@@ -1,8 +1,8 @@
 //! Table widget - displays tabular data with headers, scrolling, and row selection.
 
 use crate::layout::Rect;
-use crate::{InputState, Theme};
 use crate::text::TextBlock;
+use crate::{InputState, Theme};
 
 use super::DrawList;
 
@@ -194,7 +194,11 @@ impl<'a> Table<'a> {
         theme: &Theme,
         input: &InputState,
     ) -> TableOutput {
-        let header_h = if self.show_header { self.header_height } else { 0.0 };
+        let header_h = if self.show_header {
+            self.header_height
+        } else {
+            0.0
+        };
         let content_rect = Rect::new(
             rect.x,
             rect.y + header_h,
@@ -229,6 +233,8 @@ impl<'a> Table<'a> {
 
         let first_visible = (scroll.offset / self.row_height).floor() as usize;
         let visible_count = (content_rect.height / self.row_height).ceil() as usize + 1;
+
+        list.push_clip(content_rect);
 
         for row_idx in first_visible..(first_visible + visible_count).min(rows.len()) {
             if row_idx >= rows.len() {
@@ -277,7 +283,13 @@ impl<'a> Table<'a> {
             };
 
             if bg_color[3] > 0.0 {
-                list.quad(row_rect.x, row_rect.y, row_rect.width, row_rect.height, bg_color);
+                list.quad(
+                    row_rect.x,
+                    row_rect.y,
+                    row_rect.width,
+                    row_rect.height,
+                    bg_color,
+                );
             }
 
             // Draw cells
@@ -286,19 +298,36 @@ impl<'a> Table<'a> {
                 if col_idx < row.len() {
                     let cell = &row[col_idx];
                     let cell_rect = Rect::new(x, y, *col_width, self.row_height);
-                    self.draw_cell(cell, &self.columns[col_idx], cell_rect, font_size, list, theme);
+                    self.draw_cell(
+                        cell,
+                        &self.columns[col_idx],
+                        cell_rect,
+                        font_size,
+                        list,
+                        theme,
+                    );
                 }
                 x += col_width;
             }
         }
 
+        list.pop_clip();
+
         // Draw scroll bar if needed
         if scroll.is_scrollable() {
             let scroll_bar_width = 4.0;
             let scroll_track_x = rect.x + rect.width - scroll_bar_width - 2.0;
-            let scroll_bar_height = content_rect.height * (content_rect.height / scroll.content_height);
-            let scroll_bar_y = content_rect.y + (scroll.offset / scroll.content_height) * content_rect.height;
-            list.quad(scroll_track_x, scroll_bar_y, scroll_bar_width, scroll_bar_height, theme.text_dim);
+            let scroll_bar_height =
+                content_rect.height * (content_rect.height / scroll.content_height);
+            let scroll_bar_y =
+                content_rect.y + (scroll.offset / scroll.content_height) * content_rect.height;
+            list.quad(
+                scroll_track_x,
+                scroll_bar_y,
+                scroll_bar_width,
+                scroll_bar_height,
+                theme.text_dim,
+            );
         }
 
         TableOutput {
@@ -345,10 +374,22 @@ impl<'a> Table<'a> {
         let header_rect = Rect::new(rect.x, rect.y, rect.width, self.header_height);
 
         // Header background
-        list.quad(header_rect.x, header_rect.y, header_rect.width, header_rect.height, theme.tab_inactive);
+        list.quad(
+            header_rect.x,
+            header_rect.y,
+            header_rect.width,
+            header_rect.height,
+            theme.tab_inactive,
+        );
 
         // Header bottom border
-        list.quad(rect.x, rect.y + self.header_height - 1.0, rect.width, 1.0, theme.panel_border);
+        list.quad(
+            rect.x,
+            rect.y + self.header_height - 1.0,
+            rect.width,
+            1.0,
+            theme.panel_border,
+        );
 
         // Header labels
         let font_size = theme.font_size * 0.7;
@@ -361,22 +402,26 @@ impl<'a> Table<'a> {
             let text_x = match col.align {
                 Align::Left => x + padding,
                 Align::Center => {
-                    let text_width = col.label.len() as f32 * font_size * 0.5;
+                    let (text_width, _) = list.measure_text(&col.label, font_size);
                     x + (col_width - text_width) / 2.0
                 }
                 Align::Right => {
-                    let text_width = col.label.len() as f32 * font_size * 0.5;
+                    let (text_width, _) = list.measure_text(&col.label, font_size);
                     x + col_width - text_width - padding
                 }
             };
 
-            let text = TextBlock::new(&col.label, text_x, rect.y + (self.header_height - font_size) / 2.0)
-                .with_size(font_size)
-                .with_color(
-                    (theme.text_dim[0] * 255.0) as u8,
-                    (theme.text_dim[1] * 255.0) as u8,
-                    (theme.text_dim[2] * 255.0) as u8,
-                );
+            let text = TextBlock::new(
+                &col.label,
+                text_x,
+                rect.y + (self.header_height - font_size) / 2.0,
+            )
+            .with_size(font_size)
+            .with_color(
+                (theme.text_dim[0] * 255.0) as u8,
+                (theme.text_dim[1] * 255.0) as u8,
+                (theme.text_dim[2] * 255.0) as u8,
+            );
             list.text(text);
 
             x += col_width;
@@ -398,11 +443,11 @@ impl<'a> Table<'a> {
         let text_x = match column.align {
             Align::Left => rect.x + padding,
             Align::Center => {
-                let text_width = cell.text.len() as f32 * font_size * 0.5;
+                let (text_width, _) = list.measure_text(&cell.text, font_size);
                 rect.x + (rect.width - text_width) / 2.0
             }
             Align::Right => {
-                let text_width = cell.text.len() as f32 * font_size * 0.5;
+                let (text_width, _) = list.measure_text(&cell.text, font_size);
                 rect.x + rect.width - text_width - padding
             }
         };

@@ -1,6 +1,9 @@
 //! Core drawing types - vertices, draw commands, and the DrawList.
 
-use crate::text::TextBlock;
+use crate::layout::Rect;
+use crate::text::{TextBlock, TextMeasurer};
+
+pub const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
 
 /// A colored vertex for triangle-based rendering.
 #[repr(C)]
@@ -8,6 +11,8 @@ use crate::text::TextBlock;
 pub struct Vertex {
     pub position: [f32; 2],
     pub color: [f32; 4],
+    pub clip: [f32; 4],
+    pub clip_enabled: f32,
 }
 
 impl Vertex {
@@ -15,7 +20,17 @@ impl Vertex {
         Self {
             position: [x, y],
             color,
+            clip: [0.0; 4],
+            clip_enabled: 0.0,
         }
+    }
+
+    pub fn with_clip(mut self, clip: Option<Rect>) -> Self {
+        if let Some(clip) = clip {
+            self.clip = [clip.x, clip.y, clip.width, clip.height];
+            self.clip_enabled = 1.0;
+        }
+        self
     }
 }
 
@@ -28,6 +43,7 @@ pub struct IconDraw {
     pub height: f32,
     /// Key identifying the icon (typically a file path).
     pub icon_key: String,
+    pub clip: Option<Rect>,
 }
 
 /// A nine-slice textured panel draw command.
@@ -39,6 +55,7 @@ pub struct NineSliceDraw {
     pub height: f32,
     /// Key identifying which nine-slice texture to use (e.g., "panel2").
     pub texture_key: String,
+    pub clip: Option<Rect>,
 }
 
 /// Draw list for collecting render commands.
@@ -48,9 +65,12 @@ pub struct NineSliceDraw {
 #[derive(Default)]
 pub struct DrawList {
     pub vertices: Vec<Vertex>,
+    pub indices: Vec<u32>,
     pub texts: Vec<TextBlock>,
     pub icons: Vec<IconDraw>,
     pub nine_slices: Vec<NineSliceDraw>,
+    pub text_measurer: TextMeasurer,
+    clip_stack: Vec<Rect>,
 }
 
 impl DrawList {
@@ -60,40 +80,177 @@ impl DrawList {
 
     pub fn clear(&mut self) {
         self.vertices.clear();
+        self.indices.clear();
         self.texts.clear();
         self.icons.clear();
         self.nine_slices.clear();
+        self.clip_stack.clear();
+    }
+
+    /// Measure text using glyphon's shaping/layout path.
+    pub fn measure_text(&mut self, text: &str, font_size: f32) -> (f32, f32) {
+        self.text_measurer.measure(text, font_size)
+    }
+
+    /// Push a clipping rectangle. Nested clips are intersected with the current clip.
+    pub fn push_clip(&mut self, rect: Rect) {
+        let clip = match self.current_clip() {
+            Some(current) => current
+                .intersection(rect)
+                .unwrap_or_else(|| Rect::new(rect.x, rect.y, 0.0, 0.0)),
+            None => rect,
+        };
+        self.clip_stack.push(clip);
+    }
+
+    /// Pop the current clipping rectangle.
+    pub fn pop_clip(&mut self) {
+        self.clip_stack.pop();
+    }
+
+    /// Return the active clipping rectangle.
+    pub fn current_clip(&self) -> Option<Rect> {
+        self.clip_stack.last().copied()
+    }
+
+    fn vertex(&self, x: f32, y: f32, color: [f32; 4]) -> Vertex {
+        Vertex::new(x, y, color).with_clip(self.current_clip())
     }
 
     /// Add a single triangle.
-    pub fn triangle(
-        &mut self,
-        p0: (f32, f32),
-        p1: (f32, f32),
-        p2: (f32, f32),
-        color: [f32; 4],
-    ) {
-        self.vertices.push(Vertex::new(p0.0, p0.1, color));
-        self.vertices.push(Vertex::new(p1.0, p1.1, color));
-        self.vertices.push(Vertex::new(p2.0, p2.1, color));
+    pub fn triangle(&mut self, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), color: [f32; 4]) {
+        let base = self.vertices.len() as u32;
+        self.vertices.push(self.vertex(p0.0, p0.1, color));
+        self.vertices.push(self.vertex(p1.0, p1.1, color));
+        self.vertices.push(self.vertex(p2.0, p2.1, color));
+        self.indices.extend_from_slice(&[base, base + 1, base + 2]);
     }
 
-    /// Add a rectangle (2 triangles, 6 vertices).
+    /// Add a rectangle (2 triangles, 4 vertices, 6 indices).
     pub fn quad(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
         let x0 = x;
         let y0 = y;
         let x1 = x + width;
         let y1 = y + height;
+        let base = self.vertices.len() as u32;
 
-        // First triangle: top-left, top-right, bottom-right
-        self.vertices.push(Vertex::new(x0, y0, color));
-        self.vertices.push(Vertex::new(x1, y0, color));
-        self.vertices.push(Vertex::new(x1, y1, color));
+        self.vertices.push(self.vertex(x0, y0, color));
+        self.vertices.push(self.vertex(x1, y0, color));
+        self.vertices.push(self.vertex(x1, y1, color));
+        self.vertices.push(self.vertex(x0, y1, color));
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+    }
 
-        // Second triangle: bottom-right, bottom-left, top-left
-        self.vertices.push(Vertex::new(x1, y1, color));
-        self.vertices.push(Vertex::new(x0, y1, color));
-        self.vertices.push(Vertex::new(x0, y0, color));
+    /// Add a thick line segment as a quad.
+    pub fn line(&mut self, p0: [f32; 2], p1: [f32; 2], thickness: f32, color: [f32; 4]) {
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= f32::EPSILON || thickness <= 0.0 {
+            return;
+        }
+
+        let half = thickness * 0.5;
+        let ox = -dy / len * half;
+        let oy = dx / len * half;
+        let base = self.vertices.len() as u32;
+
+        self.vertices
+            .push(self.vertex(p0[0] + ox, p0[1] + oy, color));
+        self.vertices
+            .push(self.vertex(p1[0] + ox, p1[1] + oy, color));
+        self.vertices
+            .push(self.vertex(p1[0] - ox, p1[1] - oy, color));
+        self.vertices
+            .push(self.vertex(p0[0] - ox, p0[1] - oy, color));
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+    }
+
+    /// Add connected thick line segments without joins or caps.
+    pub fn polyline(&mut self, points: &[[f32; 2]], thickness: f32, color: [f32; 4]) {
+        for segment in points.windows(2) {
+            self.line(segment[0], segment[1], thickness, color);
+        }
+    }
+
+    /// Add a rounded rectangle.
+    pub fn rounded_rect(&mut self, rect: Rect, radius: f32, color: [f32; 4]) {
+        if radius <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
+            self.quad(rect.x, rect.y, rect.width, rect.height, color);
+            return;
+        }
+
+        let radius = radius.min(rect.width * 0.5).min(rect.height * 0.5);
+        let x0 = rect.x;
+        let y0 = rect.y;
+        let x1 = rect.x + rect.width;
+        let y1 = rect.y + rect.height;
+
+        self.quad(
+            x0 + radius,
+            y0,
+            rect.width - radius * 2.0,
+            rect.height,
+            color,
+        );
+        self.quad(x0, y0 + radius, radius, rect.height - radius * 2.0, color);
+        self.quad(
+            x1 - radius,
+            y0 + radius,
+            radius,
+            rect.height - radius * 2.0,
+            color,
+        );
+
+        self.rounded_corner(
+            (x0 + radius, y0 + radius),
+            radius,
+            std::f32::consts::PI,
+            std::f32::consts::PI * 1.5,
+            color,
+        );
+        self.rounded_corner(
+            (x1 - radius, y0 + radius),
+            radius,
+            std::f32::consts::PI * 1.5,
+            std::f32::consts::TAU,
+            color,
+        );
+        self.rounded_corner(
+            (x1 - radius, y1 - radius),
+            radius,
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+            color,
+        );
+        self.rounded_corner(
+            (x0 + radius, y1 - radius),
+            radius,
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+            color,
+        );
+    }
+
+    fn rounded_corner(
+        &mut self,
+        center: (f32, f32),
+        radius: f32,
+        start_angle: f32,
+        end_angle: f32,
+        color: [f32; 4],
+    ) {
+        for i in 0..ROUNDED_RECT_CORNER_SEGMENTS {
+            let t0 = i as f32 / ROUNDED_RECT_CORNER_SEGMENTS as f32;
+            let t1 = (i + 1) as f32 / ROUNDED_RECT_CORNER_SEGMENTS as f32;
+            let a0 = start_angle + (end_angle - start_angle) * t0;
+            let a1 = start_angle + (end_angle - start_angle) * t1;
+            let p0 = (center.0 + a0.cos() * radius, center.1 + a0.sin() * radius);
+            let p1 = (center.0 + a1.cos() * radius, center.1 + a1.sin() * radius);
+            self.triangle(center, p0, p1, color);
+        }
     }
 
     /// Add a filled convex polygon using fan triangulation from centroid.
@@ -122,7 +279,14 @@ impl DrawList {
     }
 
     /// Add text.
-    pub fn text(&mut self, block: TextBlock) {
+    pub fn text(&mut self, mut block: TextBlock) {
+        if let Some(clip) = self.current_clip() {
+            let natural_bounds = Rect::new(block.x, block.y, block.max_width, 2000.0);
+            let text_bounds = block.clip.unwrap_or(natural_bounds);
+            block.clip = text_bounds
+                .intersection(clip)
+                .or_else(|| Some(Rect::new(clip.x, clip.y, 0.0, 0.0)));
+        }
         self.texts.push(block);
     }
 
@@ -134,6 +298,7 @@ impl DrawList {
             width,
             height,
             icon_key: icon_key.to_string(),
+            clip: self.current_clip(),
         });
     }
 
@@ -145,6 +310,51 @@ impl DrawList {
             width,
             height,
             texture_key: texture_key.to_string(),
+            clip: self.current_clip(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::layout::Rect;
+
+    use super::DrawList;
+
+    #[test]
+    fn rounded_rect_emits_plausible_geometry() {
+        let mut list = DrawList::new();
+        list.rounded_rect(Rect::new(0.0, 0.0, 100.0, 40.0), 6.0, [1.0, 1.0, 1.0, 1.0]);
+
+        assert!(list.vertices.len() > 12);
+        assert!(list.indices.len() > 18);
+    }
+
+    #[test]
+    fn line_emits_quad_geometry() {
+        let mut list = DrawList::new();
+        list.line([0.0, 0.0], [10.0, 0.0], 2.0, [1.0, 1.0, 1.0, 1.0]);
+
+        assert_eq!(list.vertices.len(), 4);
+        assert_eq!(list.indices.len(), 6);
+    }
+
+    #[test]
+    fn clip_stack_marks_emitted_commands() {
+        let mut list = DrawList::new();
+        let clip = Rect::new(10.0, 20.0, 30.0, 40.0);
+
+        list.push_clip(clip);
+        list.quad(0.0, 0.0, 100.0, 100.0, [1.0, 1.0, 1.0, 1.0]);
+        list.text(crate::text::TextBlock::new("clipped", 0.0, 0.0));
+        list.icon("icon", 0.0, 0.0, 10.0, 10.0);
+        list.pop_clip();
+        list.quad(0.0, 0.0, 10.0, 10.0, [1.0, 1.0, 1.0, 1.0]);
+
+        assert_eq!(list.vertices[0].clip_enabled, 1.0);
+        assert_eq!(list.vertices[0].clip, [10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(list.texts[0].clip, Some(Rect::new(10.0, 20.0, 30.0, 40.0)));
+        assert_eq!(list.icons[0].clip, Some(clip));
+        assert_eq!(list.vertices[4].clip_enabled, 0.0);
     }
 }

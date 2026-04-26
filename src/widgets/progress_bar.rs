@@ -1,7 +1,7 @@
 //! Progress bar widget.
 
-use crate::layout::Rect;
 use crate::Theme;
+use crate::layout::Rect;
 use crate::text::TextBlock;
 
 use super::DrawList;
@@ -42,7 +42,17 @@ impl ProgressBar {
     /// Draw the progress bar at the given rect.
     pub fn draw(&self, rect: Rect, list: &mut DrawList, theme: &Theme) {
         // Background
-        list.quad(rect.x, rect.y, rect.width, rect.height, theme.progress_background);
+        if theme.border_radius > 0.0 {
+            list.rounded_rect(rect, theme.border_radius, theme.progress_background);
+        } else {
+            list.quad(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                theme.progress_background,
+            );
+        }
 
         // Fill - color based on value
         let fill_color = if self.value < 0.25 {
@@ -61,16 +71,28 @@ impl ProgressBar {
         // Border
         let border = 1.0;
         list.quad(rect.x, rect.y, rect.width, border, theme.panel_border);
-        list.quad(rect.x, rect.y + rect.height - border, rect.width, border, theme.panel_border);
+        list.quad(
+            rect.x,
+            rect.y + rect.height - border,
+            rect.width,
+            border,
+            theme.panel_border,
+        );
         list.quad(rect.x, rect.y, border, rect.height, theme.panel_border);
-        list.quad(rect.x + rect.width - border, rect.y, border, rect.height, theme.panel_border);
+        list.quad(
+            rect.x + rect.width - border,
+            rect.y,
+            border,
+            rect.height,
+            theme.panel_border,
+        );
 
         // Text (percentage)
         if self.show_text {
             let pct = (self.value * 100.0) as u32;
             let text = format!("{}%", pct);
             let font_size = rect.height * 0.7;
-            let text_width = text.len() as f32 * font_size * 0.5;
+            let (text_width, _) = list.measure_text(&text, font_size);
             let text_x = rect.x + (rect.width - text_width) / 2.0;
             let text_y = rect.y + (rect.height - font_size) / 2.0;
 

@@ -26,7 +26,7 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `Rect`s. This is the single biggest blocker for the Teardown UI port.
 - [ ] **P0 — Color / tint stack** (`UiColor`/`UiColorFilter`) with sub-tree alpha
       multiplier so panels can fade in/out. Today vertex colors are baked.
-- [ ] **P0 — Clip / scissor stack.** `push_clip(rect)`/`pop_clip()` with draw
+- [x] **P0 — Clip / scissor stack.** `push_clip(rect)`/`pop_clip()` with draw
       commands grouped per clip stack. `Table::draw_cell` text is currently
       *not actually clipped* by `content_rect`.
 - [ ] **P1 — Unify widget API around `DrawContext` + `Rect`.** Today some
@@ -45,9 +45,9 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 ## Draw Primitives
 
-- [ ] **P0 — Rounded rectangles.** `theme.border_radius` exists but is never
+- [x] **P0 — Rounded rectangles.** `theme.border_radius` exists but is never
       used. Teardown's `UiRoundedRect` is widely used. Tessellate or SDF.
-- [ ] **P0 — Lines / strokes** (`line(p0, p1, thickness, color)`) with
+- [x] **P0 — Lines / strokes** (`line(p0, p1, thickness, color)`) with
       thickness/joins/caps/AA. Teardown's `DrawLine` is top-30. Also needed
       for slider tick marks, debug overlays.
 - [ ] **P1 — Circles / arcs / ellipses** (`UiCircle`).
@@ -141,7 +141,7 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 ## Text
 
-- [ ] **P0 — Real text measurement** via glyphon shaping. Centering today
+- [x] **P0 — Real text measurement** via glyphon shaping. Centering today
       uses `len() * font_size * 0.5` in 6+ places; broken for proportional
       fonts, multi-byte UTF-8, non-ASCII. (Teardown ships `UiGetTextSize` for
       this reason.)

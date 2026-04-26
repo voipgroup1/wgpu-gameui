@@ -1,7 +1,7 @@
 //! Text input widget.
 
-use crate::{InputState, Theme};
 use crate::text::TextBlock;
+use crate::{InputState, Theme};
 
 use super::DrawList;
 
@@ -58,7 +58,13 @@ impl TextInput {
             }
         }
 
-        list.quad(self.x, self.y, self.width, self.height, theme.input_background);
+        list.quad(
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            theme.input_background,
+        );
 
         let border = theme.border_width;
         let border_color = if self.focused {
@@ -70,9 +76,21 @@ impl TextInput {
         };
 
         list.quad(self.x, self.y, self.width, border, border_color);
-        list.quad(self.x, self.y + self.height - border, self.width, border, border_color);
+        list.quad(
+            self.x,
+            self.y + self.height - border,
+            self.width,
+            border,
+            border_color,
+        );
         list.quad(self.x, self.y, border, self.height, border_color);
-        list.quad(self.x + self.width - border, self.y, border, self.height, border_color);
+        list.quad(
+            self.x + self.width - border,
+            self.y,
+            border,
+            self.height,
+            border_color,
+        );
 
         let (text_content, text_color) = if self.value.is_empty() {
             (&self.placeholder, theme.text_dim)
@@ -80,18 +98,23 @@ impl TextInput {
             (&self.value, theme.text)
         };
 
-        let text = TextBlock::new(text_content, self.x + theme.padding, self.y + (self.height - theme.font_size) / 2.0)
-            .with_size(theme.font_size)
-            .with_color(
-                (text_color[0] * 255.0) as u8,
-                (text_color[1] * 255.0) as u8,
-                (text_color[2] * 255.0) as u8,
-            )
-            .with_max_width(self.width - theme.padding * 2.0);
+        let text = TextBlock::new(
+            text_content,
+            self.x + theme.padding,
+            self.y + (self.height - theme.font_size) / 2.0,
+        )
+        .with_size(theme.font_size)
+        .with_color(
+            (text_color[0] * 255.0) as u8,
+            (text_color[1] * 255.0) as u8,
+            (text_color[2] * 255.0) as u8,
+        )
+        .with_max_width(self.width - theme.padding * 2.0);
         list.text(text);
 
         if self.focused {
-            let cursor_x = self.x + theme.padding + (self.value.len() as f32 * theme.font_size * 0.5);
+            let (cursor_offset, _) = list.measure_text(&self.value, theme.font_size);
+            let cursor_x = self.x + theme.padding + cursor_offset;
             let cursor_y = self.y + (self.height - theme.font_size) / 2.0;
             list.quad(cursor_x, cursor_y, 2.0, theme.font_size, theme.text);
         }

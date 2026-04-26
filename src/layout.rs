@@ -45,6 +45,20 @@ impl Rect {
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
     }
+
+    /// Return the overlapping rectangle, if any.
+    pub fn intersection(&self, other: Rect) -> Option<Rect> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = (self.x + self.width).min(other.x + other.width);
+        let y1 = (self.y + self.height).min(other.y + other.height);
+
+        if x1 <= x0 || y1 <= y0 {
+            None
+        } else {
+            Some(Rect::new(x0, y0, x1 - x0, y1 - y0))
+        }
+    }
 }
 
 /// Anchor point for positioning relative to parent/screen.

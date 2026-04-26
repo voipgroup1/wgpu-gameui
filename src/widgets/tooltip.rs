@@ -1,8 +1,8 @@
 //! Tooltip system - hover regions with rich content display.
 
 use crate::layout::Rect;
-use crate::{InputState, Theme};
 use crate::text::TextBlock;
+use crate::{InputState, Theme};
 
 use super::DrawList;
 
@@ -11,10 +11,7 @@ use super::DrawList;
 #[derive(Clone)]
 pub enum TooltipContent {
     /// Simple text tooltip with optional title.
-    Text {
-        title: Option<String>,
-        body: String,
-    },
+    Text { title: Option<String>, body: String },
     /// Multi-line text with optional title.
     Lines {
         title: Option<String>,
@@ -70,7 +67,10 @@ impl TooltipContent {
 
     /// Add a detail line to a rich tooltip.
     pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        if let Self::Rich { ref mut details, .. } = self {
+        if let Self::Rich {
+            ref mut details, ..
+        } = self
+        {
             details.push((key.into(), value.into()));
         }
         self
@@ -142,7 +142,10 @@ impl TooltipLayer {
         screen_height: f32,
     ) {
         // Find the first hovered region (could prioritize by z-order if needed)
-        let hovered = self.regions.iter().find(|r| r.rect.contains(input.mouse_x, input.mouse_y));
+        let hovered = self
+            .regions
+            .iter()
+            .find(|r| r.rect.contains(input.mouse_x, input.mouse_y));
 
         let region = match hovered {
             Some(r) => r,
@@ -160,24 +163,36 @@ impl TooltipLayer {
             TooltipContent::Text { title, body } => {
                 let title_h = if title.is_some() { title_height } else { 0.0 };
                 let body_lines = (body.len() as f32 / 40.0).ceil().max(1.0);
-                let w = 220.0f32.max(body.len() as f32 * body_size * 0.45).min(300.0);
+                let (body_width, _) = list.measure_text(body, body_size);
+                let w = 220.0f32.max(body_width).min(300.0);
                 let h = padding * 2.0 + title_h + body_lines * line_height;
                 (w, h)
             }
             TooltipContent::Lines { title, lines } => {
                 let title_h = if title.is_some() { title_height } else { 0.0 };
-                let max_line_len = lines.iter().map(|l| l.len()).max().unwrap_or(20);
-                let w = 180.0f32.max(max_line_len as f32 * body_size * 0.5).min(300.0);
+                let max_line_width = lines
+                    .iter()
+                    .map(|line| list.measure_text(line, body_size).0)
+                    .fold(0.0f32, f32::max);
+                let w = 180.0f32.max(max_line_width).min(300.0);
                 let h = padding * 2.0 + title_h + lines.len() as f32 * line_height;
                 (w, h)
             }
-            TooltipContent::Rich { title: _, description, details } => {
+            TooltipContent::Rich {
+                title: _,
+                description,
+                details,
+            } => {
                 let desc_lines = (description.len() as f32 / 35.0).ceil().max(1.0);
                 let w = 240.0;
                 let h = padding * 2.0
                     + title_height
                     + desc_lines * line_height
-                    + if !details.is_empty() { 8.0 + details.len() as f32 * line_height } else { 0.0 };
+                    + if !details.is_empty() {
+                        8.0 + details.len() as f32 * line_height
+                    } else {
+                        0.0
+                    };
                 (w, h)
             }
         };
@@ -261,7 +276,11 @@ impl TooltipLayer {
                     cursor_y += line_height;
                 }
             }
-            TooltipContent::Rich { title, description, details } => {
+            TooltipContent::Rich {
+                title,
+                description,
+                details,
+            } => {
                 let title_block = TextBlock::new(title, content_x, cursor_y)
                     .with_size(title_size)
                     .with_color(

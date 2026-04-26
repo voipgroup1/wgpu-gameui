@@ -1,8 +1,8 @@
 //! Button widget.
 
 use crate::layout::Rect;
-use crate::{InputState, Theme};
 use crate::text::TextBlock;
+use crate::{InputState, Theme};
 
 use super::DrawList;
 
@@ -51,7 +51,15 @@ impl Button {
             theme.button
         };
 
-        list.quad(self.x, self.y, self.width, self.height, bg_color);
+        if theme.border_radius > 0.0 {
+            list.rounded_rect(
+                Rect::new(self.x, self.y, self.width, self.height),
+                theme.border_radius,
+                bg_color,
+            );
+        } else {
+            list.quad(self.x, self.y, self.width, self.height, bg_color);
+        }
 
         let border = theme.border_width;
         let border_color = if hovered && self.enabled {
@@ -61,19 +69,39 @@ impl Button {
         };
 
         list.quad(self.x, self.y, self.width, border, border_color);
-        list.quad(self.x, self.y + self.height - border, self.width, border, border_color);
+        list.quad(
+            self.x,
+            self.y + self.height - border,
+            self.width,
+            border,
+            border_color,
+        );
         list.quad(self.x, self.y, border, self.height, border_color);
-        list.quad(self.x + self.width - border, self.y, border, self.height, border_color);
+        list.quad(
+            self.x + self.width - border,
+            self.y,
+            border,
+            self.height,
+            border_color,
+        );
 
-        let text_color = if self.enabled { theme.text } else { theme.text_dim };
-        let text = TextBlock::new(&self.label, self.x + theme.padding, self.y + (self.height - theme.font_size) / 2.0)
-            .with_size(theme.font_size)
-            .with_color(
-                (text_color[0] * 255.0) as u8,
-                (text_color[1] * 255.0) as u8,
-                (text_color[2] * 255.0) as u8,
-            )
-            .with_max_width(self.width - theme.padding * 2.0);
+        let text_color = if self.enabled {
+            theme.text
+        } else {
+            theme.text_dim
+        };
+        let text = TextBlock::new(
+            &self.label,
+            self.x + theme.padding,
+            self.y + (self.height - theme.font_size) / 2.0,
+        )
+        .with_size(theme.font_size)
+        .with_color(
+            (text_color[0] * 255.0) as u8,
+            (text_color[1] * 255.0) as u8,
+            (text_color[2] * 255.0) as u8,
+        )
+        .with_max_width(self.width - theme.padding * 2.0);
         list.text(text);
 
         clicked
@@ -104,7 +132,11 @@ impl Button {
             theme.button
         };
 
-        list.quad(rect.x, rect.y, rect.width, rect.height, bg_color);
+        if theme.border_radius > 0.0 {
+            list.rounded_rect(rect, theme.border_radius, bg_color);
+        } else {
+            list.quad(rect.x, rect.y, rect.width, rect.height, bg_color);
+        }
 
         let border = theme.border_width;
         let border_color = if hovered && enabled {
@@ -114,19 +146,35 @@ impl Button {
         };
 
         list.quad(rect.x, rect.y, rect.width, border, border_color);
-        list.quad(rect.x, rect.y + rect.height - border, rect.width, border, border_color);
+        list.quad(
+            rect.x,
+            rect.y + rect.height - border,
+            rect.width,
+            border,
+            border_color,
+        );
         list.quad(rect.x, rect.y, border, rect.height, border_color);
-        list.quad(rect.x + rect.width - border, rect.y, border, rect.height, border_color);
+        list.quad(
+            rect.x + rect.width - border,
+            rect.y,
+            border,
+            rect.height,
+            border_color,
+        );
 
         let text_color = if enabled { theme.text } else { theme.text_dim };
-        let text = TextBlock::new(label, rect.x + theme.padding, rect.y + (rect.height - theme.font_size) / 2.0)
-            .with_size(theme.font_size)
-            .with_color(
-                (text_color[0] * 255.0) as u8,
-                (text_color[1] * 255.0) as u8,
-                (text_color[2] * 255.0) as u8,
-            )
-            .with_max_width(rect.width - theme.padding * 2.0);
+        let text = TextBlock::new(
+            label,
+            rect.x + theme.padding,
+            rect.y + (rect.height - theme.font_size) / 2.0,
+        )
+        .with_size(theme.font_size)
+        .with_color(
+            (text_color[0] * 255.0) as u8,
+            (text_color[1] * 255.0) as u8,
+            (text_color[2] * 255.0) as u8,
+        )
+        .with_max_width(rect.width - theme.padding * 2.0);
         list.text(text);
 
         clicked
@@ -148,22 +196,44 @@ impl Button {
         list.nine_slice(rect.x, rect.y, rect.width, rect.height, texture_key);
 
         if !enabled {
-            list.quad(rect.x, rect.y, rect.width, rect.height, [0.0, 0.0, 0.0, 0.4]);
+            list.quad(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                [0.0, 0.0, 0.0, 0.4],
+            );
         } else if hovered && input.mouse_down {
-            list.quad(rect.x, rect.y, rect.width, rect.height, [0.0, 0.0, 0.0, 0.2]);
+            list.quad(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                [0.0, 0.0, 0.0, 0.2],
+            );
         } else if hovered {
-            list.quad(rect.x, rect.y, rect.width, rect.height, [1.0, 1.0, 1.0, 0.08]);
+            list.quad(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                [1.0, 1.0, 1.0, 0.08],
+            );
         }
 
         let text_color = if enabled { theme.text } else { theme.text_dim };
-        let text = TextBlock::new(label, rect.x + theme.padding, rect.y + (rect.height - theme.font_size) / 2.0)
-            .with_size(theme.font_size)
-            .with_color(
-                (text_color[0] * 255.0) as u8,
-                (text_color[1] * 255.0) as u8,
-                (text_color[2] * 255.0) as u8,
-            )
-            .with_max_width(rect.width - theme.padding * 2.0);
+        let text = TextBlock::new(
+            label,
+            rect.x + theme.padding,
+            rect.y + (rect.height - theme.font_size) / 2.0,
+        )
+        .with_size(theme.font_size)
+        .with_color(
+            (text_color[0] * 255.0) as u8,
+            (text_color[1] * 255.0) as u8,
+            (text_color[2] * 255.0) as u8,
+        )
+        .with_max_width(rect.width - theme.padding * 2.0);
         list.text(text);
 
         clicked

@@ -1,8 +1,8 @@
 //! Tabs widget - a row of tab buttons.
 
 use crate::layout::Rect;
-use crate::{InputState, Theme};
 use crate::text::TextBlock;
+use crate::{InputState, Theme};
 
 use super::DrawList;
 
@@ -65,7 +65,13 @@ impl<'a> Tabs<'a> {
         let mut clicked = None;
 
         // Draw background for entire tab bar
-        list.quad(bar_rect.x, bar_rect.y, bar_rect.width, bar_rect.height, theme.tab_inactive);
+        list.quad(
+            bar_rect.x,
+            bar_rect.y,
+            bar_rect.width,
+            bar_rect.height,
+            theme.tab_inactive,
+        );
 
         // Draw each tab
         for (i, label) in self.labels.iter().enumerate() {
@@ -92,20 +98,35 @@ impl<'a> Tabs<'a> {
 
             // Active indicator (bottom border for active tab)
             if is_active {
-                list.quad(tab_x, rect.y + self.tab_height - 2.0, tab_width, 2.0, theme.accent);
+                list.quad(
+                    tab_x,
+                    rect.y + self.tab_height - 2.0,
+                    tab_width,
+                    2.0,
+                    theme.accent,
+                );
             }
 
             // Tab separator (right edge, except for last tab)
             if i < tab_count - 1 {
-                list.quad(tab_x + tab_width - 1.0, rect.y + 4.0, 1.0, self.tab_height - 8.0, theme.tab_border);
+                list.quad(
+                    tab_x + tab_width - 1.0,
+                    rect.y + 4.0,
+                    1.0,
+                    self.tab_height - 8.0,
+                    theme.tab_border,
+                );
             }
 
             // Tab label (centered)
-            let text_color = if is_active { theme.text_highlight } else { theme.text };
+            let text_color = if is_active {
+                theme.text_highlight
+            } else {
+                theme.text
+            };
             let font_size = theme.font_size * 0.8;
             let text_y = rect.y + (self.tab_height - font_size) / 2.0;
-            // Rough center calculation
-            let text_width = label.len() as f32 * font_size * 0.5;
+            let (text_width, _) = list.measure_text(label, font_size);
             let text_x = tab_x + (tab_width - text_width) / 2.0;
 
             let text = TextBlock::new(*label, text_x, text_y)
@@ -119,7 +140,13 @@ impl<'a> Tabs<'a> {
         }
 
         // Bottom border for tab bar
-        list.quad(rect.x, rect.y + self.tab_height - 1.0, rect.width, 1.0, theme.tab_border);
+        list.quad(
+            rect.x,
+            rect.y + self.tab_height - 1.0,
+            rect.width,
+            1.0,
+            theme.tab_border,
+        );
 
         TabsOutput {
             clicked,
