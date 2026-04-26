@@ -18,7 +18,7 @@ use glyphon::{
 pub type FontSystemHandle = Arc<Mutex<FontSystem>>;
 
 /// Create a new shared `FontSystem` handle.
-pub fn new_font_system() -> FontSystemHandle {
+pub fn shared_font_system() -> FontSystemHandle {
     Arc::new(Mutex::new(FontSystem::new()))
 }
 
@@ -34,7 +34,7 @@ pub struct TextRenderer {
 
 impl TextRenderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let font_system = new_font_system();
+        let font_system = shared_font_system();
         Self::with_font_system(device, queue, format, font_system)
     }
 
@@ -186,7 +186,7 @@ impl TextMeasurer {
     /// so measured widths match rendered glyphs.
     pub fn new() -> Self {
         Self {
-            font_system: new_font_system(),
+            font_system: shared_font_system(),
         }
     }
 

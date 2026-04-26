@@ -42,8 +42,12 @@ impl Panel {
             list.quad(self.x, self.y, self.width, self.height, theme.panel);
         }
 
-        // Draw border (4 inset quads — no corner overlap, no half-thickness bleed)
+        // Draw border (4 non-overlapping inset quads). Top/bottom span the
+        // full width; left/right span only the inner height between them so
+        // the corners are painted exactly once — important for any
+        // semi-transparent panel_border color.
         let border = theme.border_width;
+        let inner_h = (self.height - 2.0 * border).max(0.0);
         list.quad(self.x, self.y, self.width, border, theme.panel_border);
         list.quad(
             self.x,
@@ -52,12 +56,18 @@ impl Panel {
             border,
             theme.panel_border,
         );
-        list.quad(self.x, self.y, border, self.height, theme.panel_border);
+        list.quad(
+            self.x,
+            self.y + border,
+            border,
+            inner_h,
+            theme.panel_border,
+        );
         list.quad(
             self.x + self.width - border,
-            self.y,
+            self.y + border,
             border,
-            self.height,
+            inner_h,
             theme.panel_border,
         );
     }
@@ -71,8 +81,12 @@ impl Panel {
             list.quad(rect.x, rect.y, rect.width, rect.height, theme.panel);
         }
 
-        // Draw border (4 inset quads — no corner overlap, no half-thickness bleed)
+        // Draw border (4 non-overlapping inset quads). Top/bottom span the
+        // full width; left/right span only the inner height between them so
+        // the corners are painted exactly once — important for any
+        // semi-transparent panel_border color.
         let border = theme.border_width;
+        let inner_h = (rect.height - 2.0 * border).max(0.0);
         list.quad(rect.x, rect.y, rect.width, border, theme.panel_border);
         list.quad(
             rect.x,
@@ -81,12 +95,18 @@ impl Panel {
             border,
             theme.panel_border,
         );
-        list.quad(rect.x, rect.y, border, rect.height, theme.panel_border);
+        list.quad(
+            rect.x,
+            rect.y + border,
+            border,
+            inner_h,
+            theme.panel_border,
+        );
         list.quad(
             rect.x + rect.width - border,
-            rect.y,
+            rect.y + border,
             border,
-            rect.height,
+            inner_h,
             theme.panel_border,
         );
     }

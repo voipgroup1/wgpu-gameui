@@ -159,6 +159,11 @@ impl TooltipLayer {
         let line_height = body_size + 3.0;
         let title_height = title_size + 4.0;
 
+        // Cached height of the wrapped description block in the Rich variant.
+        // Set during sizing and reused during rendering to advance cursor_y
+        // without a second glyphon shape pass.
+        let mut rich_desc_h: f32 = 0.0;
+
         let (width, height) = match &region.content {
             TooltipContent::Text { title, body } => {
                 let title_h = if title.is_some() { title_height } else { 0.0 };
@@ -189,6 +194,7 @@ impl TooltipLayer {
                 let w = 240.0;
                 let inner_w = w - padding * 2.0;
                 let (_, desc_h) = list.measure_text(description, body_size, Some(inner_w));
+                rich_desc_h = desc_h;
                 let h = padding * 2.0
                     + title_height
                     + desc_h
@@ -305,9 +311,8 @@ impl TooltipLayer {
                     .with_max_width(width - padding * 2.0);
                 list.text(desc_block);
 
-                let (_, desc_h) =
-                    list.measure_text(description, body_size, Some(width - padding * 2.0));
-                cursor_y += desc_h;
+                // Reuse the description height computed during sizing.
+                cursor_y += rich_desc_h;
 
                 if !details.is_empty() {
                     cursor_y += 8.0;

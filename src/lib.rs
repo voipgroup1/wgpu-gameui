@@ -28,7 +28,7 @@
 
 mod text;
 
-pub use text::{FontSystemHandle, TextBlock, TextMeasurer, TextRenderer, new_font_system};
+pub use text::{FontSystemHandle, TextBlock, TextMeasurer, TextRenderer, shared_font_system};
 
 pub mod layout;
 mod theme;
