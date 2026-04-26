@@ -113,7 +113,7 @@ impl TextInput {
         list.text(text);
 
         if self.focused {
-            let (cursor_offset, _) = list.measure_text(&self.value, theme.font_size);
+            let (cursor_offset, _) = list.measure_text(&self.value, theme.font_size, None);
             let cursor_x = self.x + theme.padding + cursor_offset;
             let cursor_y = self.y + (self.height - theme.font_size) / 2.0;
             list.quad(cursor_x, cursor_y, 2.0, theme.font_size, theme.text);

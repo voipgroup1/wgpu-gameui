@@ -42,17 +42,22 @@ impl Panel {
             list.quad(self.x, self.y, self.width, self.height, theme.panel);
         }
 
-        // Draw border
+        // Draw border (4 inset quads — no corner overlap, no half-thickness bleed)
         let border = theme.border_width;
-        list.polyline(
-            &[
-                [self.x, self.y],
-                [self.x + self.width, self.y],
-                [self.x + self.width, self.y + self.height],
-                [self.x, self.y + self.height],
-                [self.x, self.y],
-            ],
+        list.quad(self.x, self.y, self.width, border, theme.panel_border);
+        list.quad(
+            self.x,
+            self.y + self.height - border,
+            self.width,
             border,
+            theme.panel_border,
+        );
+        list.quad(self.x, self.y, border, self.height, theme.panel_border);
+        list.quad(
+            self.x + self.width - border,
+            self.y,
+            border,
+            self.height,
             theme.panel_border,
         );
     }
@@ -66,17 +71,22 @@ impl Panel {
             list.quad(rect.x, rect.y, rect.width, rect.height, theme.panel);
         }
 
-        // Draw border
+        // Draw border (4 inset quads — no corner overlap, no half-thickness bleed)
         let border = theme.border_width;
-        list.polyline(
-            &[
-                [rect.x, rect.y],
-                [rect.x + rect.width, rect.y],
-                [rect.x + rect.width, rect.y + rect.height],
-                [rect.x, rect.y + rect.height],
-                [rect.x, rect.y],
-            ],
+        list.quad(rect.x, rect.y, rect.width, border, theme.panel_border);
+        list.quad(
+            rect.x,
+            rect.y + rect.height - border,
+            rect.width,
             border,
+            theme.panel_border,
+        );
+        list.quad(rect.x, rect.y, border, rect.height, theme.panel_border);
+        list.quad(
+            rect.x + rect.width - border,
+            rect.y,
+            border,
+            rect.height,
             theme.panel_border,
         );
     }
@@ -100,7 +110,7 @@ pub fn label_at(list: &mut DrawList, theme: &Theme, text: &str, rect: Rect) {
 
 /// Label centered horizontally and vertically in a rect.
 pub fn label_centered_at(list: &mut DrawList, theme: &Theme, text: &str, rect: Rect) {
-    let (text_width, _) = list.measure_text(text, theme.font_size);
+    let (text_width, _) = list.measure_text(text, theme.font_size, None);
     let x = rect.x + (rect.width - text_width) / 2.0;
     let y = rect.y + (rect.height - theme.font_size) / 2.0;
     list.text(theme.text(text, x, y));

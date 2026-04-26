@@ -1,6 +1,8 @@
 //! Text rendering using glyphon.
 //! Provides GPU-accelerated text rendering with proper font shaping.
 
+use std::sync::{Arc, Mutex};
+
 use crate::layout::Rect;
 
 use glyphon::{
@@ -8,8 +10,20 @@ use glyphon::{
     TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonRenderer, Viewport,
 };
 
+/// Shared handle to a glyphon `FontSystem`.
+///
+/// Both `TextRenderer` and `TextMeasurer` hold the same handle so measured text widths
+/// (used for layout) match rendered glyphs (used for output) — including any custom
+/// fonts loaded into the system later.
+pub type FontSystemHandle = Arc<Mutex<FontSystem>>;
+
+/// Create a new shared `FontSystem` handle.
+pub fn new_font_system() -> FontSystemHandle {
+    Arc::new(Mutex::new(FontSystem::new()))
+}
+
 pub struct TextRenderer {
-    font_system: FontSystem,
+    font_system: FontSystemHandle,
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
@@ -20,7 +34,17 @@ pub struct TextRenderer {
 
 impl TextRenderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let font_system = FontSystem::new();
+        let font_system = new_font_system();
+        Self::with_font_system(device, queue, format, font_system)
+    }
+
+    /// Construct a `TextRenderer` reusing an existing shared `FontSystem`.
+    pub fn with_font_system(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        font_system: FontSystemHandle,
+    ) -> Self {
         let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
@@ -39,6 +63,14 @@ impl TextRenderer {
         }
     }
 
+    /// Get a clone of the shared font system handle.
+    ///
+    /// Use this to construct a `DrawList` / `TextMeasurer` that shares font state with
+    /// this renderer.
+    pub fn font_system_handle(&self) -> FontSystemHandle {
+        Arc::clone(&self.font_system)
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
@@ -49,7 +81,8 @@ impl TextRenderer {
     /// This mutates the internal font system cache as glyphon shapes text, but does not
     /// mutate rendered atlas or renderer state.
     pub fn measure(&mut self, text: &str, font_size: f32) -> (f32, f32) {
-        measure_with_font_system(&mut self.font_system, text, font_size)
+        let mut fs = self.font_system.lock().expect("FontSystem poisoned");
+        measure_with_font_system(&mut fs, text, font_size, None)
     }
 
     /// Prepare and render text in a single call.
@@ -74,21 +107,20 @@ impl TextRenderer {
             },
         );
 
+        let mut fs = self.font_system.lock().expect("FontSystem poisoned");
+
         // Create buffers for each text block
         let mut buffers: Vec<Buffer> = Vec::with_capacity(texts.len());
         for text in texts {
-            let mut buffer = Buffer::new(
-                &mut self.font_system,
-                Metrics::new(text.font_size, text.line_height),
-            );
-            buffer.set_size(&mut self.font_system, Some(text.max_width), None);
+            let mut buffer = Buffer::new(&mut *fs, Metrics::new(text.font_size, text.line_height));
+            buffer.set_size(&mut *fs, Some(text.max_width), None);
             buffer.set_text(
-                &mut self.font_system,
+                &mut *fs,
                 &text.content,
                 Attrs::new().family(Family::SansSerif).color(text.color),
                 Shaping::Advanced,
             );
-            buffer.shape_until_scroll(&mut self.font_system, false);
+            buffer.shape_until_scroll(&mut *fs, false);
             buffers.push(buffer);
         }
 
@@ -112,7 +144,7 @@ impl TextRenderer {
             .prepare(
                 device,
                 queue,
-                &mut self.font_system,
+                &mut *fs,
                 &mut self.atlas,
                 &self.viewport,
                 text_areas,
@@ -144,22 +176,42 @@ impl TextRenderer {
 
 /// CPU-side glyphon text measurer for layout and widget construction.
 pub struct TextMeasurer {
-    font_system: FontSystem,
+    font_system: FontSystemHandle,
 }
 
 impl TextMeasurer {
+    /// Create a measurer with its own private `FontSystem`.
+    ///
+    /// Prefer [`TextMeasurer::with_font_system`] when a `TextRenderer` already exists,
+    /// so measured widths match rendered glyphs.
     pub fn new() -> Self {
         Self {
-            font_system: FontSystem::new(),
+            font_system: new_font_system(),
         }
+    }
+
+    /// Create a measurer that shares its `FontSystem` with another component (typically
+    /// a `TextRenderer`).
+    pub fn with_font_system(font_system: FontSystemHandle) -> Self {
+        Self { font_system }
+    }
+
+    /// Get a clone of the shared font system handle.
+    pub fn font_system_handle(&self) -> FontSystemHandle {
+        Arc::clone(&self.font_system)
     }
 
     /// Measure text using glyphon's shaping/layout path.
     ///
+    /// `max_width` constrains the shaping width; pass `None` for unconstrained
+    /// single-line measurement, or `Some(w)` to let glyphon wrap the text and report
+    /// the resulting multi-line height.
+    ///
     /// This mutates glyphon's font system cache while shaping; it does not touch any GPU
     /// renderer, atlas, or swash cache state.
-    pub fn measure(&mut self, text: &str, font_size: f32) -> (f32, f32) {
-        measure_with_font_system(&mut self.font_system, text, font_size)
+    pub fn measure(&mut self, text: &str, font_size: f32, max_width: Option<f32>) -> (f32, f32) {
+        let mut fs = self.font_system.lock().expect("FontSystem poisoned");
+        measure_with_font_system(&mut fs, text, font_size, max_width)
     }
 }
 
@@ -173,10 +225,12 @@ fn measure_with_font_system(
     font_system: &mut FontSystem,
     text: &str,
     font_size: f32,
+    max_width: Option<f32>,
 ) -> (f32, f32) {
     let line_height = font_size * 1.25;
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_size(font_system, Some(f32::MAX / 4.0), None);
+    let shape_width = max_width.unwrap_or(f32::MAX / 4.0);
+    buffer.set_size(font_system, Some(shape_width), None);
     buffer.set_text(
         font_system,
         text,
@@ -278,13 +332,22 @@ mod tests {
     #[test]
     fn measures_text_with_glyphon_layout() {
         let mut measurer = TextMeasurer::new();
-        let (hello_width, hello_height) = measurer.measure("Hello", 16.0);
+        let (hello_width, hello_height) = measurer.measure("Hello", 16.0, None);
         assert!(hello_width > 0.0);
         assert!(hello_height > 0.0);
 
         let font_size = 16.0;
-        let (m_width, _) = measurer.measure("M", font_size);
+        let (m_width, _) = measurer.measure("M", font_size, None);
         let approximate_width = "M".len() as f32 * font_size * 0.5;
         assert!((m_width - approximate_width).abs() > f32::EPSILON);
+    }
+
+    #[test]
+    fn measure_with_max_width_wraps_to_multiple_lines() {
+        let mut measurer = TextMeasurer::new();
+        let long = "The quick brown fox jumps over the lazy dog repeatedly each morning.";
+        let (_, h_unwrapped) = measurer.measure(long, 14.0, None);
+        let (_, h_wrapped) = measurer.measure(long, 14.0, Some(80.0));
+        assert!(h_wrapped > h_unwrapped);
     }
 }

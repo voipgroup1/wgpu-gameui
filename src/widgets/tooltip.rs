@@ -162,17 +162,20 @@ impl TooltipLayer {
         let (width, height) = match &region.content {
             TooltipContent::Text { title, body } => {
                 let title_h = if title.is_some() { title_height } else { 0.0 };
-                let body_lines = (body.len() as f32 / 40.0).ceil().max(1.0);
-                let (body_width, _) = list.measure_text(body, body_size);
-                let w = 220.0f32.max(body_width).min(300.0);
-                let h = padding * 2.0 + title_h + body_lines * line_height;
+                // Determine width first using an unconstrained measurement, then clamp
+                // and re-measure with that as the wrap width to get the real height.
+                let (body_width_natural, _) = list.measure_text(body, body_size, None);
+                let w = 220.0f32.max(body_width_natural).min(300.0);
+                let inner_w = w - padding * 2.0;
+                let (_, body_h) = list.measure_text(body, body_size, Some(inner_w));
+                let h = padding * 2.0 + title_h + body_h;
                 (w, h)
             }
             TooltipContent::Lines { title, lines } => {
                 let title_h = if title.is_some() { title_height } else { 0.0 };
                 let max_line_width = lines
                     .iter()
-                    .map(|line| list.measure_text(line, body_size).0)
+                    .map(|line| list.measure_text(line, body_size, None).0)
                     .fold(0.0f32, f32::max);
                 let w = 180.0f32.max(max_line_width).min(300.0);
                 let h = padding * 2.0 + title_h + lines.len() as f32 * line_height;
@@ -183,11 +186,12 @@ impl TooltipLayer {
                 description,
                 details,
             } => {
-                let desc_lines = (description.len() as f32 / 35.0).ceil().max(1.0);
                 let w = 240.0;
+                let inner_w = w - padding * 2.0;
+                let (_, desc_h) = list.measure_text(description, body_size, Some(inner_w));
                 let h = padding * 2.0
                     + title_height
-                    + desc_lines * line_height
+                    + desc_h
                     + if !details.is_empty() {
                         8.0 + details.len() as f32 * line_height
                     } else {
@@ -301,8 +305,9 @@ impl TooltipLayer {
                     .with_max_width(width - padding * 2.0);
                 list.text(desc_block);
 
-                let desc_lines = (description.len() as f32 / 35.0).ceil().max(1.0);
-                cursor_y += desc_lines * line_height;
+                let (_, desc_h) =
+                    list.measure_text(description, body_size, Some(width - padding * 2.0));
+                cursor_y += desc_h;
 
                 if !details.is_empty() {
                     cursor_y += 8.0;

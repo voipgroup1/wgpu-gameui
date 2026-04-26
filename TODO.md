@@ -158,7 +158,7 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [ ] **P1 — Text wrapping policy.** `max_width` set, but smaller-than-text
       causes silent truncation. `UiWordWrap` exists in Teardown.
 - [ ] **P1 — Ellipsis on overflow.**
-- [ ] **P1 — Cursor x-position from real shaping**, not the same broken
+- [x] **P1 — Cursor x-position from real shaping**, not the same broken
       `len*0.5` formula.
 - [ ] **P2 — Password / masked input.**
 - [ ] **P2 — RTL / bidi exposure** (glyphon supports it; no public knob).

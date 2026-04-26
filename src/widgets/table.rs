@@ -402,11 +402,11 @@ impl<'a> Table<'a> {
             let text_x = match col.align {
                 Align::Left => x + padding,
                 Align::Center => {
-                    let (text_width, _) = list.measure_text(&col.label, font_size);
+                    let (text_width, _) = list.measure_text(&col.label, font_size, None);
                     x + (col_width - text_width) / 2.0
                 }
                 Align::Right => {
-                    let (text_width, _) = list.measure_text(&col.label, font_size);
+                    let (text_width, _) = list.measure_text(&col.label, font_size, None);
                     x + col_width - text_width - padding
                 }
             };
@@ -443,11 +443,11 @@ impl<'a> Table<'a> {
         let text_x = match column.align {
             Align::Left => rect.x + padding,
             Align::Center => {
-                let (text_width, _) = list.measure_text(&cell.text, font_size);
+                let (text_width, _) = list.measure_text(&cell.text, font_size, None);
                 rect.x + (rect.width - text_width) / 2.0
             }
             Align::Right => {
-                let (text_width, _) = list.measure_text(&cell.text, font_size);
+                let (text_width, _) = list.measure_text(&cell.text, font_size, None);
                 rect.x + rect.width - text_width - padding
             }
         };

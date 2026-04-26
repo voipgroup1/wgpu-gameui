@@ -1,9 +1,9 @@
 //! Core drawing types - vertices, draw commands, and the DrawList.
 
 use crate::layout::Rect;
-use crate::text::{TextBlock, TextMeasurer};
+use crate::text::{FontSystemHandle, TextBlock, TextMeasurer};
 
-pub const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
+pub(crate) const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
 
 /// A colored vertex for triangle-based rendering.
 #[repr(C)]
@@ -69,13 +69,24 @@ pub struct DrawList {
     pub texts: Vec<TextBlock>,
     pub icons: Vec<IconDraw>,
     pub nine_slices: Vec<NineSliceDraw>,
-    pub text_measurer: TextMeasurer,
+    pub(crate) text_measurer: TextMeasurer,
     clip_stack: Vec<Rect>,
 }
 
 impl DrawList {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a `DrawList` whose measurer shares the given `FontSystem`.
+    ///
+    /// Use this together with `TextRenderer::font_system_handle()` so measured text
+    /// widths match what gets rendered to screen.
+    pub fn with_font_system(font_system: FontSystemHandle) -> Self {
+        Self {
+            text_measurer: TextMeasurer::with_font_system(font_system),
+            ..Self::default()
+        }
     }
 
     pub fn clear(&mut self) {
@@ -88,8 +99,16 @@ impl DrawList {
     }
 
     /// Measure text using glyphon's shaping/layout path.
-    pub fn measure_text(&mut self, text: &str, font_size: f32) -> (f32, f32) {
-        self.text_measurer.measure(text, font_size)
+    ///
+    /// Pass `max_width = None` for unconstrained single-line measurement, or
+    /// `Some(w)` to let glyphon wrap and report the resulting multi-line height.
+    pub fn measure_text(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+    ) -> (f32, f32) {
+        self.text_measurer.measure(text, font_size, max_width)
     }
 
     /// Push a clipping rectangle. Nested clips are intersected with the current clip.
@@ -188,14 +207,37 @@ impl DrawList {
         let x1 = rect.x + rect.width;
         let y1 = rect.y + rect.height;
 
+        // Zero-overlap decomposition: center quad + 4 side strips + 4 corner fans.
+        // Every pixel inside the rounded rect is covered by exactly one triangle, so
+        // semi-transparent fills don't double-blend at the corners.
+
+        // Center quad — fully inset rect, untouched by corner arcs.
+        self.quad(
+            x0 + radius,
+            y0 + radius,
+            rect.width - radius * 2.0,
+            rect.height - radius * 2.0,
+            color,
+        );
+        // Top side strip
         self.quad(
             x0 + radius,
             y0,
             rect.width - radius * 2.0,
-            rect.height,
+            radius,
             color,
         );
+        // Bottom side strip
+        self.quad(
+            x0 + radius,
+            y1 - radius,
+            rect.width - radius * 2.0,
+            radius,
+            color,
+        );
+        // Left side strip
         self.quad(x0, y0 + radius, radius, rect.height - radius * 2.0, color);
+        // Right side strip
         self.quad(
             x1 - radius,
             y0 + radius,

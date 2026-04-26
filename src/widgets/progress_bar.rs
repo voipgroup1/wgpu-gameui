@@ -92,7 +92,7 @@ impl ProgressBar {
             let pct = (self.value * 100.0) as u32;
             let text = format!("{}%", pct);
             let font_size = rect.height * 0.7;
-            let (text_width, _) = list.measure_text(&text, font_size);
+            let (text_width, _) = list.measure_text(&text, font_size, None);
             let text_x = rect.x + (rect.width - text_width) / 2.0;
             let text_y = rect.y + (rect.height - font_size) / 2.0;
 
