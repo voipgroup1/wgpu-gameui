@@ -1,0 +1,13 @@
+[package]
+name = "wgpu-gameui"
+version = "0.1.0"
+edition = "2024"
+description = "Custom wgpu-based game UI library"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/serialexp/wgpu-gameui"
+
+[dependencies]
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+glyphon = "0.8"
+log = "0.4"
