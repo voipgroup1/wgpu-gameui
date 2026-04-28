@@ -67,13 +67,17 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 ## Widgets
 
 - [ ] **P0 — Dropdown / combo / select.** Universal in settings/mod menus.
-- [ ] **P0 — ScrollView / scroll container** (general — today `ScrollState`
-      lives only inside `Table`).
-- [ ] **P0 — Modal / dialog / popup layer** with z-order stacking and input
-      gobbling. Teardown's `UiModalBegin`/`UiModalEnd`/`UiWindow`.
-- [ ] **P0 — Popup / portal layer** for dropdowns, context menus, tooltips.
-      Tooltip currently relies on caller draw order
-      (`src/widgets/tooltip.rs:135` — "call this at the end").
+- [x] **P0 — ScrollView / scroll container** (general — `ScrollView` widget
+      with caller-owned `ScrollState`, vertical+horizontal scroll, wheel
+      input, draggable thumb, lives in `src/widgets/scroll_view.rs`. `Table`
+      now uses it).
+- [x] **P0 — Modal / dialog / popup layer** with z-order stacking and input
+      gobbling. `LayerStack` in `src/layer.rs` plus
+      `UiContext::modal_begin`/`modal_end`/`popup_begin`/`popup_end`.
+      `InputState::mouse_consumed` tracks layer-dispatch capture.
+- [x] **P0 — Popup / portal layer** for dropdowns, context menus, tooltips.
+      `LayerStack::push_popup`/`push_tooltip`. Tooltip refactored to render
+      onto its own layer via `TooltipLayer::draw_into_layers`.
 - [ ] **P0 — Image / sprite widget** with sizing/aspect/tinting/UV-rect
       (`UiImage`/`UiImageBox`).
 - [ ] **P1 — Image / icon button** (`UiImageButton`/`UiButtonImageBox`).
@@ -86,9 +90,9 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [ ] **P2 — Separator / divider.**
 - [ ] **P2 — Toast / notification / banner.**
 - [ ] **P2 — Group / titled panel** (workshop equivalent of `UiWindow`).
-- [ ] **P1 — Tooltip hover delay actually works.** `TooltipLayer.hover_delay_ms`
-      is stored but never read; tooltips show immediately
-      (`src/widgets/tooltip.rs:99,118,144`).
+- [x] **P1 — Tooltip hover delay actually works.** `TooltipLayer::tick(dt,
+      input)` accumulates hover time per region; `is_visible()` only
+      returns true once the configured `with_delay_ms` has elapsed.
 - [ ] **P1 — Slider drag capture identity.** Drag state is a caller-owned
       `bool`; multiple sliders can't disambiguate active drag
       (`src/widgets/slider.rs:67`).
@@ -106,7 +110,9 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [ ] **P1 — Content-driven children.** `VStack::child(height, width)` takes
       raw numbers, not actual widget content; `content_size` is always 0.0
       for `Fill`/`Percent` (`src/layout.rs:296-303`).
-- [ ] **P1 — Z-order / layers** (required for popups/modals).
+- [x] **P1 — Z-order / layers** (required for popups/modals). `LayerStack`
+      provides ordered Modal/Popup/Tooltip layers; `UiRenderer::render_layers`
+      renders base → layers in order.
 - [ ] **P2 — Weighted children** beyond equal-share `Fill`.
 - [ ] **P2 — Wrap / flow layout** (inventory grids, mod lists).
 - [ ] **P2 — Stable node IDs in `LayoutResult`** instead of positional indices
@@ -125,8 +131,12 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `backspace_pressed`, `enter_pressed`, and a `text_input` string. No
       Shift/Ctrl/Alt/Cmd, arrows, Home/End, Delete, Ctrl+A/C/V/X. Blocks
       usable text editing.
-- [ ] **P0 — Hit-testing respects clip stack and z-order.** A button under a
-      modal currently still registers hover.
+- [x] **P0 — Hit-testing respects clip stack and z-order.** Layer-aware
+      input dispatch via `InputState::mouse_consumed` +
+      `LayerStack::input_for_layer`/`input_for_base`. `is_hovered()` honors
+      the flag automatically. (Note: existing widgets that call
+      `rect.contains(input.mouse_x, ...)` directly should additionally AND
+      with `!input.mouse_consumed` — `Table` and the example already do.)
 - [ ] **P1 — Multi-button mouse** (right click, middle click) for context
       menus.
 - [ ] **P1 — Double-click and click-and-hold distinction** (timestamps).

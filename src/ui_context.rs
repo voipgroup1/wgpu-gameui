@@ -9,6 +9,7 @@
 //! Pop is explicit. There is no `Drop`-based auto-pop, mirroring Teardown's
 //! `UiPush`/`UiPop` semantics.
 
+use crate::layer::{LayerKind, LayerStack};
 use crate::layout::Rect;
 use crate::text::TextBlock;
 use crate::widgets::DrawList;
@@ -79,38 +80,75 @@ impl AlignSpec {
     }
 }
 
-/// Teardown-style façade over `DrawList`. Owns no draw state — borrows the
-/// list for the duration of the build.
+/// What `UiContext` is rendering into.
+enum Backend<'a> {
+    /// Plain draw list (no layer system; modal_begin/popup_begin will panic
+    /// in debug if called).
+    List(&'a mut DrawList),
+    /// Full layer stack — modal_begin/popup_begin route here.
+    Layers(&'a mut LayerStack),
+}
+
+impl<'a> Backend<'a> {
+    fn list_mut(&mut self) -> &mut DrawList {
+        match self {
+            Backend::List(l) => l,
+            Backend::Layers(s) => s.current_mut(),
+        }
+    }
+}
+
+/// Teardown-style façade over a `DrawList` or `LayerStack`. Owns no draw
+/// state — borrows the backend for the duration of the build.
 pub struct UiContext<'a> {
-    list: &'a mut DrawList,
+    backend: Backend<'a>,
     align_stack: Vec<AlignSpec>,
+    /// Stack of layer kinds still open — used by Drop debug_assert, by
+    /// modal_end / popup_end to verify the caller closed the right kind, and
+    /// to detect unbalanced begin/end pairs. Length == number of open layers.
+    open_layer_kinds: Vec<LayerKind>,
     /// Names of unknown align tokens we've already warned about, to keep one
     /// typo from spamming the log every frame.
     warned_align_tokens: std::collections::HashSet<String>,
 }
 
 impl<'a> UiContext<'a> {
-    /// Wrap an existing `DrawList`.
+    /// Wrap an existing `DrawList`. `modal_begin`/`popup_begin` will
+    /// debug_assert when called on this variant — switch to
+    /// [`UiContext::with_layers`] for full layer support.
     pub fn new(list: &'a mut DrawList) -> Self {
         Self {
-            list,
+            backend: Backend::List(list),
             align_stack: vec![AlignSpec::DEFAULT],
+            open_layer_kinds: Vec::new(),
+            warned_align_tokens: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Wrap a `LayerStack`. Enables `modal_begin`/`popup_begin`.
+    pub fn with_layers(layers: &'a mut LayerStack) -> Self {
+        Self {
+            backend: Backend::Layers(layers),
+            align_stack: vec![AlignSpec::DEFAULT],
+            open_layer_kinds: Vec::new(),
             warned_align_tokens: std::collections::HashSet::new(),
         }
     }
 
     /// Push transform + tint + align (Teardown's `UiPush`).
     pub fn push(&mut self) {
-        self.list.push_transform();
-        self.list.push_tint();
+        let list = self.backend.list_mut();
+        list.push_transform();
+        list.push_tint();
         let top = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         self.align_stack.push(top);
     }
 
     /// Pop transform + tint + align (Teardown's `UiPop`).
     pub fn pop(&mut self) {
-        self.list.pop_transform();
-        self.list.pop_tint();
+        let list = self.backend.list_mut();
+        list.pop_transform();
+        list.pop_tint();
         if self.align_stack.len() > 1 {
             self.align_stack.pop();
         }
@@ -118,19 +156,19 @@ impl<'a> UiContext<'a> {
 
     /// Shift the local origin (Teardown's `UiTranslate`).
     pub fn translate(&mut self, dx: f32, dy: f32) {
-        self.list.translate(dx, dy);
+        self.backend.list_mut().translate(dx, dy);
     }
 
     /// Rotate the local coordinate frame (Teardown's `UiRotate` is in degrees;
     /// we take radians to match Rust convention. Use `f32::to_radians()` to
     /// convert from degrees at the call site).
     pub fn rotate(&mut self, angle_radians: f32) {
-        self.list.rotate(angle_radians);
+        self.backend.list_mut().rotate(angle_radians);
     }
 
     /// Non-uniform scale the local coordinate frame (Teardown's `UiScale`).
     pub fn scale(&mut self, sx: f32, sy: f32) {
-        self.list.scale(sx, sy);
+        self.backend.list_mut().scale(sx, sy);
     }
 
     /// Set alignment for subsequent placement helpers (Teardown's `UiAlign`).
@@ -164,30 +202,32 @@ impl<'a> UiContext<'a> {
 
     /// Replace the current tint (Teardown's `UiColor`).
     pub fn color(&mut self, r: f32, g: f32, b: f32, a: f32) {
-        self.list.set_tint([r, g, b, a]);
+        self.backend.list_mut().set_tint([r, g, b, a]);
     }
 
     /// Multiply into the current tint (Teardown's `UiColorFilter`).
     pub fn color_filter(&mut self, r: f32, g: f32, b: f32, a: f32) {
-        self.list.multiply_tint([r, g, b, a]);
+        self.backend.list_mut().multiply_tint([r, g, b, a]);
     }
 
     /// Return the current world-space cursor position (origin of the local
     /// frame after all active transforms).
-    pub fn cursor(&self) -> [f32; 2] {
-        self.list.current_transform().transform_point([0.0, 0.0])
+    pub fn cursor(&mut self) -> [f32; 2] {
+        self.backend
+            .list_mut()
+            .current_transform()
+            .transform_point([0.0, 0.0])
     }
 
     /// Compute the world-space rect for a widget of the given local size at
     /// the current origin under the active alignment, then transform through
-    /// the active affine. For translate-only and axis-aligned-scale transforms
-    /// this is exact; for rotated/sheared transforms it returns the AABB of
-    /// the rotated quad and the result will not match a rotated draw exactly.
-    pub fn place_rect(&self, width: f32, height: f32) -> Rect {
+    /// the active affine.
+    pub fn place_rect(&mut self, width: f32, height: f32) -> Rect {
         let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         let [ox, oy] = align.offset(width, height);
         let local = Rect::new(ox, oy, width, height);
-        self.list
+        self.backend
+            .list_mut()
             .current_transform()
             .transform_rect_aabb(local)
     }
@@ -196,22 +236,19 @@ impl<'a> UiContext<'a> {
     pub fn quad(&mut self, w: f32, h: f32, color: [f32; 4]) {
         let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         let [ox, oy] = align.offset(w, h);
-        self.list.quad(ox, oy, w, h, color);
+        self.backend.list_mut().quad(ox, oy, w, h, color);
     }
 
     /// Draw a rounded rect of the given size at the aligned origin.
     pub fn rounded_rect(&mut self, w: f32, h: f32, radius: f32, color: [f32; 4]) {
         let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         let [ox, oy] = align.offset(w, h);
-        self.list
+        self.backend
+            .list_mut()
             .rounded_rect(Rect::new(ox, oy, w, h), radius, color);
     }
 
     /// Draw a text block whose origin honours align/transform.
-    ///
-    /// Width for alignment is derived from the block's `max_width`; height
-    /// from `line_height`. Use `measure_text` if you need pixel-perfect text
-    /// alignment.
     pub fn text(&mut self, mut block: TextBlock) {
         let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         let w = block.max_width;
@@ -219,27 +256,113 @@ impl<'a> UiContext<'a> {
         let [ox, oy] = align.offset(w, h);
         block.x += ox;
         block.y += oy;
-        self.list.text(block);
+        self.backend.list_mut().text(block);
     }
 
-    /// Direct access to the underlying `DrawList`. Calls still honour the
-    /// active transform / tint / clip stacks because those live on the list.
+    /// Direct access to the underlying `DrawList` (the currently active layer's
+    /// list when running on a `LayerStack`).
     pub fn list(&mut self) -> &mut DrawList {
-        self.list
+        self.backend.list_mut()
+    }
+
+    /// Open a modal layer covering `rect`. Subsequent draw calls go to the
+    /// modal layer until `modal_end` is called. Lower layers receive
+    /// `mouse_consumed = true` for input dispatch.
+    ///
+    /// Calling this on a `UiContext::new(DrawList)` (no layers) hits a
+    /// `debug_assert!` — switch to `UiContext::with_layers` for modal support.
+    pub fn modal_begin(&mut self, rect: Rect) {
+        match &mut self.backend {
+            Backend::List(_) => {
+                debug_assert!(
+                    false,
+                    "UiContext::modal_begin requires a LayerStack backend; \
+                     construct via UiContext::with_layers(...)"
+                );
+            }
+            Backend::Layers(s) => {
+                s.push_modal(rect);
+                self.open_layer_kinds.push(LayerKind::Modal);
+            }
+        }
+    }
+
+    /// Close the most recent modal layer. Debug-asserts that the most-recent
+    /// open layer was opened with `modal_begin`.
+    pub fn modal_end(&mut self) {
+        self.close_layer(LayerKind::Modal);
+    }
+
+    /// Open a popup layer with bounding `rect`. Clicks inside `rect` are
+    /// captured (lower layers see `mouse_consumed`); clicks outside fall
+    /// through.
+    pub fn popup_begin(&mut self, rect: Rect) {
+        match &mut self.backend {
+            Backend::List(_) => {
+                debug_assert!(
+                    false,
+                    "UiContext::popup_begin requires a LayerStack backend; \
+                     construct via UiContext::with_layers(...)"
+                );
+            }
+            Backend::Layers(s) => {
+                s.push_popup(rect);
+                self.open_layer_kinds.push(LayerKind::Popup);
+            }
+        }
+    }
+
+    /// Close the most recent popup layer. Debug-asserts that the most-recent
+    /// open layer was opened with `popup_begin`.
+    pub fn popup_end(&mut self) {
+        self.close_layer(LayerKind::Popup);
+    }
+
+    fn close_layer(&mut self, expected: LayerKind) {
+        match &mut self.backend {
+            Backend::List(_) => {
+                debug_assert!(
+                    false,
+                    "UiContext::*_end called on a UiContext that has no layer backend"
+                );
+            }
+            Backend::Layers(s) => {
+                let top = self.open_layer_kinds.last().copied();
+                // Pop *before* asserting so a kind-mismatch panic doesn't
+                // turn into a double-panic via Drop's balance check.
+                if !self.open_layer_kinds.is_empty() {
+                    s.pop_layer();
+                    self.open_layer_kinds.pop();
+                }
+                debug_assert!(
+                    top.is_some(),
+                    "UiContext::*_end called with no open layer"
+                );
+                debug_assert!(
+                    top == Some(expected),
+                    "UiContext layer kind mismatch: expected to close a {:?}, but the most-recent open layer is a {:?}",
+                    expected,
+                    top
+                );
+            }
+        }
     }
 }
 
 impl<'a> Drop for UiContext<'a> {
-    /// Surfaces unbalanced `push`/`pop` calls in debug builds. We do NOT
-    /// auto-pop — that would mask the bug and contradict Teardown semantics.
-    /// In release builds this is a no-op.
+    /// Surfaces unbalanced `push`/`pop` calls in debug builds.
     fn drop(&mut self) {
         debug_assert_eq!(
             self.align_stack.len(),
             1,
-            "UiContext dropped with {} unbalanced push/pop pair(s) on the align stack \
-             (expected exactly 1 entry, the implicit base)",
+            "UiContext dropped with {} unbalanced push/pop pair(s) on the align stack",
             self.align_stack.len() - 1
+        );
+        debug_assert_eq!(
+            self.open_layer_kinds.len(),
+            0,
+            "UiContext dropped with {} unbalanced modal_begin/end or popup_begin/end pair(s)",
+            self.open_layer_kinds.len()
         );
     }
 }
@@ -255,7 +378,7 @@ mod tests {
     #[test]
     fn align_left_top_at_origin() {
         let mut list = DrawList::new();
-        let ui = UiContext::new(&mut list);
+        let mut ui = UiContext::new(&mut list);
         let r = ui.place_rect(10.0, 20.0);
         assert_eq!(r, Rect::new(0.0, 0.0, 10.0, 20.0));
     }
@@ -377,6 +500,71 @@ mod tests {
         assert_eq!(spec.h, AlignH::Center);
         assert_eq!(spec.v, AlignV::Bottom);
         assert_eq!(unknown, vec!["wibble".to_string()]);
+    }
+
+    #[test]
+    fn modal_begin_routes_draws_to_modal_layer() {
+        let mut layers = LayerStack::new();
+        {
+            let mut ui = UiContext::with_layers(&mut layers);
+            ui.quad(10.0, 10.0, [1.0; 4]); // base
+            ui.modal_begin(Rect::new(0.0, 0.0, 50.0, 50.0));
+            ui.quad(20.0, 20.0, [1.0; 4]); // routed to modal
+            ui.modal_end();
+            ui.quad(5.0, 5.0, [1.0; 4]); // base again
+        }
+        // Base list got 2 quads (8 verts), modal got 1 quad (4 verts).
+        assert_eq!(layers.base().vertices.len(), 8);
+        assert_eq!(layers.layers().len(), 1);
+        assert_eq!(layers.layers()[0].list.vertices.len(), 4);
+    }
+
+    #[test]
+    fn nested_modal_popup_balanced() {
+        let mut layers = LayerStack::new();
+        {
+            let mut ui = UiContext::with_layers(&mut layers);
+            ui.modal_begin(Rect::new(0.0, 0.0, 200.0, 200.0));
+            ui.popup_begin(Rect::new(50.0, 50.0, 50.0, 50.0));
+            ui.popup_end();
+            ui.modal_end();
+        }
+        assert!(!layers.has_active_layer());
+        assert_eq!(layers.layers().len(), 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn modal_begin_on_drawlist_only_panics_in_debug() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.modal_begin(Rect::new(0.0, 0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "unbalanced modal_begin")]
+    fn unbalanced_modal_drop_panics_in_debug() {
+        // Box the LayerStack so we can leak it on panic-unwind to avoid a
+        // double-panic from its own balance assertion.
+        let mut layers = Box::new(LayerStack::new());
+        let layers_ptr: *mut LayerStack = &mut *layers;
+        // SAFETY: forget the box to prevent its Drop firing during unwind.
+        std::mem::forget(layers);
+        // SAFETY: still pointing at valid memory we won't touch after the
+        // panic; the test process tears down regardless.
+        let layers_ref = unsafe { &mut *layers_ptr };
+        let mut ui = UiContext::with_layers(layers_ref);
+        ui.modal_begin(Rect::new(0.0, 0.0, 1.0, 1.0));
+        // Drop of `ui` fires the debug_assert.
+    }
+
+    #[test]
+    #[should_panic(expected = "layer kind mismatch")]
+    fn popup_begin_followed_by_modal_end_panics_in_debug() {
+        let mut layers = LayerStack::new();
+        let mut ui = UiContext::with_layers(&mut layers);
+        ui.popup_begin(Rect::new(0.0, 0.0, 1.0, 1.0));
+        ui.modal_end(); // wrong kind -> debug_assert; layer still popped
     }
 
     #[test]

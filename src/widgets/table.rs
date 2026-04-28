@@ -4,6 +4,7 @@ use crate::layout::Rect;
 use crate::text::TextBlock;
 use crate::{InputState, Theme};
 
+use super::scroll_view::{ScrollState, ScrollView};
 use super::DrawList;
 
 /// Column width specification.
@@ -80,37 +81,6 @@ impl From<&str> for TableCell {
     }
 }
 
-/// Scroll state for scrollable containers.
-#[derive(Debug, Clone, Default)]
-pub struct ScrollState {
-    pub offset: f32,
-    pub content_height: f32,
-    pub visible_height: f32,
-}
-
-impl ScrollState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Update scroll offset with mouse wheel delta.
-    /// Call this when the mouse is over the scrollable area.
-    pub fn scroll(&mut self, delta: f32) {
-        let max_scroll = (self.content_height - self.visible_height).max(0.0);
-        self.offset = (self.offset - delta * 20.0).clamp(0.0, max_scroll);
-    }
-
-    /// Reset scroll to top.
-    pub fn reset(&mut self) {
-        self.offset = 0.0;
-    }
-
-    /// Check if content is scrollable.
-    pub fn is_scrollable(&self) -> bool {
-        self.content_height > self.visible_height
-    }
-}
-
 /// Output from drawing a table.
 pub struct TableOutput {
     /// The rect occupied by the entire table (including header).
@@ -139,7 +109,7 @@ pub struct TableOutput {
 ///
 /// let output = Table::new(&columns)
 ///     .with_row_height(24.0)
-///     .draw(rect, &rows, &mut scroll, draw_list, theme, input);
+///     .draw(rect, &rows, &mut scroll, draw_list, theme, &mut input);
 ///
 /// if let Some(idx) = output.clicked_row {
 ///     selected = Some(data[idx].id);
@@ -192,7 +162,7 @@ impl<'a> Table<'a> {
         scroll: &mut ScrollState,
         list: &mut DrawList,
         theme: &Theme,
-        input: &InputState,
+        input: &mut InputState,
     ) -> TableOutput {
         let header_h = if self.show_header {
             self.header_height
@@ -206,17 +176,9 @@ impl<'a> Table<'a> {
             rect.height - header_h,
         );
 
-        // Update scroll state
-        scroll.content_height = rows.len() as f32 * self.row_height;
-        scroll.visible_height = content_rect.height;
-
-        // Check mouse over content area
-        let mouse_over_content = content_rect.contains(input.mouse_x, input.mouse_y);
-
-        // Handle scroll input when mouse is over content
-        if mouse_over_content && input.scroll_delta != 0.0 {
-            scroll.scroll(input.scroll_delta);
-        }
+        // Update scroll state's content extent — ScrollView handles clamping +
+        // wheel + scrollbar interaction from here.
+        scroll.content_size = [rect.width, rows.len() as f32 * self.row_height];
 
         // Calculate column widths
         let col_widths = self.calculate_column_widths(rect.width);
@@ -226,109 +188,97 @@ impl<'a> Table<'a> {
             self.draw_header(rect, &col_widths, list, theme);
         }
 
-        // Draw rows
+        // Track interaction results from inside the closure.
         let mut clicked_row = None;
         let mut hovered_row = None;
         let font_size = theme.font_size * 0.75;
 
-        let first_visible = (scroll.offset / self.row_height).floor() as usize;
-        let visible_count = (content_rect.height / self.row_height).ceil() as usize + 1;
+        let mouse_over_content = content_rect.contains(input.mouse_x, input.mouse_y)
+            && !input.mouse_consumed;
 
-        list.push_clip(content_rect);
+        // Snapshot offset for use inside the closure — scroll is borrowed
+        // mutably by ScrollView::draw, so we read once up front. Same for
+        // mouse position: ScrollView gets `&mut input` and may zero scroll
+        // fields, but the fields we use here (mouse position + click state)
+        // are stable for the lifetime of the call.
+        let scroll_y = scroll.offset[1];
+        let mouse_y = input.mouse_y;
+        let mouse_clicked = input.mouse_clicked;
 
-        for row_idx in first_visible..(first_visible + visible_count).min(rows.len()) {
-            if row_idx >= rows.len() {
-                break;
-            }
+        ScrollView::new(content_rect)
+            .vertical_only()
+            .draw(scroll, list, theme, input, |list, vp| {
+                // The ScrollView has translated by -scroll.offset and clipped
+                // to `vp`. Draw rows in vp-local world coordinates: row N lives
+                // at y = vp.y + N * row_height (pre-translation), which the
+                // ScrollView shifts by -offset for us.
+                let first_visible = (scroll_y / self.row_height).floor() as usize;
+                let visible_count =
+                    (vp.height / self.row_height).ceil() as usize + 1;
 
-            let row = &rows[row_idx];
-            let y = content_rect.y + (row_idx as f32 * self.row_height) - scroll.offset;
+                let end = (first_visible + visible_count).min(rows.len());
+                for (row_idx, row) in rows
+                    .iter()
+                    .enumerate()
+                    .skip(first_visible)
+                    .take(end.saturating_sub(first_visible))
+                {
+                    // `world_y` here is in CONTENT space (pre-scroll-translate)
+                    // — this is what we draw at, because the ScrollView has
+                    // already pushed a `translate(0, -scroll_y)` for us.
+                    let world_y = vp.y + row_idx as f32 * self.row_height;
+                    // `screen_y` is where this row actually lands on screen.
+                    // Mouse coords are in screen space, so we hit-test against
+                    // this, not against `world_y`.
+                    let screen_y = world_y - scroll_y;
 
-            // Skip if above visible area
-            if y + self.row_height < content_rect.y {
-                continue;
-            }
-            // Skip if below visible area
-            if y > content_rect.y + content_rect.height {
-                break;
-            }
+                    let row_hovered = mouse_over_content
+                        && mouse_y >= screen_y
+                        && mouse_y < screen_y + self.row_height
+                        && mouse_y >= vp.y
+                        && mouse_y < vp.y + vp.height;
 
-            let row_rect = Rect::new(rect.x, y, rect.width, self.row_height);
+                    if row_hovered {
+                        hovered_row = Some(row_idx);
+                        if mouse_clicked {
+                            clicked_row = Some(row_idx);
+                        }
+                    }
 
-            // Check hover/click (only if within content bounds)
-            let row_hovered = mouse_over_content
-                && input.mouse_y >= y
-                && input.mouse_y < y + self.row_height
-                && input.mouse_y >= content_rect.y
-                && input.mouse_y < content_rect.y + content_rect.height;
+                    let bg_color = if row_hovered {
+                        theme.button_hover
+                    } else if self.zebra_stripe && row_idx % 2 == 1 {
+                        let mut c = theme.panel;
+                        c[0] *= 1.1;
+                        c[1] *= 1.1;
+                        c[2] *= 1.1;
+                        c
+                    } else {
+                        [0.0, 0.0, 0.0, 0.0]
+                    };
 
-            if row_hovered {
-                hovered_row = Some(row_idx);
-                if input.mouse_clicked {
-                    clicked_row = Some(row_idx);
+                    if bg_color[3] > 0.0 {
+                        list.quad(rect.x, world_y, rect.width, self.row_height, bg_color);
+                    }
+
+                    let mut x = rect.x;
+                    for (col_idx, col_width) in col_widths.iter().enumerate() {
+                        if col_idx < row.len() {
+                            let cell = &row[col_idx];
+                            let cell_rect = Rect::new(x, world_y, *col_width, self.row_height);
+                            self.draw_cell(
+                                cell,
+                                &self.columns[col_idx],
+                                cell_rect,
+                                font_size,
+                                list,
+                                theme,
+                            );
+                        }
+                        x += col_width;
+                    }
                 }
-            }
-
-            // Row background
-            let bg_color = if row_hovered {
-                theme.button_hover
-            } else if self.zebra_stripe && row_idx % 2 == 1 {
-                let mut c = theme.panel;
-                c[0] *= 1.1;
-                c[1] *= 1.1;
-                c[2] *= 1.1;
-                c
-            } else {
-                [0.0, 0.0, 0.0, 0.0] // transparent
-            };
-
-            if bg_color[3] > 0.0 {
-                list.quad(
-                    row_rect.x,
-                    row_rect.y,
-                    row_rect.width,
-                    row_rect.height,
-                    bg_color,
-                );
-            }
-
-            // Draw cells
-            let mut x = rect.x;
-            for (col_idx, col_width) in col_widths.iter().enumerate() {
-                if col_idx < row.len() {
-                    let cell = &row[col_idx];
-                    let cell_rect = Rect::new(x, y, *col_width, self.row_height);
-                    self.draw_cell(
-                        cell,
-                        &self.columns[col_idx],
-                        cell_rect,
-                        font_size,
-                        list,
-                        theme,
-                    );
-                }
-                x += col_width;
-            }
-        }
-
-        list.pop_clip();
-
-        // Draw scroll bar if needed
-        if scroll.is_scrollable() {
-            let scroll_bar_width = 4.0;
-            let scroll_track_x = rect.x + rect.width - scroll_bar_width - 2.0;
-            let scroll_bar_height =
-                content_rect.height * (content_rect.height / scroll.content_height);
-            let scroll_bar_y =
-                content_rect.y + (scroll.offset / scroll.content_height) * content_rect.height;
-            list.quad(
-                scroll_track_x,
-                scroll_bar_y,
-                scroll_bar_width,
-                scroll_bar_height,
-                theme.text_dim,
-            );
-        }
+            });
 
         TableOutput {
             rect,
@@ -461,5 +411,93 @@ impl<'a> Table<'a> {
                 (color[2] * 255.0) as u8,
             );
         list.text(text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cols() -> Vec<TableColumn> {
+        vec![
+            TableColumn::new("A", ColumnWidth::Flex(1.0)),
+            TableColumn::new("B", ColumnWidth::Fixed(40.0)),
+        ]
+    }
+
+    fn rows(n: usize) -> Vec<Vec<TableCell>> {
+        (0..n)
+            .map(|i| vec![TableCell::new(format!("a{}", i)), TableCell::new(format!("b{}", i))])
+            .collect()
+    }
+
+    #[test]
+    fn click_targets_correct_row_after_scroll() {
+        // Build a table with 50 rows of height 24 (1200px content) into a
+        // 200x100 viewport (header off). After scrolling down 100px, row 0 is
+        // off-screen and the first visible row should be row ~4 at screen y=
+        // viewport.y + 4*24 - 100 = -4. The mouse hovers at the screen-y of
+        // row 5: viewport.y + 5*24 - 100 = 20.
+        let columns = cols();
+        let row_data = rows(50);
+        let table = Table::new(&columns).with_row_height(24.0).with_header(false);
+
+        let mut scroll = ScrollState::default();
+        scroll.content_size = [200.0, 50.0 * 24.0];
+        scroll.offset = [0.0, 100.0];
+
+        let viewport = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let row_idx = 5usize;
+        // Screen y for the top of row_idx after scrolling.
+        let screen_y = viewport.y + row_idx as f32 * 24.0 - scroll.offset[1];
+        // Mouse in middle of that row (in screen space).
+        let mouse_y = screen_y + 12.0;
+
+        let mut input = InputState {
+            mouse_x: viewport.x + 50.0,
+            mouse_y,
+            mouse_clicked: true,
+            mouse_down: true,
+            ..InputState::default()
+        };
+
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        let out = table.draw(viewport, &row_data, &mut scroll, &mut list, &theme, &mut input);
+        assert_eq!(
+            out.clicked_row,
+            Some(row_idx),
+            "expected row {} (screen_y={}, mouse_y={}) but got {:?}",
+            row_idx,
+            screen_y,
+            mouse_y,
+            out.clicked_row
+        );
+        assert_eq!(out.hovered_row, Some(row_idx));
+    }
+
+    #[test]
+    fn click_above_viewport_does_not_pick_a_row() {
+        // Mouse above the table — must not register as a hover even though
+        // the math could otherwise land on a content-space row position.
+        let columns = cols();
+        let row_data = rows(50);
+        let table = Table::new(&columns).with_row_height(24.0).with_header(false);
+
+        let mut scroll = ScrollState::default();
+        scroll.content_size = [200.0, 50.0 * 24.0];
+        scroll.offset = [0.0, 100.0];
+        let viewport = Rect::new(0.0, 200.0, 200.0, 100.0);
+        let mut input = InputState {
+            mouse_x: 50.0,
+            mouse_y: 50.0, // above viewport.y == 200
+            mouse_clicked: true,
+            ..InputState::default()
+        };
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        let out = table.draw(viewport, &row_data, &mut scroll, &mut list, &theme, &mut input);
+        assert_eq!(out.clicked_row, None);
+        assert_eq!(out.hovered_row, None);
     }
 }

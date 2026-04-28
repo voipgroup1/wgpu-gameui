@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::layer::LayerStack;
 use crate::render::atlas::{SpriteAtlas, SpriteId};
 use crate::text::FontSystemHandle;
 use crate::widgets::{DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex};
@@ -420,22 +421,55 @@ impl UiRenderer {
         viewport: (u32, u32),
         draw_list: &DrawList,
     ) {
-        // Upload uniforms (ortho for current viewport).
+        self.prepare_frame(device, queue, viewport);
+        self.render_one(device, queue, encoder, view, draw_list);
+    }
+
+    /// Render a `LayerStack`: base list first, then each layer in push order.
+    /// Each layer goes through the full 4-pass pipeline so a higher-z layer's
+    /// quads correctly overlap a lower-z layer's text/icons.
+    pub fn render_layers(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        viewport: (u32, u32),
+        layers: &LayerStack,
+    ) {
+        self.prepare_frame(device, queue, viewport);
+        self.render_one(device, queue, encoder, view, layers.base());
+        for layer in layers.layers() {
+            self.render_one(device, queue, encoder, view, &layer.list);
+        }
+    }
+
+    fn prepare_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        viewport: (u32, u32),
+    ) {
         let uniforms = Uniforms {
             view_proj: ortho_matrix(viewport.0 as f32, viewport.1 as f32),
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         self.text_renderer.resize(viewport.0, viewport.1);
-
-        // Flush any pending atlas changes.
         self.flush_atlas(device, queue);
+    }
 
+    fn render_one(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        draw_list: &DrawList,
+    ) {
         // Layering, bottom→top: nine-slice backgrounds, colored quads (panels,
         // rounded-rect fills, sliders, custom shapes), icons, text. Each
         // requires its own pass because consecutive layers swap pipelines or
-        // change vertex formats. Merging nine-slices and icons into one
-        // textured pass would put icons *below* the colored-quad layer, which
-        // breaks every widget that draws an icon over a panel.
+        // change vertex formats.
 
         // ---------- 1. Nine-slices ----------
         let nine_slice_verts = self.tessellate_nine_slices(&draw_list.nine_slices);
@@ -445,7 +479,14 @@ impl UiRenderer {
 
         // ---------- 2. Colored quads ----------
         if !draw_list.vertices.is_empty() && !draw_list.indices.is_empty() {
-            self.draw_color(device, queue, encoder, view, &draw_list.vertices, &draw_list.indices);
+            self.draw_color(
+                device,
+                queue,
+                encoder,
+                view,
+                &draw_list.vertices,
+                &draw_list.indices,
+            );
         }
 
         // ---------- 3. Icons ----------

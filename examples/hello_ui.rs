@@ -8,9 +8,11 @@
 use std::sync::Arc;
 
 use wgpu_gameui::layout::Rect;
-use wgpu_gameui::{DrawList, TextBlock, UiContext, UiRenderer};
+use wgpu_gameui::{
+    InputState, LayerStack, ScrollState, ScrollView, TextBlock, Theme, UiContext, UiRenderer,
+};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -54,9 +56,19 @@ struct Gpu {
     nine_slice_id: u32,
 }
 
+#[derive(Default)]
+struct UiState {
+    scroll: ScrollState,
+    modal_open: bool,
+    modal_button_was_clicked: bool,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
+    input: InputState,
+    theme: Theme,
+    state: UiState,
 }
 
 impl ApplicationHandler for App {
@@ -159,6 +171,31 @@ impl ApplicationHandler for App {
                 gpu.ui.resize(&gpu.queue, gpu.config.width, gpu.config.height);
                 window.request_redraw();
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.input.mouse_x = position.x as f32;
+                self.input.mouse_y = position.y as f32;
+                window.request_redraw();
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    let pressed = state == ElementState::Pressed;
+                    if pressed && !self.input.mouse_down {
+                        self.input.mouse_clicked = true;
+                    } else if !pressed && self.input.mouse_down {
+                        self.input.mouse_released = true;
+                    }
+                    self.input.mouse_down = pressed;
+                }
+                window.request_redraw();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as f32,
+                };
+                self.input.scroll_delta = dy;
+                window.request_redraw();
+            }
             WindowEvent::RedrawRequested => {
                 let frame = match gpu.surface.get_current_texture() {
                     Ok(f) => f,
@@ -171,8 +208,24 @@ impl ApplicationHandler for App {
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
 
-                // Build draw list.
-                let mut list = DrawList::new();
+                // Build a LayerStack so we can demo modal layers.
+                let mut layers = LayerStack::new();
+
+                // Push the modal first (if open) so layer dispatch sees the
+                // full z-order when computing `input_for_base`.
+                let modal_rect = Rect::new(220.0, 100.0, 360.0, 200.0);
+                let modal_idx = if self.state.modal_open {
+                    Some(layers.push_modal(modal_rect))
+                } else {
+                    None
+                };
+
+                // Resolve input for the base layer. When a modal is open this
+                // sets `mouse_consumed = true` so base widgets can't fire.
+                let mut base_input = layers.input_for_base(&self.input);
+
+                let list = layers.base_mut();
+
                 // Background nine-slice panel.
                 list.nine_slice_id(
                     gpu.nine_slice_id,
@@ -182,78 +235,149 @@ impl ApplicationHandler for App {
                     260.0,
                     [1.0, 1.0, 1.0, 1.0],
                 );
-                // Inner rounded fill.
                 list.rounded_rect(
                     Rect::new(60.0, 60.0, 440.0, 220.0),
                     8.0,
                     [0.12, 0.14, 0.20, 0.95],
                 );
-                // Pretend button.
-                list.rounded_rect(
-                    Rect::new(80.0, 220.0, 120.0, 40.0),
-                    6.0,
-                    [0.30, 0.55, 0.85, 1.0],
-                );
-                // Icon (sprite).
+
+                // "Open Modal" button rect.
+                let open_btn = Rect::new(80.0, 220.0, 160.0, 40.0);
+                let btn_hovered = !base_input.mouse_consumed
+                    && open_btn.contains(base_input.mouse_x, base_input.mouse_y);
+                let btn_color = if btn_hovered {
+                    [0.40, 0.65, 0.95, 1.0]
+                } else {
+                    [0.30, 0.55, 0.85, 1.0]
+                };
+                list.rounded_rect(open_btn, 6.0, btn_color);
+                if btn_hovered && base_input.mouse_clicked {
+                    self.state.modal_open = true;
+                    self.state.modal_button_was_clicked = true;
+                }
+
                 list.icon_sprite(
                     gpu.icon_sprite,
-                    220.0,
+                    260.0,
                     220.0,
                     40.0,
                     40.0,
                     [1.0, 1.0, 1.0, 1.0],
                 );
 
-                // Text overlay.
                 list.text(
                     TextBlock::new("hello_ui — wgpu-gameui", 80.0, 80.0)
                         .with_size(22.0)
                         .with_color(255, 255, 255),
                 );
                 list.text(
-                    TextBlock::new("Renderer draws panel + quads + icon + text", 80.0, 120.0)
+                    TextBlock::new("Click 'Open Modal' to demo the layer system", 80.0, 120.0)
                         .with_size(14.0)
                         .with_color(200, 210, 230),
                 );
+                list.text(
+                    TextBlock::new("Open Modal", 110.0, 232.0)
+                        .with_size(16.0)
+                        .with_color(255, 255, 255),
+                );
 
-                // ---------------------------------------------------------------
-                // UiContext demo: a panel built with push/translate/color, plus a
-                // rotated badge showing the rotation surface.
-                // ---------------------------------------------------------------
-                {
-                    let mut ui = UiContext::new(&mut list);
+                // ---------- ScrollView demo ----------
+                // 30 rows of overflowing content in a 200x240 viewport.
+                let scroll_viewport = Rect::new(560.0, 60.0, 200.0, 240.0);
+                list.rounded_rect(scroll_viewport, 6.0, [0.06, 0.07, 0.10, 1.0]);
+                self.state.scroll.content_size = [180.0, 30.0 * 24.0];
 
-                    // Translate into the bottom-right area, then nest a panel.
-                    ui.push();
-                    ui.translate(560.0, 60.0);
-                    ui.color(0.20, 0.85, 0.55, 1.0);
-                    ui.rounded_rect(200.0, 80.0, 8.0, [1.0, 1.0, 1.0, 1.0]);
-                    // Centered label inside that panel.
-                    ui.push();
-                    ui.translate(100.0, 40.0);
-                    ui.center();
-                    // Reset tint to white for the label.
-                    ui.color(1.0, 1.0, 1.0, 1.0);
-                    ui.text(
-                        TextBlock::new("UiContext", 0.0, 0.0)
-                            .with_size(20.0)
-                            .with_max_width(200.0)
-                            .with_color(20, 30, 30),
+                ScrollView::new(scroll_viewport).vertical_only().draw(
+                    &mut self.state.scroll,
+                    list,
+                    &self.theme,
+                    &mut base_input,
+                    |list, vp| {
+                        for i in 0..30usize {
+                            let y = vp.y + i as f32 * 24.0;
+                            let bg = if i % 2 == 0 {
+                                [0.16, 0.18, 0.24, 1.0]
+                            } else {
+                                [0.10, 0.12, 0.18, 1.0]
+                            };
+                            list.quad(vp.x + 4.0, y + 2.0, vp.width - 12.0, 20.0, bg);
+                            list.text(
+                                TextBlock::new(
+                                    &format!("Row #{:02}", i),
+                                    vp.x + 12.0,
+                                    y + 4.0,
+                                )
+                                .with_size(14.0)
+                                .with_color(200, 210, 230),
+                            );
+                        }
+                    },
+                );
+
+                // ---------- Modal demo ----------
+                if let Some(idx) = modal_idx {
+                    // Resolve input for THIS layer.
+                    let modal_input = layers.input_for_layer(idx, &self.input);
+
+                    let m = &mut layers.layers_mut()[idx].list;
+                    // Dim the background with a full-screen scrim.
+                    m.quad(
+                        0.0,
+                        0.0,
+                        gpu.config.width as f32,
+                        gpu.config.height as f32,
+                        [0.0, 0.0, 0.0, 0.55],
                     );
-                    ui.pop();
-                    ui.pop();
+                    m.rounded_rect(modal_rect, 8.0, [0.18, 0.20, 0.26, 1.0]);
+                    m.text(
+                        TextBlock::new("Modal Dialog", modal_rect.x + 16.0, modal_rect.y + 16.0)
+                            .with_size(20.0)
+                            .with_color(255, 255, 255),
+                    );
+                    m.text(
+                        TextBlock::new(
+                            "Lower layers can't be hovered while this is open.",
+                            modal_rect.x + 16.0,
+                            modal_rect.y + 56.0,
+                        )
+                        .with_size(14.0)
+                        .with_color(200, 210, 230)
+                        .with_max_width(modal_rect.width - 32.0),
+                    );
+                    let close_btn = Rect::new(
+                        modal_rect.x + modal_rect.width - 110.0,
+                        modal_rect.y + modal_rect.height - 50.0,
+                        90.0,
+                        34.0,
+                    );
+                    let close_hover = close_btn.contains(modal_input.mouse_x, modal_input.mouse_y);
+                    m.rounded_rect(
+                        close_btn,
+                        6.0,
+                        if close_hover {
+                            [0.40, 0.65, 0.95, 1.0]
+                        } else {
+                            [0.30, 0.55, 0.85, 1.0]
+                        },
+                    );
+                    m.text(
+                        TextBlock::new("Close", close_btn.x + 22.0, close_btn.y + 8.0)
+                            .with_size(16.0)
+                            .with_color(255, 255, 255),
+                    );
+                    if close_hover && modal_input.mouse_clicked {
+                        self.state.modal_open = false;
+                    }
+                    layers.pop_layer();
+                }
 
-                    // Color-filter sub-tree: a half-alpha overlay quad.
+                // Bonus: rotated badge from the original demo, on the base layer
+                // (built via UiContext::with_layers so it stays clipped to the
+                // base list).
+                {
+                    let mut ui = UiContext::with_layers(&mut layers);
                     ui.push();
-                    ui.translate(560.0, 160.0);
-                    ui.color_filter(1.0, 1.0, 1.0, 0.5);
-                    ui.quad(200.0, 30.0, [0.30, 0.55, 0.85, 1.0]);
-                    ui.pop();
-
-                    // Rotated badge — demonstrates rotation through the affine
-                    // stack. Origin shifts to the badge centre, then we rotate.
-                    ui.push();
-                    ui.translate(660.0, 240.0);
+                    ui.translate(660.0, 320.0);
                     ui.rotate(15.0_f32.to_radians());
                     ui.center();
                     ui.rounded_rect(160.0, 40.0, 6.0, [0.95, 0.45, 0.30, 1.0]);
@@ -288,17 +412,18 @@ impl ApplicationHandler for App {
                     });
                 }
 
-                gpu.ui.render(
+                gpu.ui.render_layers(
                     &gpu.device,
                     &gpu.queue,
                     &mut encoder,
                     &view,
                     (gpu.config.width, gpu.config.height),
-                    &list,
+                    &layers,
                 );
 
                 gpu.queue.submit(Some(encoder.finish()));
                 frame.present();
+                self.input.end_frame();
                 window.request_redraw();
             }
             _ => {}
@@ -312,6 +437,9 @@ fn main() {
     let mut app = App {
         window: None,
         gpu: None,
+        input: InputState::default(),
+        theme: Theme::default(),
+        state: UiState::default(),
     };
     event_loop.run_app(&mut app).expect("run app");
 }
