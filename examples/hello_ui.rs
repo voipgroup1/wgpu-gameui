@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use wgpu_gameui::layout::Rect;
-use wgpu_gameui::{DrawList, TextBlock, UiRenderer};
+use wgpu_gameui::{DrawList, TextBlock, UiContext, UiRenderer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -215,6 +215,50 @@ impl ApplicationHandler for App {
                         .with_size(14.0)
                         .with_color(200, 210, 230),
                 );
+
+                // ---------------------------------------------------------------
+                // UiContext demo: a panel built with push/translate/color, plus a
+                // rotated badge showing the rotation surface.
+                // ---------------------------------------------------------------
+                {
+                    let mut ui = UiContext::new(&mut list);
+
+                    // Translate into the bottom-right area, then nest a panel.
+                    ui.push();
+                    ui.translate(560.0, 60.0);
+                    ui.color(0.20, 0.85, 0.55, 1.0);
+                    ui.rounded_rect(200.0, 80.0, 8.0, [1.0, 1.0, 1.0, 1.0]);
+                    // Centered label inside that panel.
+                    ui.push();
+                    ui.translate(100.0, 40.0);
+                    ui.center();
+                    // Reset tint to white for the label.
+                    ui.color(1.0, 1.0, 1.0, 1.0);
+                    ui.text(
+                        TextBlock::new("UiContext", 0.0, 0.0)
+                            .with_size(20.0)
+                            .with_max_width(200.0)
+                            .with_color(20, 30, 30),
+                    );
+                    ui.pop();
+                    ui.pop();
+
+                    // Color-filter sub-tree: a half-alpha overlay quad.
+                    ui.push();
+                    ui.translate(560.0, 160.0);
+                    ui.color_filter(1.0, 1.0, 1.0, 0.5);
+                    ui.quad(200.0, 30.0, [0.30, 0.55, 0.85, 1.0]);
+                    ui.pop();
+
+                    // Rotated badge — demonstrates rotation through the affine
+                    // stack. Origin shifts to the badge centre, then we rotate.
+                    ui.push();
+                    ui.translate(660.0, 240.0);
+                    ui.rotate(15.0_f32.to_radians());
+                    ui.center();
+                    ui.rounded_rect(160.0, 40.0, 6.0, [0.95, 0.45, 0.30, 1.0]);
+                    ui.pop();
+                }
 
                 let mut encoder =
                     gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
