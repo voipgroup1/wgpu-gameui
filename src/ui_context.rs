@@ -43,11 +43,13 @@ impl AlignSpec {
 
     /// Parse a Teardown-style align string. Accepts space-separated tokens in
     /// any order: `left|center|right` for horizontal and `top|middle|bottom`
-    /// for vertical. Unknown tokens fall back to the previous component.
-    /// Empty input returns `Default`.
-    fn parse(spec: &str, base: Self) -> Self {
+    /// for vertical. Unknown tokens fall back to the previous component (and
+    /// are returned in the second tuple element so the caller can surface a
+    /// warning). Empty input returns `base` unchanged.
+    fn parse(spec: &str, base: Self) -> (Self, Vec<String>) {
         let mut h = base.h;
         let mut v = base.v;
+        let mut unknown = Vec::new();
         for token in spec.split_ascii_whitespace() {
             match token {
                 "left" => h = AlignH::Left,
@@ -56,10 +58,10 @@ impl AlignSpec {
                 "top" => v = AlignV::Top,
                 "middle" | "center_v" => v = AlignV::Middle,
                 "bottom" => v = AlignV::Bottom,
-                _ => {}
+                other => unknown.push(other.to_string()),
             }
         }
-        Self { h, v }
+        (Self { h, v }, unknown)
     }
 
     fn offset(&self, w: f32, h: f32) -> [f32; 2] {
@@ -82,6 +84,9 @@ impl AlignSpec {
 pub struct UiContext<'a> {
     list: &'a mut DrawList,
     align_stack: Vec<AlignSpec>,
+    /// Names of unknown align tokens we've already warned about, to keep one
+    /// typo from spamming the log every frame.
+    warned_align_tokens: std::collections::HashSet<String>,
 }
 
 impl<'a> UiContext<'a> {
@@ -90,6 +95,7 @@ impl<'a> UiContext<'a> {
         Self {
             list,
             align_stack: vec![AlignSpec::DEFAULT],
+            warned_align_tokens: std::collections::HashSet::new(),
         }
     }
 
@@ -130,7 +136,17 @@ impl<'a> UiContext<'a> {
     /// Set alignment for subsequent placement helpers (Teardown's `UiAlign`).
     pub fn align(&mut self, spec: &str) {
         let base = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
-        let new_spec = AlignSpec::parse(spec, base);
+        let (new_spec, unknown) = AlignSpec::parse(spec, base);
+        for token in unknown {
+            if self.warned_align_tokens.insert(token.clone()) {
+                log::warn!(
+                    "wgpu-gameui: UiContext::align received unknown token '{}' \
+                     (expected one of: left|center|right, top|middle|bottom) — \
+                     ignoring",
+                    token
+                );
+            }
+        }
         if let Some(top) = self.align_stack.last_mut() {
             *top = new_spec;
         }
@@ -210,6 +226,21 @@ impl<'a> UiContext<'a> {
     /// active transform / tint / clip stacks because those live on the list.
     pub fn list(&mut self) -> &mut DrawList {
         self.list
+    }
+}
+
+impl<'a> Drop for UiContext<'a> {
+    /// Surfaces unbalanced `push`/`pop` calls in debug builds. We do NOT
+    /// auto-pop — that would mask the bug and contradict Teardown semantics.
+    /// In release builds this is a no-op.
+    fn drop(&mut self) {
+        debug_assert_eq!(
+            self.align_stack.len(),
+            1,
+            "UiContext dropped with {} unbalanced push/pop pair(s) on the align stack \
+             (expected exactly 1 entry, the implicit base)",
+            self.align_stack.len() - 1
+        );
     }
 }
 
@@ -337,5 +368,26 @@ mod tests {
         }
         // First vertex should be at (100 - 10, 100 - 10) = (90, 90).
         assert_eq!(list.vertices[0].position, [90.0, 90.0]);
+    }
+
+    #[test]
+    fn align_unknown_token_is_collected() {
+        let base = AlignSpec::DEFAULT;
+        let (spec, unknown) = AlignSpec::parse("center wibble bottom", base);
+        assert_eq!(spec.h, AlignH::Center);
+        assert_eq!(spec.v, AlignV::Bottom);
+        assert_eq!(unknown, vec!["wibble".to_string()]);
+    }
+
+    #[test]
+    fn align_call_warns_once_per_unknown_token() {
+        // Same unknown token across multiple align() calls should be deduped.
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.align("typo");
+        ui.align("typo");
+        assert_eq!(ui.warned_align_tokens.len(), 1);
+        ui.align("other_typo");
+        assert_eq!(ui.warned_align_tokens.len(), 2);
     }
 }

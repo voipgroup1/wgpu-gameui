@@ -119,6 +119,19 @@ impl Affine2 {
         self.b == 0.0 && self.c == 0.0
     }
 
+    /// Determinant of the linear (2x2) part — the signed area scale factor.
+    pub fn determinant(&self) -> f32 {
+        self.a * self.d - self.b * self.c
+    }
+
+    /// Geometric-mean uniform scale factor: `sqrt(|det|)`. Useful for scaling
+    /// quantities that aren't tied to a single axis (font size, line width).
+    /// Equals `s` for `Affine2::scale(s, s)`, and the square root of the area
+    /// scale for non-uniform `scale(sx, sy)` (so `scale(2,8)` yields ~4).
+    pub fn uniform_scale(&self) -> f32 {
+        self.determinant().abs().sqrt()
+    }
+
     /// Transform the four corners of a rect and return its axis-aligned
     /// bounding box. For translate-only or axis-aligned-scale transforms this
     /// is exact; otherwise it is the AABB of the rotated/sheared quad.
@@ -263,5 +276,19 @@ mod tests {
         assert_eq!(corners[1], [110.0, 200.0]); // TR
         assert_eq!(corners[2], [110.0, 205.0]); // BR
         assert_eq!(corners[3], [100.0, 205.0]); // BL
+    }
+
+    #[test]
+    fn uniform_scale_returns_geometric_mean() {
+        // identity → 1.0
+        assert!(approx_eq(Affine2::identity().uniform_scale(), 1.0));
+        // uniform scale s → s
+        assert!(approx_eq(Affine2::scale(3.0, 3.0).uniform_scale(), 3.0));
+        // non-uniform → sqrt(|det|): scale(2,8) → sqrt(16) = 4
+        assert!(approx_eq(Affine2::scale(2.0, 8.0).uniform_scale(), 4.0));
+        // rotation preserves area, so uniform_scale stays 1.0
+        assert!(approx_eq(Affine2::rotation(0.7).uniform_scale(), 1.0));
+        // translation has no effect on the linear part
+        assert!(approx_eq(Affine2::translation(50.0, 50.0).uniform_scale(), 1.0));
     }
 }

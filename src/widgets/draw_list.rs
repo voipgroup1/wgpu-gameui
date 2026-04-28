@@ -474,10 +474,12 @@ impl DrawList {
     }
 
     /// Add text. The block's origin is transformed through the current
-    /// affine; uniform scale (taken from the `a` axis of the linear part) is
-    /// applied to font_size and max_width. Rotation/shear is **not supported**
-    /// by glyphon — when the transform has any rotation we log a one-shot
-    /// warning and render axis-aligned.
+    /// affine; uniform scale (the geometric mean of the X and Y axis basis
+    /// lengths, i.e. `sqrt(|det|)`) is applied to font_size, line_height and
+    /// max_width. Under non-uniform scale this picks the "average" zoom so a
+    /// 2x-by-1x stretch becomes ~1.41x text rather than picking only one axis.
+    /// Rotation/shear is **not supported** by glyphon — when the transform
+    /// has any rotation we log a one-shot warning and render axis-aligned.
     pub fn text(&mut self, mut block: TextBlock) {
         let m = self.current_transform();
         if !m.is_axis_aligned() && !self.text_rotation_warned {
@@ -493,9 +495,11 @@ impl DrawList {
         block.x = origin[0];
         block.y = origin[1];
 
-        // Apply uniform scale (use the X-axis basis length so non-uniform
-        // axis-aligned scale picks up the obvious case).
-        let scale = (m.a * m.a + m.c * m.c).sqrt();
+        // Apply uniform-ish scale: geometric mean of the two basis lengths,
+        // which equals sqrt(|det|). This handles non-uniform axis-aligned
+        // scale gracefully (picks the average zoom instead of dropping a
+        // dimension).
+        let scale = m.uniform_scale();
         if scale > 0.0 && (scale - 1.0).abs() > 1e-6 {
             block.font_size *= scale;
             block.line_height *= scale;
