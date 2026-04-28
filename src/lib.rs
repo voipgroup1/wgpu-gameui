@@ -34,11 +34,13 @@ pub mod affine;
 pub mod layout;
 pub mod render;
 mod theme;
+mod ui_context;
 mod widgets;
 
 pub use affine::Affine2;
 pub use render::{NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
 pub use theme::Theme;
+pub use ui_context::{AlignH, AlignV, UiContext};
 pub use widgets::*;
 
 /// Input state passed to UI for interaction.

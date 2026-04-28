@@ -20,11 +20,13 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       (`src/render/atlas.rs`), `load_sprite_rgba8` + `register_nine_slice` on
       `UiRenderer`. `IconDraw`/`NineSliceDraw` now carry pre-resolved
       `SpriteId`/`NineSliceId` with name fallback.
-- [ ] **P0 — Matrix / transform stack** (`UiPush`/`UiPop`/`UiTranslate`/`UiAlign`/
-      `UiCenter`/`UiRotate`/`UiScale`). All widgets currently take absolute
-      `Rect`s. This is the single biggest blocker for the Teardown UI port.
-- [ ] **P0 — Color / tint stack** (`UiColor`/`UiColorFilter`) with sub-tree alpha
-      multiplier so panels can fade in/out. Today vertex colors are baked.
+- [x] **P0 — Matrix / transform stack** (`UiPush`/`UiPop`/`UiTranslate`/`UiAlign`/
+      `UiCenter`/`UiRotate`/`UiScale`). 2x3 affine stack lives on `DrawList`
+      so existing widgets that take absolute `Rect`s pick it up transparently;
+      `UiContext` (`src/ui_context.rs`) is the Teardown-verb façade.
+- [x] **P0 — Color / tint stack** (`UiColor`/`UiColorFilter`) with sub-tree alpha
+      multiplier. Lives alongside the transform stack on `DrawList`; primitive
+      methods multiply input color by current tint at push time.
 - [x] **P0 — Clip / scissor stack.** `push_clip(rect)`/`pop_clip()` with draw
       commands grouped per clip stack. `Table::draw_cell` text is currently
       *not actually clipped* by `content_rect`.
@@ -187,8 +189,11 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 - [ ] **P0 — Lua-binding-friendly facade** (`UiContext` with state stack)
       that backs `UiText`/`UiTextButton`/`UiImageBox`/`UiSlider`/etc. as
-      stateful immediate-mode calls. The crate today is "give me a Rect,
-      build draw commands"; the Teardown layer is the missing wrap.
+      stateful immediate-mode calls. *Partial:* `UiContext` (push/pop,
+      translate/rotate/scale, align/center, color/color_filter, place_rect,
+      quad/rounded_rect/text) landed in `src/ui_context.rs`. Still missing:
+      stateful widget verbs (UiText/UiTextButton/UiSlider/UiImageBox), font
+      stack, sound hooks.
 - [ ] **P0 — World-space UI** (`UiWorldToPixel`/`UiWorldToScreen`) for
       in-world labels, damage numbers, health bars over NPCs.
 - [ ] **P1 — UI sound hooks.** `UiSound`/`UiSoundLoop` and button
