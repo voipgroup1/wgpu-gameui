@@ -14,13 +14,12 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 ## Architecture / Core Plumbing
 
-- [ ] **P0 — Public `UiRenderer`/`Backend`** that owns the wgpu pipeline, sampler,
-      atlas, and consumes a `DrawList` per frame. Today only `TextRenderer`
-      actually renders; quads/icons/nine-slices have no rendering side
-      (`src/widgets/draw_list.rs` ends at line 150 with no draw call site).
-- [ ] **P0 — Texture atlas / sprite registry.** `IconDraw`/`NineSliceDraw` store
-      `String` keys with no place to register textures. Required for
-      Teardown's `LoadSprite`/`DrawSprite`/`UiImage`/`UiImageBox`.
+- [x] **P0 — Public `UiRenderer`/`Backend`** that owns the wgpu pipeline, sampler,
+      atlas, and consumes a `DrawList` per frame. (`src/render/ui_renderer.rs`)
+- [x] **P0 — Texture atlas / sprite registry.** Dynamic shelf packer with grow
+      (`src/render/atlas.rs`), `load_sprite_rgba8` + `register_nine_slice` on
+      `UiRenderer`. `IconDraw`/`NineSliceDraw` now carry pre-resolved
+      `SpriteId`/`NineSliceId` with name fallback.
 - [ ] **P0 — Matrix / transform stack** (`UiPush`/`UiPop`/`UiTranslate`/`UiAlign`/
       `UiCenter`/`UiRotate`/`UiScale`). All widgets currently take absolute
       `Rect`s. This is the single biggest blocker for the Teardown UI port.
@@ -33,9 +32,10 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       widgets are structs with `draw`/`draw_at`, some are unit structs with
       assoc fns, some are free functions. `DrawContext` exists in
       `src/widgets/mod.rs` but is unused.
-- [ ] **P1 — Replace `String` keys in draw commands with interned `IconId`/
-      `SpriteId`/`u32` handles** produced by the atlas. Today every push
-      allocates.
+- [x] **P1 — Replace `String` keys in draw commands with interned `IconId`/
+      `SpriteId`/`u32` handles** produced by the atlas. (Both still accept
+      string-keyed helpers for ergonomics; `icon_sprite`/`nine_slice_id` are the
+      allocation-free path.)
 - [ ] **P1 — Don't `unwrap()` glyphon errors in `TextRenderer::prepare`/
       `render`** (`src/text.rs:103,130`). Bubble as a typed `UiError`.
 - [ ] **P1 — Cache glyphon `Buffer`s by content+size hash or pool them.**
@@ -51,10 +51,11 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       thickness/joins/caps/AA. Teardown's `DrawLine` is top-30. Also needed
       for slider tick marks, debug overlays.
 - [ ] **P1 — Circles / arcs / ellipses** (`UiCircle`).
-- [ ] **P1 — Textured quad with explicit UV rect.** `IconDraw` has no UVs —
-      assumes the whole texture. Atlasing requires UVs.
-- [ ] **P1 — Nine-slice border metadata.** `NineSliceDraw` stores only a key —
-      no border thickness, source rect, scale mode, tint, repeat/stretch.
+- [x] **P1 — Textured quad with explicit UV rect.** Atlas `AtlasRegion::uv()`
+      drives icon UVs, with optional tint per draw.
+- [x] **P1 — Nine-slice border metadata.** `register_nine_slice(name, sprite,
+      border)` on `UiRenderer` records source rect (via SpriteId) + per-side
+      borders, with tint per draw.
 - [ ] **P2 — Gradient helpers** (linear/radial). Per-vertex color exists but
       no constructor.
 - [ ] **P2 — Text outline / shadow** (`UiTextOutline`, `UiTextShadow`).
@@ -210,8 +211,9 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       No `#[cfg(test)]` in any `widgets/*.rs`. The design is testable with
       mock `InputState` + draw-list inspection (slider drag, table scroll,
       text-input editing).
-- [ ] **P1 — `examples/` directory with at least one runnable wgpu
-      example.** No `[[example]]`, no `[dev-dependencies]` today.
+- [x] **P1 — `examples/` directory with at least one runnable wgpu
+      example.** `examples/hello_ui.rs` opens a window and renders a panel +
+      button + icon + nine-slice + text via `UiRenderer`.
 - [ ] **P2 — Rustdoc on all public types.** Several lack it: `Vertex`,
       `IconDraw`, `NineSliceDraw`, `LayoutResult`, `StackChild`,
       `DrawContext::*`.
