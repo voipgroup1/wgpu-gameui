@@ -122,10 +122,10 @@ impl ApplicationHandler for App {
             [220, 80, 80, 255],
             [40, 40, 40, 255],
         );
-        let icon_sprite = ui.load_sprite_rgba8(&queue, "icon", CHECKER_SIZE, CHECKER_SIZE, &icon_pixels);
+        let icon_sprite = ui.load_sprite_rgba8("icon", CHECKER_SIZE, CHECKER_SIZE, &icon_pixels);
 
         let frame_pixels = solid_with_border(32, [180, 180, 200, 255], [60, 60, 90, 255], 4);
-        let frame_sprite = ui.load_sprite_rgba8(&queue, "frame", 32, 32, &frame_pixels);
+        let frame_sprite = ui.load_sprite_rgba8("frame", 32, 32, &frame_pixels);
         let nine_slice_id = ui.register_nine_slice("frame", frame_sprite, [4, 4, 4, 4]);
 
         self.gpu = Some(Gpu {

@@ -6,11 +6,22 @@
 //! up by name. UV coordinates are stored as pixel rects and converted to UV space at
 //! query time so they remain valid when the atlas grows.
 //!
-//! The packer uses a simple shelf algorithm: each shelf has a fixed height, and a
-//! sprite is placed on the first shelf with enough remaining width and height
-//! capacity. New shelves open at `next_shelf_y` when no existing shelf fits. This is
-//! O(N*shelves) per insert, fast enough for hundreds of UI sprites and trivial to
-//! reason about.
+//! ## Bilinear bleed prevention
+//!
+//! Each sprite occupies a `(w + 2) x (h + 2)` cell in the atlas, with the sprite
+//! content placed at offset `(1, 1)` inside the cell. The 1-pixel halo around every
+//! sprite is filled with replicated edge pixels at upload time (see
+//! [`SpriteAtlas::build_pixel_buffer`]) so bilinear sampling at the sprite's
+//! boundary reads `(edge, edge)` instead of `(edge, transparent_gutter)`. Without
+//! this, every non-corner sprite would visibly darken / fade at its edges under
+//! [`wgpu::FilterMode::Linear`] sampling.
+//!
+//! ## Algorithm
+//!
+//! Shelf packer: each shelf has a fixed height, a sprite is placed on the first
+//! shelf with enough remaining width and height capacity. New shelves open at
+//! `next_shelf_y` when no existing shelf fits. O(N * shelves) per insert, fast
+//! enough for hundreds of UI sprites and trivial to reason about.
 
 use std::collections::HashMap;
 
@@ -21,10 +32,11 @@ pub type SpriteId = u32;
 pub(crate) const INITIAL_ATLAS_SIZE: u32 = 1024;
 /// Maximum atlas dimensions before allocation fails.
 pub(crate) const MAX_ATLAS_SIZE: u32 = 4096;
-/// Padding around each sprite to avoid bilinear bleed.
-const SPRITE_PADDING: u32 = 1;
+/// Halo (replicated-edge gutter) width on each side of a sprite, in pixels.
+const SPRITE_HALO: u32 = 1;
 
-/// A region within the atlas, in pixel coordinates.
+/// A region within the atlas, in pixel coordinates. Refers to the *content* rect
+/// — the surrounding 1-pixel halo is implicit and never sampled directly.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct AtlasRegion {
     pub x: u32,
@@ -50,6 +62,7 @@ impl AtlasRegion {
 #[derive(Clone)]
 struct Shelf {
     y: u32,
+    /// Cell height (sprite height + 2 * SPRITE_HALO).
     height: u32,
     cursor_x: u32,
 }
@@ -57,7 +70,7 @@ struct Shelf {
 #[derive(Clone)]
 struct StoredSprite {
     region: AtlasRegion,
-    /// Padded RGBA8 pixels (region.w * region.h * 4).
+    /// Sprite RGBA8 pixels (region.w * region.h * 4) — content only, no halo.
     pixels: Vec<u8>,
 }
 
@@ -137,41 +150,44 @@ impl SpriteAtlas {
     }
 
     fn try_place(&mut self, w: u32, h: u32) -> Option<AtlasRegion> {
-        let pad_w = w + SPRITE_PADDING;
-        let pad_h = h + SPRITE_PADDING;
+        // Each sprite reserves a (w + 2*halo) x (h + 2*halo) cell so its 1px
+        // replicated-edge halo can sit inside the cell without colliding with the
+        // neighbours' halos.
+        let cell_w = w + 2 * SPRITE_HALO;
+        let cell_h = h + 2 * SPRITE_HALO;
 
-        if pad_w > self.width {
+        if cell_w > self.width {
             return None;
         }
 
         // First-fit on existing shelves.
         for shelf in &mut self.shelves {
-            if shelf.height >= pad_h && shelf.cursor_x + pad_w <= self.width {
+            if shelf.height >= cell_h && shelf.cursor_x + cell_w <= self.width {
                 let region = AtlasRegion {
-                    x: shelf.cursor_x,
-                    y: shelf.y,
+                    x: shelf.cursor_x + SPRITE_HALO,
+                    y: shelf.y + SPRITE_HALO,
                     w,
                     h,
                 };
-                shelf.cursor_x += pad_w;
+                shelf.cursor_x += cell_w;
                 return Some(region);
             }
         }
 
         // Open a new shelf.
-        if self.next_shelf_y + pad_h <= self.height {
+        if self.next_shelf_y + cell_h <= self.height {
             let shelf = Shelf {
                 y: self.next_shelf_y,
-                height: pad_h,
-                cursor_x: pad_w,
+                height: cell_h,
+                cursor_x: cell_w,
             };
             let region = AtlasRegion {
-                x: 0,
-                y: shelf.y,
+                x: SPRITE_HALO,
+                y: shelf.y + SPRITE_HALO,
                 w,
                 h,
             };
-            self.next_shelf_y += pad_h;
+            self.next_shelf_y += cell_h;
             self.shelves.push(shelf);
             return Some(region);
         }
@@ -199,18 +215,79 @@ impl SpriteAtlas {
     }
 
     /// Render the full atlas as a single packed RGBA8 buffer of size width*height*4.
+    /// Each sprite is written into its content rect *and* replicated 1 pixel into
+    /// the surrounding halo (top/bottom rows, left/right columns, and the four
+    /// corner pixels) so bilinear sampling at the content edge reads the sprite's
+    /// own colour, not the neighbouring transparent gutter.
     pub fn build_pixel_buffer(&self) -> Vec<u8> {
         let mut buf = vec![0u8; (self.width * self.height * 4) as usize];
+        let stride = (self.width * 4) as usize;
+
+        let put = |buf: &mut [u8], x: u32, y: u32, src: &[u8]| {
+            if x >= self.width || y >= self.height {
+                return;
+            }
+            let off = (y as usize) * stride + (x as usize) * 4;
+            buf[off..off + 4].copy_from_slice(src);
+        };
+
         for sprite in &self.sprites {
             let r = sprite.region;
+            let row_bytes = (r.w * 4) as usize;
+
+            // Content
             for row in 0..r.h {
-                let src_row_start = (row * r.w * 4) as usize;
-                let src_row_end = src_row_start + (r.w * 4) as usize;
-                let dst_row_start =
-                    (((r.y + row) * self.width + r.x) * 4) as usize;
-                let dst_row_end = dst_row_start + (r.w * 4) as usize;
-                buf[dst_row_start..dst_row_end]
-                    .copy_from_slice(&sprite.pixels[src_row_start..src_row_end]);
+                let src_off = (row * r.w * 4) as usize;
+                let dst_off = ((r.y + row) as usize) * stride + (r.x as usize) * 4;
+                buf[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&sprite.pixels[src_off..src_off + row_bytes]);
+            }
+
+            // Top/bottom edge replication (covers the row above / below the content).
+            if r.y >= 1 {
+                let src_off = 0usize;
+                let dst_off = ((r.y - 1) as usize) * stride + (r.x as usize) * 4;
+                buf[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&sprite.pixels[src_off..src_off + row_bytes]);
+            }
+            if r.y + r.h < self.height {
+                let last_row = r.h - 1;
+                let src_off = (last_row * r.w * 4) as usize;
+                let dst_off = ((r.y + r.h) as usize) * stride + (r.x as usize) * 4;
+                buf[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&sprite.pixels[src_off..src_off + row_bytes]);
+            }
+
+            // Left / right edge replication (column-by-column).
+            for row in 0..r.h {
+                let left_src = (row * r.w * 4) as usize;
+                let right_src = (row * r.w * 4 + (r.w - 1) * 4) as usize;
+                if r.x >= 1 {
+                    put(&mut buf, r.x - 1, r.y + row, &sprite.pixels[left_src..left_src + 4]);
+                }
+                if r.x + r.w < self.width {
+                    put(&mut buf, r.x + r.w, r.y + row, &sprite.pixels[right_src..right_src + 4]);
+                }
+            }
+
+            // Four corners — replicate the matching corner pixel into the
+            // diagonal halo cell so bilinear at the sprite corner reads
+            // (corner, corner, corner, corner).
+            let tl = 0usize;
+            let tr = ((r.w - 1) * 4) as usize;
+            let bl = ((r.h - 1) * r.w * 4) as usize;
+            let br = ((r.h - 1) * r.w * 4 + (r.w - 1) * 4) as usize;
+            if r.x >= 1 && r.y >= 1 {
+                put(&mut buf, r.x - 1, r.y - 1, &sprite.pixels[tl..tl + 4]);
+            }
+            if r.x + r.w < self.width && r.y >= 1 {
+                put(&mut buf, r.x + r.w, r.y - 1, &sprite.pixels[tr..tr + 4]);
+            }
+            if r.x >= 1 && r.y + r.h < self.height {
+                put(&mut buf, r.x - 1, r.y + r.h, &sprite.pixels[bl..bl + 4]);
+            }
+            if r.x + r.w < self.width && r.y + r.h < self.height {
+                put(&mut buf, r.x + r.w, r.y + r.h, &sprite.pixels[br..br + 4]);
             }
         }
         buf
@@ -256,27 +333,28 @@ mod tests {
 
     #[test]
     fn grows_when_full() {
-        // Force growth: insert sprites totalling > 1024x1024 area.
+        // With 512x512 sprites at INITIAL_ATLAS_SIZE=1024, cell height is 514, so
+        // only one shelf fits. The 2nd insert is forced to grow.
         let mut atlas = SpriteAtlas::new();
         let big = 512u32;
         let pixels = vec![0u8; (big * big * 4) as usize];
-        // 1024x1024 atlas fits 2x2 of 512 sprites only via shelves of ~513 height,
-        // and the 5th will require growth.
         let _a = atlas.insert(None, big, big, &pixels);
+        assert_eq!(atlas.width(), INITIAL_ATLAS_SIZE);
         let _b = atlas.insert(None, big, big, &pixels);
-        let _c = atlas.insert(None, big, big, &pixels);
-        // Atlas now has shelves at y=0 (height ~513) and y=513 (height ~513);
-        // remaining 511 of 1024 not enough for another 513 shelf, so 4th forces grow.
-        let initial = atlas.width();
-        let _d = atlas.insert(None, big, big, &pixels);
-        assert!(atlas.width() >= initial);
-        // 5th definitely grows or is on a new row in grown atlas.
-        let _e = atlas.insert(None, big, big, &pixels);
-        assert!(atlas.width() >= INITIAL_ATLAS_SIZE);
+        // Second insert should have triggered a grow.
+        assert!(
+            atlas.width() > INITIAL_ATLAS_SIZE,
+            "atlas should have grown after second 512x512 insert (was {})",
+            atlas.width()
+        );
     }
 
     #[test]
     fn pack_no_overlap() {
+        // Stress test: many small sprites of mixed sizes. Verifies regions are
+        // disjoint AND have at least 1 pixel of separation in every direction
+        // (the halo gutter), which is the real invariant the packer must
+        // maintain to prevent bilinear bleed across sprites.
         let mut atlas = SpriteAtlas::new();
         let mut regions = Vec::new();
         for i in 0..50 {
@@ -285,22 +363,82 @@ mod tests {
             let id = atlas.insert(None, s, s, &pixels);
             regions.push(atlas.region(id).unwrap());
         }
-        // Verify none overlap.
         for i in 0..regions.len() {
             for j in (i + 1)..regions.len() {
                 let a = regions[i];
                 let b = regions[j];
-                let overlap_x = a.x < b.x + b.w && b.x < a.x + a.w;
-                let overlap_y = a.y < b.y + b.h && b.y < a.y + a.h;
+                // Treat each region as inflated by 1 pixel in all directions
+                // (i.e. its halo). Inflated rects must NOT overlap.
+                let ax0 = a.x.saturating_sub(1);
+                let ay0 = a.y.saturating_sub(1);
+                let ax1 = a.x + a.w + 1;
+                let ay1 = a.y + a.h + 1;
+                let bx0 = b.x.saturating_sub(1);
+                let by0 = b.y.saturating_sub(1);
+                let bx1 = b.x + b.w + 1;
+                let by1 = b.y + b.h + 1;
+                let overlap_x = ax0 < bx1 && bx0 < ax1;
+                let overlap_y = ay0 < by1 && by0 < ay1;
                 assert!(
                     !(overlap_x && overlap_y),
-                    "regions {} and {} overlap: {:?} vs {:?}",
+                    "regions {} and {} (incl. halo) overlap: {:?} vs {:?}",
                     i,
                     j,
                     a,
                     b
                 );
             }
+        }
+    }
+
+    #[test]
+    fn halo_is_replicated_at_upload() {
+        // Place two sprites of distinctive solid colours adjacent on the same
+        // shelf. Verify that the gutter pixel between them carries each
+        // sprite's edge colour (NOT zeroes), so bilinear at the boundary won't
+        // bleed transparency.
+        let mut atlas = SpriteAtlas::new();
+        let red = [255u8, 0, 0, 255];
+        let green = [0u8, 255, 0, 255];
+        let red_pixels: Vec<u8> = red.repeat(8 * 8);
+        let green_pixels: Vec<u8> = green.repeat(8 * 8);
+        let r_id = atlas.insert(Some("red"), 8, 8, &red_pixels);
+        let g_id = atlas.insert(Some("green"), 8, 8, &green_pixels);
+        let buf = atlas.build_pixel_buffer();
+        let stride = (atlas.width() * 4) as usize;
+        let read = |x: u32, y: u32| -> [u8; 4] {
+            let off = (y as usize) * stride + (x as usize) * 4;
+            [buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]
+        };
+
+        let r = atlas.region(r_id).unwrap();
+        let g = atlas.region(g_id).unwrap();
+
+        // Right halo of red: column at r.x + r.w should be solid red (any row in range).
+        for row in 0..r.h {
+            assert_eq!(
+                read(r.x + r.w, r.y + row),
+                red,
+                "red right halo not replicated at ({}, {})",
+                r.x + r.w,
+                r.y + row
+            );
+        }
+        // Left halo of green: column at g.x - 1 should be solid green.
+        assert!(g.x >= 1);
+        for row in 0..g.h {
+            assert_eq!(
+                read(g.x - 1, g.y + row),
+                green,
+                "green left halo not replicated at ({}, {})",
+                g.x - 1,
+                g.y + row
+            );
+        }
+        // Top halo of red — first row above sprite should be solid red.
+        assert!(r.y >= 1);
+        for col in 0..r.w {
+            assert_eq!(read(r.x + col, r.y - 1), red);
         }
     }
 }

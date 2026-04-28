@@ -1,6 +1,7 @@
 //! `UiRenderer` — single-call renderer consuming a `DrawList`.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -34,7 +35,6 @@ struct TexVertex {
     tint: [f32; 4],
     clip: [f32; 4],
     clip_enabled: f32,
-    _pad: [f32; 3],
 }
 
 impl TexVertex {
@@ -49,7 +49,6 @@ impl TexVertex {
             tint,
             clip: clip_rect,
             clip_enabled: enabled,
-            _pad: [0.0; 3],
         }
     }
 }
@@ -102,6 +101,11 @@ pub struct UiRenderer {
 
     // Text
     text_renderer: TextRenderer,
+
+    // De-duplicated set of names we've already warned about — prevents log spam
+    // when a missing sprite key is referenced every frame. RefCell because
+    // tessellate_* take &self.
+    warned_missing: RefCell<HashSet<String>>,
 }
 
 impl UiRenderer {
@@ -277,21 +281,34 @@ impl UiRenderer {
             tex_vbo,
             tex_vbo_capacity,
             text_renderer,
+            warned_missing: RefCell::new(HashSet::new()),
+        }
+    }
+
+    fn warn_missing(&self, kind: &str, key: &str) {
+        let composite = format!("{kind}:{key}");
+        let mut set = self.warned_missing.borrow_mut();
+        if set.insert(composite) {
+            log::warn!(
+                "wgpu-gameui: {} '{}' referenced but not registered — draw skipped",
+                kind,
+                key
+            );
         }
     }
 
     /// Load a sprite from raw RGBA8 bytes into the atlas.
+    ///
+    /// The pixels are buffered CPU-side; the atlas texture is re-uploaded lazily
+    /// in [`UiRenderer::render`] (or eagerly via [`UiRenderer::flush_atlas`])
+    /// so back-to-back loads coalesce into a single GPU upload.
     pub fn load_sprite_rgba8(
         &mut self,
-        _queue: &wgpu::Queue,
         name: &str,
         w: u32,
         h: u32,
         pixels: &[u8],
     ) -> SpriteId {
-        // Texture re-upload happens lazily in `render()` (or you can force it via
-        // `flush_atlas`). Doing it here would require a queue-aware path even when
-        // multiple sprites are loaded back-to-back; deferring batches them.
         self.atlas.insert(Some(name), w, h, pixels)
     }
 
@@ -413,6 +430,13 @@ impl UiRenderer {
         // Flush any pending atlas changes.
         self.flush_atlas(device, queue);
 
+        // Layering, bottom→top: nine-slice backgrounds, colored quads (panels,
+        // rounded-rect fills, sliders, custom shapes), icons, text. Each
+        // requires its own pass because consecutive layers swap pipelines or
+        // change vertex formats. Merging nine-slices and icons into one
+        // textured pass would put icons *below* the colored-quad layer, which
+        // breaks every widget that draws an icon over a panel.
+
         // ---------- 1. Nine-slices ----------
         let nine_slice_verts = self.tessellate_nine_slices(&draw_list.nine_slices);
         if !nine_slice_verts.is_empty() {
@@ -445,7 +469,10 @@ impl UiRenderer {
                 Some(id) => id,
                 None => match self.atlas.id_for(&icon.icon_key) {
                     Some(id) => id,
-                    None => continue,
+                    None => {
+                        self.warn_missing("sprite", &icon.icon_key);
+                        continue;
+                    }
                 },
             };
             let region = match self.atlas.region(id) {
@@ -480,7 +507,10 @@ impl UiRenderer {
                 Some(id) => id,
                 None => match self.nine_slice_names.get(&draw.texture_key) {
                     Some(id) => *id,
-                    None => continue,
+                    None => {
+                        self.warn_missing("nine-slice", &draw.texture_key);
+                        continue;
+                    }
                 },
             };
             let meta = match self.nine_slices.get(id as usize) {
