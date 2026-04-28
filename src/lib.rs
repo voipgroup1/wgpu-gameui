@@ -30,11 +30,13 @@ mod text;
 
 pub use text::{FontSystemHandle, TextBlock, TextMeasurer, TextRenderer, shared_font_system};
 
+pub mod affine;
 pub mod layout;
 pub mod render;
 mod theme;
 mod widgets;
 
+pub use affine::Affine2;
 pub use render::{NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
 pub use theme::Theme;
 pub use widgets::*;
