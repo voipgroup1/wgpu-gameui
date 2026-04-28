@@ -13,7 +13,7 @@ mod tooltip;
 
 pub use button::Button;
 pub use checkbox::{Checkbox, CHECKBOX_CHECKED_ICON, CHECKBOX_ICON};
-pub use draw_list::{DrawList, IconDraw, NineSliceDraw, Vertex};
+pub use draw_list::{DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex};
 pub use panel::{label, label_at, label_centered_at, title, title_at, Panel};
 pub use progress_bar::ProgressBar;
 pub use slider::{Slider, SliderOutput, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE};

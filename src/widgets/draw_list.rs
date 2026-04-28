@@ -1,6 +1,7 @@
 //! Core drawing types - vertices, draw commands, and the DrawList.
 
 use crate::layout::Rect;
+use crate::render::SpriteId;
 use crate::text::{FontSystemHandle, TextBlock, TextMeasurer};
 
 pub(crate) const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
@@ -35,16 +36,28 @@ impl Vertex {
 }
 
 /// A textured quad command (e.g. an icon from a texture atlas).
+///
+/// `sprite` is the resolved atlas handle. When `None`, the renderer falls back
+/// to looking up `icon_key` in the atlas at render time (slightly slower; one
+/// `HashMap<String, SpriteId>` lookup per icon per frame). Prefer resolving the
+/// sprite once at registration via [`DrawList::icon_sprite`].
 #[derive(Clone, Debug)]
 pub struct IconDraw {
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
-    /// Key identifying the icon (typically a file path).
+    /// Pre-resolved atlas handle, if known.
+    pub sprite: Option<SpriteId>,
+    /// Name fallback for late-resolved sprites.
     pub icon_key: String,
+    /// Multiplied with sampled atlas color. Default white.
+    pub tint: [f32; 4],
     pub clip: Option<Rect>,
 }
+
+/// Opaque handle to a registered nine-slice resource.
+pub type NineSliceId = u32;
 
 /// A nine-slice textured panel draw command.
 #[derive(Clone, Debug)]
@@ -53,8 +66,12 @@ pub struct NineSliceDraw {
     pub y: f32,
     pub width: f32,
     pub height: f32,
-    /// Key identifying which nine-slice texture to use (e.g., "panel2").
+    /// Pre-resolved nine-slice handle.
+    pub nine_slice: Option<NineSliceId>,
+    /// Name fallback for late resolution.
     pub texture_key: String,
+    /// Multiplied with sampled color. Default white.
+    pub tint: [f32; 4],
     pub clip: Option<Rect>,
 }
 
@@ -332,26 +349,76 @@ impl DrawList {
         self.texts.push(block);
     }
 
-    /// Add a textured icon.
+    /// Add a textured icon by name. The renderer will resolve `icon_key` against
+    /// its `SpriteAtlas` at render time.
     pub fn icon(&mut self, icon_key: &str, x: f32, y: f32, width: f32, height: f32) {
         self.icons.push(IconDraw {
             x,
             y,
             width,
             height,
+            sprite: None,
             icon_key: icon_key.to_string(),
+            tint: [1.0, 1.0, 1.0, 1.0],
             clip: self.current_clip(),
         });
     }
 
-    /// Add a nine-slice textured panel.
+    /// Add a textured icon by pre-resolved sprite handle, with optional tint.
+    /// Cheaper than [`DrawList::icon`] — no per-frame name lookup.
+    pub fn icon_sprite(
+        &mut self,
+        sprite: SpriteId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        tint: [f32; 4],
+    ) {
+        self.icons.push(IconDraw {
+            x,
+            y,
+            width,
+            height,
+            sprite: Some(sprite),
+            icon_key: String::new(),
+            tint,
+            clip: self.current_clip(),
+        });
+    }
+
+    /// Add a nine-slice textured panel by name.
     pub fn nine_slice(&mut self, x: f32, y: f32, width: f32, height: f32, texture_key: &str) {
         self.nine_slices.push(NineSliceDraw {
             x,
             y,
             width,
             height,
+            nine_slice: None,
             texture_key: texture_key.to_string(),
+            tint: [1.0, 1.0, 1.0, 1.0],
+            clip: self.current_clip(),
+        });
+    }
+
+    /// Add a nine-slice panel by pre-resolved handle.
+    pub fn nine_slice_id(
+        &mut self,
+        id: NineSliceId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        tint: [f32; 4],
+    ) {
+        self.nine_slices.push(NineSliceDraw {
+            x,
+            y,
+            width,
+            height,
+            nine_slice: Some(id),
+            texture_key: String::new(),
+            tint,
             clip: self.current_clip(),
         });
     }
@@ -382,6 +449,26 @@ mod tests {
     }
 
     #[test]
+    fn icon_helper_pushes_one_command() {
+        let mut list = DrawList::new();
+        list.icon("foo", 1.0, 2.0, 16.0, 16.0);
+        assert_eq!(list.icons.len(), 1);
+        assert_eq!(list.icons[0].icon_key, "foo");
+        assert_eq!(list.icons[0].sprite, None);
+        assert_eq!(list.icons[0].tint, [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn icon_sprite_helper_resolves_id_and_tint() {
+        let mut list = DrawList::new();
+        list.icon_sprite(7, 0.0, 0.0, 24.0, 24.0, [0.5, 0.6, 0.7, 1.0]);
+        assert_eq!(list.icons.len(), 1);
+        assert_eq!(list.icons[0].sprite, Some(7));
+        assert_eq!(list.icons[0].tint, [0.5, 0.6, 0.7, 1.0]);
+        assert!(list.icons[0].icon_key.is_empty());
+    }
+
+    #[test]
     fn clip_stack_marks_emitted_commands() {
         let mut list = DrawList::new();
         let clip = Rect::new(10.0, 20.0, 30.0, 40.0);
@@ -397,6 +484,8 @@ mod tests {
         assert_eq!(list.vertices[0].clip, [10.0, 20.0, 30.0, 40.0]);
         assert_eq!(list.texts[0].clip, Some(Rect::new(10.0, 20.0, 30.0, 40.0)));
         assert_eq!(list.icons[0].clip, Some(clip));
+        assert_eq!(list.icons[0].icon_key, "icon");
+        assert_eq!(list.icons[0].tint, [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(list.vertices[4].clip_enabled, 0.0);
     }
 }
