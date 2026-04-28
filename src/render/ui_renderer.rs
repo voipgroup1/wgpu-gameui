@@ -482,12 +482,9 @@ impl UiRenderer {
             let uv = region.uv(aw, ah);
             let clip = icon.clip.map(|c| [c.x, c.y, c.width, c.height]);
 
-            push_textured_quad(
+            push_textured_quad_corners(
                 &mut out,
-                icon.x,
-                icon.y,
-                icon.width,
-                icon.height,
+                icon.corners,
                 [uv[0], uv[1], uv[2], uv[3]],
                 icon.tint,
                 clip,
@@ -524,10 +521,11 @@ impl UiRenderer {
 
             tessellate_nine_slice(
                 &mut out,
-                draw.x,
-                draw.y,
-                draw.width,
-                draw.height,
+                draw.local.x,
+                draw.local.y,
+                draw.local.width,
+                draw.local.height,
+                &draw.transform,
                 draw.tint,
                 draw.clip.map(|c| [c.x, c.y, c.width, c.height]),
                 region,
@@ -727,29 +725,29 @@ fn ortho_matrix(width: f32, height: f32) -> [[f32; 4]; 4] {
     ]
 }
 
-fn push_textured_quad(
+/// Emit two triangles for a quad whose 4 corners are given in TL, TR, BR, BL
+/// order (matching `Affine2::transform_rect_corners`). Used for icons that may
+/// have been rotated/scaled by the active transform.
+fn push_textured_quad_corners(
     out: &mut Vec<TexVertex>,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
+    corners: [[f32; 2]; 4],
     uv: [f32; 4], // u0, v0, u1, v1
     tint: [f32; 4],
     clip: Option<[f32; 4]>,
 ) {
-    let x0 = x;
-    let y0 = y;
-    let x1 = x + w;
-    let y1 = y + h;
     let (u0, v0, u1, v1) = (uv[0], uv[1], uv[2], uv[3]);
+    let tl = corners[0];
+    let tr = corners[1];
+    let br = corners[2];
+    let bl = corners[3];
 
-    out.push(TexVertex::new([x0, y0], [u0, v0], tint, clip));
-    out.push(TexVertex::new([x1, y0], [u1, v0], tint, clip));
-    out.push(TexVertex::new([x1, y1], [u1, v1], tint, clip));
+    out.push(TexVertex::new(tl, [u0, v0], tint, clip));
+    out.push(TexVertex::new(tr, [u1, v0], tint, clip));
+    out.push(TexVertex::new(br, [u1, v1], tint, clip));
 
-    out.push(TexVertex::new([x1, y1], [u1, v1], tint, clip));
-    out.push(TexVertex::new([x0, y1], [u0, v1], tint, clip));
-    out.push(TexVertex::new([x0, y0], [u0, v0], tint, clip));
+    out.push(TexVertex::new(br, [u1, v1], tint, clip));
+    out.push(TexVertex::new(bl, [u0, v1], tint, clip));
+    out.push(TexVertex::new(tl, [u0, v0], tint, clip));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -759,6 +757,7 @@ fn tessellate_nine_slice(
     y: f32,
     w: f32,
     h: f32,
+    transform: &crate::affine::Affine2,
     tint: [f32; 4],
     clip: Option<[f32; 4]>,
     region: crate::render::AtlasRegion,
@@ -826,13 +825,18 @@ fn tessellate_nine_slice(
             let tv0 = vs[row];
             let tv1 = vs[row + 1];
 
-            out.push(TexVertex::new([px0, py0], [tu0, tv0], tint, clip));
-            out.push(TexVertex::new([px1, py0], [tu1, tv0], tint, clip));
-            out.push(TexVertex::new([px1, py1], [tu1, tv1], tint, clip));
+            let tl = transform.transform_point([px0, py0]);
+            let tr = transform.transform_point([px1, py0]);
+            let br = transform.transform_point([px1, py1]);
+            let bl = transform.transform_point([px0, py1]);
 
-            out.push(TexVertex::new([px1, py1], [tu1, tv1], tint, clip));
-            out.push(TexVertex::new([px0, py1], [tu0, tv1], tint, clip));
-            out.push(TexVertex::new([px0, py0], [tu0, tv0], tint, clip));
+            out.push(TexVertex::new(tl, [tu0, tv0], tint, clip));
+            out.push(TexVertex::new(tr, [tu1, tv0], tint, clip));
+            out.push(TexVertex::new(br, [tu1, tv1], tint, clip));
+
+            out.push(TexVertex::new(br, [tu1, tv1], tint, clip));
+            out.push(TexVertex::new(bl, [tu0, tv1], tint, clip));
+            out.push(TexVertex::new(tl, [tu0, tv0], tint, clip));
         }
     }
 }
@@ -851,12 +855,14 @@ mod tests {
             w: 32,
             h: 32,
         };
+        let identity = crate::affine::Affine2::IDENTITY;
         tessellate_nine_slice(
             &mut out,
             0.0,
             0.0,
             100.0,
             80.0,
+            &identity,
             [1.0; 4],
             None,
             region,
@@ -877,12 +883,14 @@ mod tests {
             w: 32,
             h: 32,
         };
+        let identity = crate::affine::Affine2::IDENTITY;
         tessellate_nine_slice(
             &mut out,
             0.0,
             0.0,
             100.0,
             80.0,
+            &identity,
             [1.0; 4],
             None,
             region,

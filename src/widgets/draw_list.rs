@@ -1,5 +1,6 @@
 //! Core drawing types - vertices, draw commands, and the DrawList.
 
+use crate::affine::Affine2;
 use crate::layout::Rect;
 use crate::render::SpriteId;
 use crate::text::{FontSystemHandle, TextBlock, TextMeasurer};
@@ -37,16 +38,17 @@ impl Vertex {
 
 /// A textured quad command (e.g. an icon from a texture atlas).
 ///
+/// Carries pre-transformed corners in TL, TR, BR, BL order so rotated/scaled
+/// sprites tessellate correctly.
+///
 /// `sprite` is the resolved atlas handle. When `None`, the renderer falls back
 /// to looking up `icon_key` in the atlas at render time (slightly slower; one
 /// `HashMap<String, SpriteId>` lookup per icon per frame). Prefer resolving the
 /// sprite once at registration via [`DrawList::icon_sprite`].
 #[derive(Clone, Debug)]
 pub struct IconDraw {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    /// Pre-transformed corners, TL/TR/BR/BL.
+    pub corners: [[f32; 2]; 4],
     /// Pre-resolved atlas handle, if known.
     pub sprite: Option<SpriteId>,
     /// Name fallback for late-resolved sprites.
@@ -60,12 +62,16 @@ pub struct IconDraw {
 pub type NineSliceId = u32;
 
 /// A nine-slice textured panel draw command.
+///
+/// Carries the local-space rect plus the affine transform that maps local
+/// space to world (screen) space. Tessellation computes the 9 sub-rect
+/// corners in local space and runs each through `transform`.
 #[derive(Clone, Debug)]
 pub struct NineSliceDraw {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    /// Local-space rect (pre-transform).
+    pub local: Rect,
+    /// Affine to apply to each corner during tessellation.
+    pub transform: Affine2,
     /// Pre-resolved nine-slice handle.
     pub nine_slice: Option<NineSliceId>,
     /// Name fallback for late resolution.
@@ -77,9 +83,9 @@ pub struct NineSliceDraw {
 
 /// Draw list for collecting render commands.
 ///
-/// All shapes are tessellated into triangles immediately when added.
-/// The vertices can be rendered directly as a triangle list.
-#[derive(Default)]
+/// Owns a transform stack and a tint stack: every primitive method consults
+/// the top of both stacks at push time so widgets that already take absolute
+/// `Rect`s remain transform-aware without code changes.
 pub struct DrawList {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
@@ -88,6 +94,28 @@ pub struct DrawList {
     pub nine_slices: Vec<NineSliceDraw>,
     pub(crate) text_measurer: TextMeasurer,
     clip_stack: Vec<Rect>,
+    transform_stack: Vec<Affine2>,
+    tint_stack: Vec<[f32; 4]>,
+    /// Logged-once flag for "tried to draw rotated text" — glyphon does not
+    /// support rotation, so we silently render axis-aligned.
+    text_rotation_warned: bool,
+}
+
+impl Default for DrawList {
+    fn default() -> Self {
+        Self {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            texts: Vec::new(),
+            icons: Vec::new(),
+            nine_slices: Vec::new(),
+            text_measurer: TextMeasurer::default(),
+            clip_stack: Vec::new(),
+            transform_stack: vec![Affine2::IDENTITY],
+            tint_stack: vec![[1.0, 1.0, 1.0, 1.0]],
+            text_rotation_warned: false,
+        }
+    }
 }
 
 impl DrawList {
@@ -113,6 +141,10 @@ impl DrawList {
         self.icons.clear();
         self.nine_slices.clear();
         self.clip_stack.clear();
+        self.transform_stack.clear();
+        self.transform_stack.push(Affine2::IDENTITY);
+        self.tint_stack.clear();
+        self.tint_stack.push([1.0, 1.0, 1.0, 1.0]);
     }
 
     /// Measure text using glyphon's shaping/layout path.
@@ -128,13 +160,21 @@ impl DrawList {
         self.text_measurer.measure(text, font_size, max_width)
     }
 
+    // ---- Clip stack ----
+
     /// Push a clipping rectangle. Nested clips are intersected with the current clip.
+    ///
+    /// **Note:** when the active transform has rotation or shear, the rect is
+    /// transformed to its AABB before being intersected; clipping is therefore
+    /// approximate (over-clips along the diagonal) under rotation. Document the
+    /// limitation rather than silently drawing wrong.
     pub fn push_clip(&mut self, rect: Rect) {
+        let world_rect = self.current_transform().transform_rect_aabb(rect);
         let clip = match self.current_clip() {
             Some(current) => current
-                .intersection(rect)
-                .unwrap_or_else(|| Rect::new(rect.x, rect.y, 0.0, 0.0)),
-            None => rect,
+                .intersection(world_rect)
+                .unwrap_or_else(|| Rect::new(world_rect.x, world_rect.y, 0.0, 0.0)),
+            None => world_rect,
         };
         self.clip_stack.push(clip);
     }
@@ -144,14 +184,111 @@ impl DrawList {
         self.clip_stack.pop();
     }
 
-    /// Return the active clipping rectangle.
+    /// Return the active clipping rectangle (in world / screen space).
     pub fn current_clip(&self) -> Option<Rect> {
         self.clip_stack.last().copied()
     }
 
-    fn vertex(&self, x: f32, y: f32, color: [f32; 4]) -> Vertex {
-        Vertex::new(x, y, color).with_clip(self.current_clip())
+    // ---- Transform stack ----
+
+    /// Push the current transform onto the stack (the new top is a clone of
+    /// the old top, matching Teardown's `UiPush`).
+    pub fn push_transform(&mut self) {
+        let top = *self.transform_stack.last().unwrap_or(&Affine2::IDENTITY);
+        self.transform_stack.push(top);
     }
+
+    /// Pop the top transform. Refuses to pop below 1 entry (the implicit
+    /// identity at the base of the stack).
+    pub fn pop_transform(&mut self) {
+        if self.transform_stack.len() > 1 {
+            self.transform_stack.pop();
+        }
+    }
+
+    /// Return the current (top) transform.
+    pub fn current_transform(&self) -> Affine2 {
+        *self.transform_stack.last().unwrap_or(&Affine2::IDENTITY)
+    }
+
+    /// Post-multiply the current transform by a translation.
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        self.compose_top(&Affine2::translation(dx, dy));
+    }
+
+    /// Post-multiply the current transform by a rotation about the local origin.
+    pub fn rotate(&mut self, angle_radians: f32) {
+        self.compose_top(&Affine2::rotation(angle_radians));
+    }
+
+    /// Post-multiply the current transform by a non-uniform scale.
+    pub fn scale(&mut self, sx: f32, sy: f32) {
+        self.compose_top(&Affine2::scale(sx, sy));
+    }
+
+    fn compose_top(&mut self, m: &Affine2) {
+        if let Some(top) = self.transform_stack.last_mut() {
+            *top = top.compose(m);
+        }
+    }
+
+    // ---- Tint stack ----
+
+    /// Push the current tint onto the stack (clone of top).
+    pub fn push_tint(&mut self) {
+        let top = *self.tint_stack.last().unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
+        self.tint_stack.push(top);
+    }
+
+    /// Pop the top tint. Refuses to pop below 1 entry.
+    pub fn pop_tint(&mut self) {
+        if self.tint_stack.len() > 1 {
+            self.tint_stack.pop();
+        }
+    }
+
+    /// Replace the current tint (Teardown's `UiColor` semantics).
+    pub fn set_tint(&mut self, rgba: [f32; 4]) {
+        if let Some(top) = self.tint_stack.last_mut() {
+            *top = rgba;
+        }
+    }
+
+    /// Multiply the current tint by `rgba` (Teardown's `UiColorFilter` semantics).
+    pub fn multiply_tint(&mut self, rgba: [f32; 4]) {
+        if let Some(top) = self.tint_stack.last_mut() {
+            top[0] *= rgba[0];
+            top[1] *= rgba[1];
+            top[2] *= rgba[2];
+            top[3] *= rgba[3];
+        }
+    }
+
+    /// Return the current (top) tint.
+    pub fn current_tint(&self) -> [f32; 4] {
+        *self.tint_stack.last().unwrap_or(&[1.0, 1.0, 1.0, 1.0])
+    }
+
+    /// Combine an input color with the current tint.
+    fn apply_tint(&self, color: [f32; 4]) -> [f32; 4] {
+        let t = self.current_tint();
+        [
+            color[0] * t[0],
+            color[1] * t[1],
+            color[2] * t[2],
+            color[3] * t[3],
+        ]
+    }
+
+    /// Build a colored vertex by transforming local position through the current
+    /// affine and multiplying the input color by the current tint.
+    fn vertex(&self, x: f32, y: f32, color: [f32; 4]) -> Vertex {
+        let world = self.current_transform().transform_point([x, y]);
+        let tinted = self.apply_tint(color);
+        Vertex::new(world[0], world[1], tinted).with_clip(self.current_clip())
+    }
+
+    // ---- Primitives ----
 
     /// Add a single triangle.
     pub fn triangle(&mut self, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), color: [f32; 4]) {
@@ -192,6 +329,7 @@ impl DrawList {
         let oy = dx / len * half;
         let base = self.vertices.len() as u32;
 
+        // Compute offsets in local space; transform happens inside `vertex()`.
         self.vertices
             .push(self.vertex(p0[0] + ox, p0[1] + oy, color));
         self.vertices
@@ -211,7 +349,9 @@ impl DrawList {
         }
     }
 
-    /// Add a rounded rectangle.
+    /// Add a rounded rectangle. Geometry is built in local space and
+    /// transformed at vertex push time, so a rotated transform produces a
+    /// rotated rounded rect.
     pub fn rounded_rect(&mut self, rect: Rect, radius: f32, color: [f32; 4]) {
         if radius <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
             self.quad(rect.x, rect.y, rect.width, rect.height, color);
@@ -223,10 +363,6 @@ impl DrawList {
         let y0 = rect.y;
         let x1 = rect.x + rect.width;
         let y1 = rect.y + rect.height;
-
-        // Zero-overlap decomposition: center quad + 4 side strips + 4 corner fans.
-        // Every pixel inside the rounded rect is covered by exactly one triangle, so
-        // semi-transparent fills don't double-blend at the corners.
 
         // Center quad — fully inset rect, untouched by corner arcs.
         self.quad(
@@ -337,8 +473,55 @@ impl DrawList {
         }
     }
 
-    /// Add text.
+    /// Add text. The block's origin is transformed through the current
+    /// affine; uniform scale (taken from the `a` axis of the linear part) is
+    /// applied to font_size and max_width. Rotation/shear is **not supported**
+    /// by glyphon — when the transform has any rotation we log a one-shot
+    /// warning and render axis-aligned.
     pub fn text(&mut self, mut block: TextBlock) {
+        let m = self.current_transform();
+        if !m.is_axis_aligned() && !self.text_rotation_warned {
+            log::warn!(
+                "wgpu-gameui: TextBlock pushed under a rotated/sheared transform — \
+                 text will render axis-aligned (glyphon limitation)"
+            );
+            self.text_rotation_warned = true;
+        }
+
+        // Transform origin.
+        let origin = m.transform_point([block.x, block.y]);
+        block.x = origin[0];
+        block.y = origin[1];
+
+        // Apply uniform scale (use the X-axis basis length so non-uniform
+        // axis-aligned scale picks up the obvious case).
+        let scale = (m.a * m.a + m.c * m.c).sqrt();
+        if scale > 0.0 && (scale - 1.0).abs() > 1e-6 {
+            block.font_size *= scale;
+            block.line_height *= scale;
+            block.max_width *= scale;
+        }
+
+        // Apply tint to text color.
+        let tint = self.current_tint();
+        if tint != [1.0, 1.0, 1.0, 1.0] {
+            // glyphon::Color is RGBA8; multiply per-channel via the public accessors.
+            let r = block.color.r() as f32 / 255.0;
+            let g = block.color.g() as f32 / 255.0;
+            let b = block.color.b() as f32 / 255.0;
+            let a = block.color.a() as f32 / 255.0;
+            let nr = (r * tint[0]).clamp(0.0, 1.0);
+            let ng = (g * tint[1]).clamp(0.0, 1.0);
+            let nb = (b * tint[2]).clamp(0.0, 1.0);
+            let na = (a * tint[3]).clamp(0.0, 1.0);
+            block.color = glyphon::Color::rgba(
+                (nr * 255.0).round() as u8,
+                (ng * 255.0).round() as u8,
+                (nb * 255.0).round() as u8,
+                (na * 255.0).round() as u8,
+            );
+        }
+
         if let Some(clip) = self.current_clip() {
             let natural_bounds = Rect::new(block.x, block.y, block.max_width, 2000.0);
             let text_bounds = block.clip.unwrap_or(natural_bounds);
@@ -352,14 +535,14 @@ impl DrawList {
     /// Add a textured icon by name. The renderer will resolve `icon_key` against
     /// its `SpriteAtlas` at render time.
     pub fn icon(&mut self, icon_key: &str, x: f32, y: f32, width: f32, height: f32) {
+        let corners = self
+            .current_transform()
+            .transform_rect_corners(Rect::new(x, y, width, height));
         self.icons.push(IconDraw {
-            x,
-            y,
-            width,
-            height,
+            corners,
             sprite: None,
             icon_key: icon_key.to_string(),
-            tint: [1.0, 1.0, 1.0, 1.0],
+            tint: self.current_tint(),
             clip: self.current_clip(),
         });
     }
@@ -375,14 +558,14 @@ impl DrawList {
         height: f32,
         tint: [f32; 4],
     ) {
+        let corners = self
+            .current_transform()
+            .transform_rect_corners(Rect::new(x, y, width, height));
         self.icons.push(IconDraw {
-            x,
-            y,
-            width,
-            height,
+            corners,
             sprite: Some(sprite),
             icon_key: String::new(),
-            tint,
+            tint: self.apply_tint(tint),
             clip: self.current_clip(),
         });
     }
@@ -390,13 +573,11 @@ impl DrawList {
     /// Add a nine-slice textured panel by name.
     pub fn nine_slice(&mut self, x: f32, y: f32, width: f32, height: f32, texture_key: &str) {
         self.nine_slices.push(NineSliceDraw {
-            x,
-            y,
-            width,
-            height,
+            local: Rect::new(x, y, width, height),
+            transform: self.current_transform(),
             nine_slice: None,
             texture_key: texture_key.to_string(),
-            tint: [1.0, 1.0, 1.0, 1.0],
+            tint: self.current_tint(),
             clip: self.current_clip(),
         });
     }
@@ -412,13 +593,11 @@ impl DrawList {
         tint: [f32; 4],
     ) {
         self.nine_slices.push(NineSliceDraw {
-            x,
-            y,
-            width,
-            height,
+            local: Rect::new(x, y, width, height),
+            transform: self.current_transform(),
             nine_slice: Some(id),
             texture_key: String::new(),
-            tint,
+            tint: self.apply_tint(tint),
             clip: self.current_clip(),
         });
     }
@@ -426,9 +605,14 @@ impl DrawList {
 
 #[cfg(test)]
 mod tests {
+    use crate::affine::Affine2;
     use crate::layout::Rect;
 
     use super::DrawList;
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
 
     #[test]
     fn rounded_rect_emits_plausible_geometry() {
@@ -456,6 +640,9 @@ mod tests {
         assert_eq!(list.icons[0].icon_key, "foo");
         assert_eq!(list.icons[0].sprite, None);
         assert_eq!(list.icons[0].tint, [1.0, 1.0, 1.0, 1.0]);
+        // TL and BR corners under identity match input rect.
+        assert_eq!(list.icons[0].corners[0], [1.0, 2.0]);
+        assert_eq!(list.icons[0].corners[2], [17.0, 18.0]);
     }
 
     #[test]
@@ -487,5 +674,140 @@ mod tests {
         assert_eq!(list.icons[0].icon_key, "icon");
         assert_eq!(list.icons[0].tint, [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(list.vertices[4].clip_enabled, 0.0);
+    }
+
+    // ---- Transform/tint stack tests ----
+
+    #[test]
+    fn quad_under_translate() {
+        let mut list = DrawList::new();
+        list.translate(100.0, 50.0);
+        list.quad(0.0, 0.0, 10.0, 20.0, [1.0; 4]);
+        assert_eq!(list.vertices[0].position, [100.0, 50.0]);
+        assert_eq!(list.vertices[2].position, [110.0, 70.0]);
+    }
+
+    #[test]
+    fn quad_under_translate_then_scale() {
+        let mut list = DrawList::new();
+        list.translate(10.0, 20.0);
+        list.scale(2.0, 3.0);
+        list.quad(0.0, 0.0, 5.0, 5.0, [1.0; 4]);
+        // local (0,0) -> scale -> (0,0) -> translate -> (10,20)
+        assert_eq!(list.vertices[0].position, [10.0, 20.0]);
+        // local (5,5) -> scale -> (10,15) -> translate -> (20,35)
+        assert_eq!(list.vertices[2].position, [20.0, 35.0]);
+    }
+
+    #[test]
+    fn rounded_rect_under_rotation_is_not_axis_aligned() {
+        let mut list = DrawList::new();
+        list.rotate(std::f32::consts::FRAC_PI_4); // 45 degrees
+        list.rounded_rect(Rect::new(10.0, 10.0, 20.0, 20.0), 4.0, [1.0; 4]);
+
+        // After 45° rotation, no two distinct vertices should share an x or y
+        // by accident (other than coincidentally). Check that at least some
+        // vertices have non-zero Y *and* non-zero X — i.e. the geometry isn't
+        // collapsed into an axis-aligned box.
+        let mut has_offdiag = false;
+        for v in &list.vertices {
+            if v.position[0].abs() > 0.001 && v.position[1].abs() > 0.001 {
+                // Distance from origin should match local distance from origin
+                // (rotation is rigid). For the corner at local (30,30), that
+                // distance is sqrt(1800) ~= 42.43.
+                let d = (v.position[0] * v.position[0] + v.position[1] * v.position[1]).sqrt();
+                if d > 5.0 {
+                    has_offdiag = true;
+                }
+            }
+        }
+        assert!(has_offdiag, "rotated rounded rect should have off-axis vertices");
+    }
+
+    #[test]
+    fn color_multiplies_with_tint() {
+        let mut list = DrawList::new();
+        list.set_tint([0.5, 0.5, 0.5, 1.0]);
+        list.quad(0.0, 0.0, 10.0, 10.0, [0.4, 0.6, 0.8, 1.0]);
+        let v = list.vertices[0];
+        assert!(approx(v.color[0], 0.2));
+        assert!(approx(v.color[1], 0.3));
+        assert!(approx(v.color[2], 0.4));
+        assert!(approx(v.color[3], 1.0));
+    }
+
+    #[test]
+    fn push_pop_restores_transform() {
+        let mut list = DrawList::new();
+        list.translate(10.0, 20.0);
+        list.push_transform();
+        list.translate(5.0, 5.0);
+        assert_eq!(list.current_transform(), Affine2::translation(15.0, 25.0));
+        list.pop_transform();
+        assert_eq!(list.current_transform(), Affine2::translation(10.0, 20.0));
+    }
+
+    #[test]
+    fn push_pop_restores_tint() {
+        let mut list = DrawList::new();
+        list.set_tint([0.5, 0.5, 0.5, 1.0]);
+        list.push_tint();
+        list.multiply_tint([0.5, 0.5, 0.5, 1.0]);
+        assert_eq!(list.current_tint(), [0.25, 0.25, 0.25, 1.0]);
+        list.pop_tint();
+        assert_eq!(list.current_tint(), [0.5, 0.5, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn pop_when_at_base_does_not_underflow() {
+        let mut list = DrawList::new();
+        list.pop_transform();
+        list.pop_transform();
+        list.pop_tint();
+        list.pop_tint();
+        assert_eq!(list.current_transform(), Affine2::IDENTITY);
+        assert_eq!(list.current_tint(), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn nested_push_pop_balances() {
+        let mut list = DrawList::new();
+        list.push_transform();
+        list.translate(1.0, 0.0);
+        list.push_transform();
+        list.translate(2.0, 0.0);
+        list.push_transform();
+        list.translate(4.0, 0.0);
+        assert_eq!(list.current_transform(), Affine2::translation(7.0, 0.0));
+        list.pop_transform();
+        assert_eq!(list.current_transform(), Affine2::translation(3.0, 0.0));
+        list.pop_transform();
+        assert_eq!(list.current_transform(), Affine2::translation(1.0, 0.0));
+        list.pop_transform();
+        assert_eq!(list.current_transform(), Affine2::IDENTITY);
+    }
+
+    #[test]
+    fn icon_corners_transformed_under_scale() {
+        let mut list = DrawList::new();
+        list.scale(2.0, 2.0);
+        list.icon("foo", 5.0, 5.0, 10.0, 10.0);
+        let c = list.icons[0].corners;
+        assert_eq!(c[0], [10.0, 10.0]);
+        assert_eq!(c[2], [30.0, 30.0]);
+    }
+
+    #[test]
+    fn nine_slice_carries_transform() {
+        let mut list = DrawList::new();
+        list.translate(50.0, 60.0);
+        list.scale(2.0, 2.0);
+        list.nine_slice_id(0, 0.0, 0.0, 10.0, 10.0, [1.0; 4]);
+        let n = &list.nine_slices[0];
+        // Local (0,0) -> world (50,60); local (10,10) -> (70,80).
+        let tl = n.transform.transform_point([0.0, 0.0]);
+        let br = n.transform.transform_point([10.0, 10.0]);
+        assert!(approx(tl[0], 50.0) && approx(tl[1], 60.0));
+        assert!(approx(br[0], 70.0) && approx(br[1], 80.0));
     }
 }
