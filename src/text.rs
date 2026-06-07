@@ -15,6 +15,7 @@
 //! the atlas, uploads the atlas if it changed, and draws — all in one call.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
@@ -22,7 +23,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::layout::Rect;
 use crate::render::{ortho_matrix, GlyphTile, MsdfGlyphAtlas};
 
-use glyphon::cosmic_text::fontdb;
+use glyphon::cosmic_text::{fontdb, Align as CosmicAlign};
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 
 const MSDF_SHADER: &str = include_str!("render/ui_msdf.wgsl");
@@ -37,6 +38,73 @@ pub type FontSystemHandle = Arc<Mutex<FontSystem>>;
 /// Create a new shared `FontSystem` handle.
 pub fn shared_font_system() -> FontSystemHandle {
     Arc::new(Mutex::new(FontSystem::new()))
+}
+
+/// Handle to a font loaded into the shared [`FontSystem`], identified by its
+/// family name.
+///
+/// cosmic-text's shaping selects fonts by family name only (`Family::Name`), so
+/// a handle is just the family string. Obtain one from [`load_font_file`] /
+/// [`load_font_bytes`] and pass it to [`TextBlock::with_font`] to shape a block
+/// in that font. If two faces share a family name, the most recently loaded one
+/// wins.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FontHandle(pub String);
+
+impl FontHandle {
+    /// The font's family name (the cosmic-text selector).
+    pub fn family(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Horizontal alignment of multi-line text within its `max_width` layout box.
+///
+/// Alignment is relative to [`TextBlock::max_width`]; `Center`/`Right` only
+/// produce a visible shift when `max_width` is wider than the longest line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextAlign {
+    /// Lines start at the left edge of the box (default).
+    #[default]
+    Left,
+    /// Lines are centered within `max_width`.
+    Center,
+    /// Lines are flushed to the right edge of `max_width`.
+    Right,
+}
+
+/// Load a font from a TTF/OTF file into the shared `FontSystem`, returning a
+/// [`FontHandle`] that selects it for [`TextBlock::with_font`].
+///
+/// After loading, drop any cached measurements ([`TextMeasurer::clear_cache`])
+/// if the same family name replaced an earlier face.
+pub fn load_font_file(
+    fs: &FontSystemHandle,
+    path: impl AsRef<Path>,
+) -> std::io::Result<FontHandle> {
+    let bytes = std::fs::read(path)?;
+    load_font_bytes(fs, &bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Load a font from in-memory TTF/OTF bytes into the shared `FontSystem`.
+///
+/// Returns the family-name [`FontHandle`], or an error string if the bytes do
+/// not parse into a face that exposes a family name. The family name is read
+/// from the same `fontdb` that cosmic-text shapes against, so the returned
+/// handle is guaranteed to resolve.
+pub fn load_font_bytes(fs: &FontSystemHandle, bytes: &[u8]) -> Result<FontHandle, String> {
+    let mut guard = fs.lock().expect("FontSystem poisoned");
+    let db = guard.db_mut();
+    let before = db.len();
+    db.load_font_data(bytes.to_vec());
+    // `load_font_data` appends one face per font in the data (one for a plain
+    // TTF/OTF). Take the first newly added face's primary family name.
+    db.faces()
+        .nth(before)
+        .and_then(|f| f.families.first().map(|(name, _)| name.clone()))
+        .map(FontHandle)
+        .ok_or_else(|| "loaded font exposes no family name".to_string())
 }
 
 #[repr(C)]
@@ -231,7 +299,7 @@ impl TextRenderer {
     /// Measure text using cosmic-text's shaping/layout path without touching GPU state.
     pub fn measure(&mut self, text: &str, font_size: f32) -> (f32, f32) {
         let mut fs = self.font_system.lock().expect("FontSystem poisoned");
-        measure_with_font_system(&mut fs, text, font_size, None)
+        measure_with_font_system(&mut fs, text, font_size, None, None)
     }
 
     /// Pre-generate the printable-ASCII glyph set into the atlas so the first
@@ -295,12 +363,24 @@ impl TextRenderer {
             }
             let mut buffer = Buffer::new(&mut fs, Metrics::new(block.font_size, block.line_height));
             buffer.set_size(&mut fs, Some(block.max_width), None);
+            let family = block
+                .font
+                .as_ref()
+                .map(|h| Family::Name(h.family()))
+                .unwrap_or(Family::SansSerif);
             buffer.set_text(
                 &mut fs,
                 &block.content,
-                Attrs::new().family(Family::SansSerif).color(block.color),
+                Attrs::new().family(family).color(block.color),
                 Shaping::Advanced,
             );
+            // Horizontal alignment is set per buffer line before layout; Left is
+            // cosmic-text's default so we only override for Center/Right.
+            if let Some(align) = cosmic_align(block.align) {
+                for line in buffer.lines.iter_mut() {
+                    line.set_align(Some(align));
+                }
+            }
             buffer.shape_until_scroll(&mut fs, false);
 
             let default_fill = color_to_rgba(block.color);
@@ -724,10 +804,12 @@ const MEASURE_CACHE_CAP: usize = 4096;
 /// stale metrics.
 pub struct TextMeasurer {
     font_system: FontSystemHandle,
-    /// Keyed by quantized `(font_size_bits, max_width_bits)` so the inner
-    /// `HashMap<String, _>` can be probed with a borrowed `&str` — no key
-    /// allocation on a cache hit, only on a miss when we insert.
-    cache: HashMap<(u32, Option<u32>), HashMap<String, (f32, f32)>>,
+    /// Keyed by quantized `(font_size_bits, max_width_bits, family_hash)` so the
+    /// inner `HashMap<String, _>` can be probed with a borrowed `&str` — no key
+    /// allocation on a cache hit, only on a miss when we insert. `family_hash`
+    /// is 0 for the default font; different fonts have different advances so the
+    /// font must be part of the key.
+    cache: HashMap<(u32, Option<u32>, u64), HashMap<String, (f32, f32)>>,
     cache_entries: usize,
 }
 
@@ -778,7 +860,26 @@ impl TextMeasurer {
     /// `FontSystem`. On a miss it shapes the text (mutating glyphon's font system cache)
     /// and stores the result; it never touches any GPU renderer, atlas, or swash state.
     pub fn measure(&mut self, text: &str, font_size: f32, max_width: Option<f32>) -> (f32, f32) {
-        let key = (font_size.to_bits(), max_width.map(f32::to_bits));
+        self.measure_with_font(text, font_size, max_width, None)
+    }
+
+    /// Like [`measure`](Self::measure), but shapes `text` in a specific font.
+    ///
+    /// Pass `None` for the default (system sans-serif). Different fonts have
+    /// different glyph advances, so the font is part of the cache key — measuring
+    /// the same string under two fonts caches two results.
+    pub fn measure_with_font(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+        font: Option<&FontHandle>,
+    ) -> (f32, f32) {
+        let key = (
+            font_size.to_bits(),
+            max_width.map(f32::to_bits),
+            family_hash(font),
+        );
 
         if let Some(inner) = self.cache.get(&key) {
             if let Some(&dims) = inner.get(text) {
@@ -788,7 +889,7 @@ impl TextMeasurer {
 
         let dims = {
             let mut fs = self.font_system.lock().expect("FontSystem poisoned");
-            measure_with_font_system(&mut fs, text, font_size, max_width)
+            measure_with_font_system(&mut fs, text, font_size, max_width, font.map(|h| h.family()))
         };
 
         // Bound memory: dynamic strings (FPS, coordinates) would grow the cache
@@ -812,20 +913,48 @@ impl Default for TextMeasurer {
     }
 }
 
+/// Hash a font handle into the `TextMeasurer` cache key. `None` (the default
+/// font) hashes to 0; a named font hashes its family. Two different family names
+/// colliding on a 64-bit hash is astronomically unlikely and only the cost is a
+/// rare stale measurement, so a plain `DefaultHasher` is fine here.
+fn family_hash(font: Option<&FontHandle>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    match font {
+        None => 0,
+        Some(h) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            h.0.hash(&mut hasher);
+            hasher.finish()
+        }
+    }
+}
+
+/// Map our [`TextAlign`] to cosmic-text's `Align`, returning `None` for the
+/// default (`Left`) so callers can skip the per-line override.
+fn cosmic_align(align: TextAlign) -> Option<CosmicAlign> {
+    match align {
+        TextAlign::Left => None,
+        TextAlign::Center => Some(CosmicAlign::Center),
+        TextAlign::Right => Some(CosmicAlign::Right),
+    }
+}
+
 fn measure_with_font_system(
     font_system: &mut FontSystem,
     text: &str,
     font_size: f32,
     max_width: Option<f32>,
+    family_name: Option<&str>,
 ) -> (f32, f32) {
     let line_height = font_size * 1.25;
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
     let shape_width = max_width.unwrap_or(f32::MAX / 4.0);
     buffer.set_size(font_system, Some(shape_width), None);
+    let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
     buffer.set_text(
         font_system,
         text,
-        Attrs::new().family(Family::SansSerif),
+        Attrs::new().family(family),
         Shaping::Advanced,
     );
     buffer.shape_until_scroll(font_system, false);
@@ -889,6 +1018,10 @@ pub struct TextBlock {
     pub shadow: Option<TextShadow>,
     /// Optional soft glow halo (off by default).
     pub glow: Option<TextGlow>,
+    /// Font to shape this block in. `None` = the default system sans-serif.
+    pub font: Option<FontHandle>,
+    /// Horizontal alignment within `max_width` (default `Left`).
+    pub align: TextAlign,
 }
 
 impl TextBlock {
@@ -905,6 +1038,8 @@ impl TextBlock {
             outline: None,
             shadow: None,
             glow: None,
+            font: None,
+            align: TextAlign::Left,
         }
     }
 
@@ -965,12 +1100,29 @@ impl TextBlock {
         });
         self
     }
+
+    /// Shape this block in `font` (from [`load_font_file`] / [`load_font_bytes`])
+    /// instead of the default system sans-serif.
+    pub fn with_font(mut self, font: FontHandle) -> Self {
+        self.font = Some(font);
+        self
+    }
+
+    /// Set the horizontal alignment within `max_width`. `Center`/`Right` only
+    /// shift visibly when `max_width` exceeds the longest line.
+    pub fn with_align(mut self, align: TextAlign) -> Self {
+        self.align = align;
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{color_to_rgba, field_reach, TextBlock, TextMeasurer};
-    use glyphon::Color;
+    use super::{
+        color_to_rgba, cosmic_align, field_reach, load_font_bytes, shared_font_system, FontHandle,
+        TextAlign, TextBlock, TextMeasurer,
+    };
+    use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping};
 
     #[test]
     fn color_to_rgba_normalizes_channels() {
@@ -1064,5 +1216,112 @@ mod tests {
         measurer.clear_cache();
         let after = measurer.measure("Persistent", 18.0, None);
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn load_font_bytes_returns_family_name() {
+        let fs = shared_font_system();
+        let handle = load_font_bytes(&fs, notosans::REGULAR_TTF).expect("load noto");
+        assert!(!handle.family().is_empty());
+        assert!(
+            handle.family().to_lowercase().contains("noto"),
+            "expected a Noto family, got {:?}",
+            handle.family()
+        );
+    }
+
+    #[test]
+    fn load_font_bytes_rejects_garbage() {
+        let fs = shared_font_system();
+        assert!(load_font_bytes(&fs, &[0u8, 1, 2, 3, 4, 5, 6, 7]).is_err());
+    }
+
+    #[test]
+    fn loaded_font_is_actually_selected_during_shaping() {
+        // The real proof that `with_font` works: shape a string selecting the
+        // loaded family and confirm cosmic-text resolved glyphs to *that* face.
+        let fs = shared_font_system();
+        let handle = load_font_bytes(&fs, notosans::REGULAR_TTF).unwrap();
+        let mut guard = fs.lock().unwrap();
+        let mut buffer = Buffer::new(&mut guard, Metrics::new(20.0, 25.0));
+        buffer.set_text(
+            &mut guard,
+            "Ag",
+            Attrs::new().family(Family::Name(handle.family())),
+            Shaping::Advanced,
+        );
+        buffer.shape_until_scroll(&mut guard, false);
+        let font_id = buffer.layout_runs().next().unwrap().glyphs[0].font_id;
+        let info = guard.db().face(font_id).expect("resolved face exists");
+        let family = info
+            .families
+            .first()
+            .map(|(n, _)| n.as_str())
+            .unwrap_or("");
+        assert_eq!(family, handle.family());
+    }
+
+    #[test]
+    fn measure_with_font_is_cached_per_font() {
+        // Default and custom-font measurements live under distinct cache keys and
+        // each round-trips. (We don't assert the metrics differ — the system
+        // default sans-serif may itself be Noto on some hosts.)
+        let fs = shared_font_system();
+        let handle = load_font_bytes(&fs, notosans::REGULAR_TTF).unwrap();
+        let mut measurer = TextMeasurer::with_font_system(fs);
+        let default = measurer.measure("Hello world", 16.0, None);
+        let noto = measurer.measure_with_font("Hello world", 16.0, None, Some(&handle));
+        assert!(default.0 > 0.0 && noto.0 > 0.0);
+        // Re-measuring each returns its own cached value (proves keys are distinct
+        // when the metrics happen to coincide, and stable when they don't).
+        assert_eq!(measurer.measure("Hello world", 16.0, None), default);
+        assert_eq!(
+            measurer.measure_with_font("Hello world", 16.0, None, Some(&handle)),
+            noto
+        );
+    }
+
+    #[test]
+    fn font_and_align_defaults_and_builders() {
+        let plain = TextBlock::new("x", 0.0, 0.0);
+        assert!(plain.font.is_none());
+        assert_eq!(plain.align, TextAlign::Left);
+
+        let styled = TextBlock::new("x", 0.0, 0.0)
+            .with_font(FontHandle("Noto Sans".to_string()))
+            .with_align(TextAlign::Center);
+        assert_eq!(styled.font.as_ref().unwrap().family(), "Noto Sans");
+        assert_eq!(styled.align, TextAlign::Center);
+    }
+
+    #[test]
+    fn alignment_shifts_leftmost_glyph_within_max_width() {
+        // Mirrors the shaping in `build_vertices`: a short line in a wide box
+        // moves rightward under Center then Right. Asserting on cosmic-text's
+        // per-glyph x (which the renderer adds to `block.x`) keeps this GPU-free.
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let mut leftmost = |align: TextAlign| -> f32 {
+            let mut buffer = Buffer::new(&mut guard, Metrics::new(16.0, 20.0));
+            buffer.set_size(&mut guard, Some(400.0), None);
+            buffer.set_text(
+                &mut guard,
+                "short",
+                Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+            );
+            if let Some(a) = cosmic_align(align) {
+                for line in buffer.lines.iter_mut() {
+                    line.set_align(Some(a));
+                }
+            }
+            buffer.shape_until_scroll(&mut guard, false);
+            buffer.layout_runs().next().unwrap().glyphs[0].x
+        };
+        let left = leftmost(TextAlign::Left);
+        let center = leftmost(TextAlign::Center);
+        let right = leftmost(TextAlign::Right);
+        assert!(center > left, "center {center} should exceed left {left}");
+        assert!(right > center, "right {right} should exceed center {center}");
     }
 }

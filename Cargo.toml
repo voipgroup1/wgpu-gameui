@@ -15,13 +15,13 @@ log = "0.4"
 # host application's tracing-tracy subscriber collects into the same capture.
 tracing = { version = "0.1", optional = true }
 # MSDF text: pure-Rust multi-channel signed distance field generation from glyph
-# outlines. `image` only for the `RgbImage` buffer fdsm fills — no codecs at runtime
-# (PNG is dev-only, for the glyph-dump test).
+# outlines. `image` provides the `RgbImage` buffer fdsm fills, plus PNG/JPEG codecs
+# for runtime UI image loading (UiImage/UiImageBox etc.).
 fdsm = "0.8"
 fdsm-ttf-parser = "0.2"
 ttf-parser = "0.25"
 nalgebra = "0.34"
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [features]
 # Emit tracing spans around the render path for Tracy profiling.

@@ -56,6 +56,10 @@ pub struct IconDraw {
     /// Multiplied with sampled atlas color. Default white.
     pub tint: [f32; 4],
     pub clip: Option<Rect>,
+    /// Optional normalized source sub-rect `[u0, v0, u1, v1]` (0..1 within the
+    /// sprite) for cropped draws. `None` draws the whole sprite. Resolved
+    /// against the atlas region at render time.
+    pub src: Option<[f32; 4]>,
 }
 
 /// Opaque handle to a registered nine-slice resource.
@@ -751,6 +755,7 @@ impl DrawList {
             icon_key: icon_key.to_string(),
             tint: self.current_tint(),
             clip: self.current_clip(),
+            src: None,
         });
     }
 
@@ -774,6 +779,45 @@ impl DrawList {
             icon_key: String::new(),
             tint: self.apply_tint(tint),
             clip: self.current_clip(),
+            src: None,
+        });
+    }
+
+    /// Draw a loaded image sprite filling `dest`, tinted by `tint`. Equivalent
+    /// to [`DrawList::icon_sprite`] with a `Rect` destination. Backs Teardown's
+    /// `UiImage(path)` / `UiFillImage`.
+    pub fn image(&mut self, sprite: SpriteId, dest: Rect, tint: [f32; 4]) {
+        self.push_image(sprite, dest, None, tint);
+    }
+
+    /// Draw a cropped region of a loaded image sprite into `dest`. `src_uv` is a
+    /// normalized `[u0, v0, u1, v1]` sub-rect (0..1) within the sprite. Backs
+    /// Teardown's `UiImage(path, x0, y0, x1, y1)`.
+    pub fn image_cropped(
+        &mut self,
+        sprite: SpriteId,
+        dest: Rect,
+        src_uv: [f32; 4],
+        tint: [f32; 4],
+    ) {
+        self.push_image(sprite, dest, Some(src_uv), tint);
+    }
+
+    fn push_image(
+        &mut self,
+        sprite: SpriteId,
+        dest: Rect,
+        src: Option<[f32; 4]>,
+        tint: [f32; 4],
+    ) {
+        let corners = self.current_transform().transform_rect_corners(dest);
+        self.icons.push(IconDraw {
+            corners,
+            sprite: Some(sprite),
+            icon_key: String::new(),
+            tint: self.apply_tint(tint),
+            clip: self.current_clip(),
+            src,
         });
     }
 
@@ -949,6 +993,24 @@ mod tests {
         assert_eq!(list.icons[0].sprite, Some(7));
         assert_eq!(list.icons[0].tint, [0.5, 0.6, 0.7, 1.0]);
         assert!(list.icons[0].icon_key.is_empty());
+        assert_eq!(list.icons[0].src, None);
+    }
+
+    #[test]
+    fn image_and_image_cropped_set_src() {
+        let mut list = DrawList::new();
+        list.image(3, Rect::new(0.0, 0.0, 32.0, 32.0), [1.0, 1.0, 1.0, 1.0]);
+        list.image_cropped(
+            4,
+            Rect::new(0.0, 0.0, 16.0, 16.0),
+            [0.0, 0.0, 0.5, 0.5],
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        assert_eq!(list.icons.len(), 2);
+        assert_eq!(list.icons[0].sprite, Some(3));
+        assert_eq!(list.icons[0].src, None);
+        assert_eq!(list.icons[1].sprite, Some(4));
+        assert_eq!(list.icons[1].src, Some([0.0, 0.0, 0.5, 0.5]));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use wgpu::util::DeviceExt;
 
 use crate::layer::LayerStack;
 use crate::render::atlas::{SpriteAtlas, SpriteId};
+use crate::render::image_cache::{decode_rgba8, ImageCache, ImageEntry, ImageError};
 use crate::text::FontSystemHandle;
 use crate::widgets::{DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex};
 use crate::TextRenderer;
@@ -90,6 +91,9 @@ pub struct UiRenderer {
     // Nine-slice registry
     nine_slices: Vec<NineSliceMeta>,
     nine_slice_names: HashMap<String, NineSliceId>,
+
+    // Decoded-image cache (path/key -> atlas sprite + dimensions)
+    image_cache: ImageCache,
 
     // Vertex buffers (grow as needed)
     color_vbo: wgpu::Buffer,
@@ -278,6 +282,7 @@ impl UiRenderer {
             current_atlas_size,
             nine_slices: Vec::new(),
             nine_slice_names: HashMap::new(),
+            image_cache: ImageCache::new(),
             color_vbo,
             color_ibo,
             color_vbo_capacity,
@@ -319,6 +324,62 @@ impl UiRenderer {
     /// Look up a sprite id by name.
     pub fn sprite_id(&self, name: &str) -> Option<SpriteId> {
         self.atlas.id_for(name)
+    }
+
+    /// Decode and load an encoded image (PNG/JPEG) from disk, returning an atlas
+    /// sprite handle. Cached by path: a repeat load of the same path is free and
+    /// returns the existing handle (no re-decode). Backs Teardown's `UiImage`.
+    pub fn load_image_file(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<SpriteId, ImageError> {
+        let key = path.as_ref().to_string_lossy().into_owned();
+        if let Some(entry) = self.image_cache.get(&key) {
+            return Ok(entry.sprite);
+        }
+        let bytes = std::fs::read(path.as_ref()).map_err(ImageError::Io)?;
+        self.decode_and_cache(&key, &bytes)
+    }
+
+    /// Decode and load an encoded image from in-memory bytes under an explicit
+    /// `key` (e.g. an `include_bytes!` asset). Cached by `key` like
+    /// [`UiRenderer::load_image_file`].
+    pub fn load_image_bytes(&mut self, key: &str, bytes: &[u8]) -> Result<SpriteId, ImageError> {
+        if let Some(entry) = self.image_cache.get(key) {
+            return Ok(entry.sprite);
+        }
+        self.decode_and_cache(key, bytes)
+    }
+
+    fn decode_and_cache(&mut self, key: &str, bytes: &[u8]) -> Result<SpriteId, ImageError> {
+        let (w, h, rgba) = decode_rgba8(bytes).map_err(ImageError::Decode)?;
+        let sprite = self.atlas.insert(Some(key), w, h, &rgba);
+        self.image_cache.insert(
+            key,
+            ImageEntry {
+                sprite,
+                width: w,
+                height: h,
+            },
+        );
+        Ok(sprite)
+    }
+
+    /// Pixel dimensions of a loaded image, if `key` has been loaded. Backs
+    /// Teardown's `UiGetImageSize`.
+    pub fn image_size(&self, key: &str) -> Option<(u32, u32)> {
+        self.image_cache.get(key).map(|e| (e.width, e.height))
+    }
+
+    /// Whether an image `key` has been loaded. Backs Teardown's `UiHasImage`.
+    pub fn has_image(&self, key: &str) -> bool {
+        self.image_cache.contains(key)
+    }
+
+    /// Drop the cache entry for an image `key` (next load re-decodes). Backs
+    /// Teardown's `UiUnloadImage`. Note: the atlas slot is not reclaimed.
+    pub fn unload_image(&mut self, key: &str) {
+        self.image_cache.remove(key);
     }
 
     /// Register a nine-slice resource referencing an existing sprite.
@@ -550,7 +611,7 @@ impl UiRenderer {
                 Some(r) => r,
                 None => continue,
             };
-            let uv = region.uv(aw, ah);
+            let uv = apply_crop_uv(region.uv(aw, ah), icon.src);
             let clip = icon.clip.map(|c| [c.x, c.y, c.width, c.height]);
 
             push_textured_quad_corners(
@@ -796,6 +857,25 @@ pub(crate) fn ortho_matrix(width: f32, height: f32) -> [[f32; 4]; 4] {
     ]
 }
 
+/// Resolve an optional normalized within-sprite crop against a sprite's full
+/// atlas UV rect `[u0, v0, u1, v1]`. `src` components are 0..1 fractions of the
+/// sprite; `None` returns the full rect unchanged.
+fn apply_crop_uv(full: [f32; 4], src: Option<[f32; 4]>) -> [f32; 4] {
+    match src {
+        Some([u0, v0, u1, v1]) => {
+            let span_u = full[2] - full[0];
+            let span_v = full[3] - full[1];
+            [
+                full[0] + u0 * span_u,
+                full[1] + v0 * span_v,
+                full[0] + u1 * span_u,
+                full[1] + v1 * span_v,
+            ]
+        }
+        None => full,
+    }
+}
+
 /// Emit two triangles for a quad whose 4 corners are given in TL, TR, BR, BL
 /// order (matching `Affine2::transform_rect_corners`). Used for icons that may
 /// have been rotated/scaled by the active transform.
@@ -916,6 +996,28 @@ fn tessellate_nine_slice(
 mod tests {
     use super::*;
     use crate::render::AtlasRegion;
+
+    fn approx4(a: [f32; 4], b: [f32; 4]) {
+        for i in 0..4 {
+            assert!((a[i] - b[i]).abs() < 1e-5, "{a:?} != {b:?}");
+        }
+    }
+
+    #[test]
+    fn crop_uv_none_is_identity() {
+        let full = [0.25, 0.5, 0.75, 1.0];
+        approx4(apply_crop_uv(full, None), full);
+    }
+
+    #[test]
+    fn crop_uv_maps_into_region() {
+        // Sprite occupies [0.2,0.4]..[0.6,0.8] of the atlas. Crop its centre
+        // quarter [0.25,0.25]..[0.75,0.75] -> a centred sub-rect of the region.
+        let full = [0.2, 0.4, 0.6, 0.8];
+        let got = apply_crop_uv(full, Some([0.25, 0.25, 0.75, 0.75]));
+        // span_u = 0.4, span_v = 0.4
+        approx4(got, [0.3, 0.5, 0.5, 0.7]);
+    }
 
     #[test]
     fn nine_slice_emits_nine_quads() {

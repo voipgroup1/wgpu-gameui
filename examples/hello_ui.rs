@@ -2,14 +2,16 @@
 //!
 //! Opens a window, builds a `DrawList` containing a panel (rounded rect),
 //! a button-shaped quad, an icon (loaded from an in-memory checkerboard
-//! sprite), a nine-slice frame, and some text. Renders all of it through
-//! the single `UiRenderer::render` call.
+//! sprite), a nine-slice frame, a decoded image (drawn full and cropped), a
+//! line in a runtime-loaded custom font, center/right-aligned text, and some
+//! text. Renders all of it through the single `UiRenderer::render` call.
 
 use std::sync::Arc;
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    InputState, LayerStack, ScrollState, ScrollView, TextBlock, Theme, UiContext, UiRenderer,
+    FontHandle, InputState, LayerStack, ScrollState, ScrollView, TextAlign, TextBlock, Theme,
+    UiContext, UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -28,6 +30,25 @@ fn checkerboard_pixels(size: u32, a: [u8; 4], b: [u8; 4]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Encode a small RGBA gradient as a PNG in memory, so the example can exercise
+/// the runtime image-decode path (`UiRenderer::load_image_bytes`) the same way
+/// Teardown's `UiImage(path)` loads an encoded file.
+fn synth_png(w: u32, h: u32) -> Vec<u8> {
+    use image::{ImageFormat, Rgba, RgbaImage};
+    let mut img = RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let r = (x * 255 / w.max(1)) as u8;
+            let g = (y * 255 / h.max(1)) as u8;
+            img.put_pixel(x, y, Rgba([r, g, 160, 255]));
+        }
+    }
+    let mut bytes = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)
+        .expect("encode png");
+    bytes
 }
 
 fn solid_with_border(size: u32, fill: [u8; 4], border: [u8; 4], thickness: u32) -> Vec<u8> {
@@ -54,6 +75,8 @@ struct Gpu {
     ui: UiRenderer,
     icon_sprite: u32,
     nine_slice_id: u32,
+    image_sprite: u32,
+    custom_font: FontHandle,
 }
 
 #[derive(Default)]
@@ -124,8 +147,11 @@ impl ApplicationHandler for App {
         };
         surface.configure(&device, &config);
 
-        // Build UiRenderer with a fresh font system.
+        // Build UiRenderer with a fresh font system. Keep a clone of the handle
+        // so we can load a custom font into the same `FontSystem` the renderer
+        // shapes against.
         let font_system = wgpu_gameui::shared_font_system();
+        let font_for_loading = font_system.clone();
         let mut ui = UiRenderer::new(&device, &queue, format, font_system);
 
         // Upload some sprites.
@@ -140,6 +166,16 @@ impl ApplicationHandler for App {
         let frame_sprite = ui.load_sprite_rgba8("frame", 32, 32, &frame_pixels);
         let nine_slice_id = ui.register_nine_slice("frame", frame_sprite, [4, 4, 4, 4]);
 
+        // Decode an encoded (PNG) image at runtime, exactly like `UiImage(path)`.
+        let png = synth_png(64, 64);
+        let image_sprite = ui
+            .load_image_bytes("demo_gradient", &png)
+            .expect("decode demo image");
+
+        // Load a font from bytes and select it per-`TextBlock`.
+        let custom_font = wgpu_gameui::load_font_bytes(&font_for_loading, notosans::REGULAR_TTF)
+            .expect("load custom font");
+
         self.gpu = Some(Gpu {
             surface,
             device,
@@ -148,6 +184,8 @@ impl ApplicationHandler for App {
             ui,
             icon_sprite,
             nine_slice_id,
+            image_sprite,
+            custom_font,
         });
 
         window.request_redraw();
@@ -316,6 +354,43 @@ impl ApplicationHandler for App {
                             );
                         }
                     },
+                );
+
+                // ---------- Image + custom font + alignment demo ----------
+                // Decoded image drawn at full size, then the same image cropped
+                // to its top-left quarter (UV [0,0,0.5,0.5]) stretched to match.
+                list.image(
+                    gpu.image_sprite,
+                    Rect::new(80.0, 320.0, 64.0, 64.0),
+                    [1.0, 1.0, 1.0, 1.0],
+                );
+                list.image_cropped(
+                    gpu.image_sprite,
+                    Rect::new(152.0, 320.0, 64.0, 64.0),
+                    [0.0, 0.0, 0.5, 0.5],
+                    [1.0, 1.0, 1.0, 1.0],
+                );
+                // A line shaped in the runtime-loaded custom font.
+                list.text(
+                    TextBlock::new("Custom font: Noto Sans", 232.0, 322.0)
+                        .with_size(16.0)
+                        .with_color(255, 228, 160)
+                        .with_font(gpu.custom_font.clone()),
+                );
+                // Center- and right-aligned lines within a 300px-wide box.
+                list.text(
+                    TextBlock::new("centered in 300px", 232.0, 348.0)
+                        .with_size(14.0)
+                        .with_color(200, 210, 230)
+                        .with_max_width(300.0)
+                        .with_align(TextAlign::Center),
+                );
+                list.text(
+                    TextBlock::new("right-aligned in 300px", 232.0, 366.0)
+                        .with_size(14.0)
+                        .with_color(200, 210, 230)
+                        .with_max_width(300.0)
+                        .with_align(TextAlign::Right),
                 );
 
                 // ---------- Modal demo ----------

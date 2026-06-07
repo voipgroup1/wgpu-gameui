@@ -29,8 +29,8 @@
 mod text;
 
 pub use text::{
-    FontSystemHandle, TextBlock, TextGlow, TextMeasurer, TextOutline, TextRenderer, TextShadow,
-    shared_font_system,
+    FontHandle, FontSystemHandle, TextAlign, TextBlock, TextGlow, TextMeasurer, TextOutline,
+    TextRenderer, TextShadow, load_font_bytes, load_font_file, shared_font_system,
 };
 
 pub mod affine;
