@@ -127,10 +127,27 @@ impl DrawList {
     ///
     /// Use this together with `TextRenderer::font_system_handle()` so measured text
     /// widths match what gets rendered to screen.
+    ///
+    /// IMPORTANT: this builds every field explicitly rather than via
+    /// `..Self::default()`. Struct-update syntax would fully evaluate
+    /// `Self::default()` first — which constructs a throwaway
+    /// `TextMeasurer::default()` whose `FontSystem::new()` scans the entire
+    /// system font database (multiple milliseconds) — only to immediately
+    /// overwrite and drop it. Callers that build a `DrawList` per frame would
+    /// pay that font-DB scan every frame. Constructing fields directly with the
+    /// caller-supplied (shared) font system avoids the wasted scan entirely.
     pub fn with_font_system(font_system: FontSystemHandle) -> Self {
         Self {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            texts: Vec::new(),
+            icons: Vec::new(),
+            nine_slices: Vec::new(),
             text_measurer: TextMeasurer::with_font_system(font_system),
-            ..Self::default()
+            clip_stack: Vec::new(),
+            transform_stack: vec![Affine2::IDENTITY],
+            tint_stack: vec![[1.0, 1.0, 1.0, 1.0]],
+            text_rotation_warned: false,
         }
     }
 
@@ -473,19 +490,205 @@ impl DrawList {
         }
     }
 
+    /// Add a rectangle outline of the given `thickness`, drawn flush *inside*
+    /// `rect` (the outer edge of the border coincides with `rect`, the border
+    /// grows inward). Mirrors Teardown's `UiRectOutline(w, h, thickness)`.
+    ///
+    /// Built from four edge quads so it transforms (rotation/scale/clip/tint)
+    /// exactly like [`DrawList::quad`].
+    pub fn rect_outline(&mut self, rect: Rect, thickness: f32, color: [f32; 4]) {
+        if thickness <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        // Clamp so an over-thick border degenerates to a filled rect instead of
+        // overlapping itself / inverting the inner strips.
+        let t = thickness.min(rect.width * 0.5).min(rect.height * 0.5);
+        let x0 = rect.x;
+        let y0 = rect.y;
+        let x1 = rect.x + rect.width;
+
+        // Top and bottom run the full width.
+        self.quad(x0, y0, rect.width, t, color);
+        self.quad(x0, rect.y + rect.height - t, rect.width, t, color);
+
+        // Left and right fill only the gap between the top/bottom strips so the
+        // corners are not double-covered.
+        let inner_h = rect.height - 2.0 * t;
+        if inner_h > 0.0 {
+            self.quad(x0, y0 + t, t, inner_h, color);
+            self.quad(x1 - t, y0 + t, t, inner_h, color);
+        }
+    }
+
+    /// Add a rounded-rectangle outline of the given `thickness`, tracing the
+    /// same boundary as [`DrawList::rounded_rect`] (outer edge flush with
+    /// `rect`, border grows inward). Mirrors Teardown's
+    /// `UiRoundedRectOutline(w, h, radius, thickness)`.
+    pub fn rounded_rect_outline(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        thickness: f32,
+        color: [f32; 4],
+    ) {
+        if thickness <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        if radius <= 0.0 {
+            self.rect_outline(rect, thickness, color);
+            return;
+        }
+
+        let radius = radius.min(rect.width * 0.5).min(rect.height * 0.5);
+        let t = thickness
+            .min(radius)
+            .min(rect.width * 0.5)
+            .min(rect.height * 0.5);
+        let x0 = rect.x;
+        let y0 = rect.y;
+        let x1 = rect.x + rect.width;
+        let y1 = rect.y + rect.height;
+
+        // Straight edges between the corner tangent points, inset inward by `t`.
+        let span_w = rect.width - radius * 2.0;
+        let span_h = rect.height - radius * 2.0;
+        if span_w > 0.0 {
+            self.quad(x0 + radius, y0, span_w, t, color); // top
+            self.quad(x0 + radius, y1 - t, span_w, t, color); // bottom
+        }
+        if span_h > 0.0 {
+            self.quad(x0, y0 + radius, t, span_h, color); // left
+            self.quad(x1 - t, y0 + radius, t, span_h, color); // right
+        }
+
+        // Corner arcs (outer radius = `radius`, inner = radius - t) using the
+        // same angular ranges as `rounded_rect` so the stroke follows the fill.
+        let inner = (radius - t).max(0.0);
+        let seg = ROUNDED_RECT_CORNER_SEGMENTS;
+        self.stroked_arc(
+            (x0 + radius, y0 + radius),
+            inner,
+            radius,
+            std::f32::consts::PI,
+            std::f32::consts::PI * 1.5,
+            seg,
+            color,
+        );
+        self.stroked_arc(
+            (x1 - radius, y0 + radius),
+            inner,
+            radius,
+            std::f32::consts::PI * 1.5,
+            std::f32::consts::TAU,
+            seg,
+            color,
+        );
+        self.stroked_arc(
+            (x1 - radius, y1 - radius),
+            inner,
+            radius,
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+            seg,
+            color,
+        );
+        self.stroked_arc(
+            (x0 + radius, y1 - radius),
+            inner,
+            radius,
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+            seg,
+            color,
+        );
+    }
+
+    /// Emit a thick arc band between `inner` and `outer` radius from
+    /// `start_angle` to `end_angle` as a strip of `segments` quads (two
+    /// triangles each).
+    fn stroked_arc(
+        &mut self,
+        center: (f32, f32),
+        inner: f32,
+        outer: f32,
+        start_angle: f32,
+        end_angle: f32,
+        segments: usize,
+        color: [f32; 4],
+    ) {
+        for i in 0..segments {
+            let t0 = i as f32 / segments as f32;
+            let t1 = (i + 1) as f32 / segments as f32;
+            let a0 = start_angle + (end_angle - start_angle) * t0;
+            let a1 = start_angle + (end_angle - start_angle) * t1;
+            let (c0, s0) = (a0.cos(), a0.sin());
+            let (c1, s1) = (a1.cos(), a1.sin());
+            let i0 = (center.0 + c0 * inner, center.1 + s0 * inner);
+            let o0 = (center.0 + c0 * outer, center.1 + s0 * outer);
+            let i1 = (center.0 + c1 * inner, center.1 + s1 * inner);
+            let o1 = (center.0 + c1 * outer, center.1 + s1 * outer);
+            self.triangle(i0, o0, o1, color);
+            self.triangle(i0, o1, i1, color);
+        }
+    }
+
+    /// Number of segments to approximate a circle of the given radius — enough
+    /// for the curve to read as smooth without exploding vertex counts.
+    fn circle_segments(radius: f32) -> usize {
+        ((radius * 0.5).ceil() as usize).clamp(16, 64)
+    }
+
+    /// Add a filled circle, centered at `center`. Mirrors Teardown's
+    /// `UiCircle(radius)`. Built as a triangle fan so it transforms like the
+    /// other primitives.
+    pub fn circle(&mut self, center: (f32, f32), radius: f32, color: [f32; 4]) {
+        if radius <= 0.0 {
+            return;
+        }
+        let segs = Self::circle_segments(radius);
+        for i in 0..segs {
+            let a0 = std::f32::consts::TAU * i as f32 / segs as f32;
+            let a1 = std::f32::consts::TAU * (i + 1) as f32 / segs as f32;
+            let p0 = (center.0 + a0.cos() * radius, center.1 + a0.sin() * radius);
+            let p1 = (center.0 + a1.cos() * radius, center.1 + a1.sin() * radius);
+            self.triangle(center, p0, p1, color);
+        }
+    }
+
+    /// Add a circle outline of the given `thickness`, centered on the path at
+    /// `radius` (the band spans `radius ± thickness/2`). Mirrors Teardown's
+    /// `UiCircleOutline(radius, thickness)`.
+    pub fn circle_outline(
+        &mut self,
+        center: (f32, f32),
+        radius: f32,
+        thickness: f32,
+        color: [f32; 4],
+    ) {
+        if radius <= 0.0 || thickness <= 0.0 {
+            return;
+        }
+        let half = thickness * 0.5;
+        let inner = (radius - half).max(0.0);
+        let outer = radius + half;
+        let segs = Self::circle_segments(outer);
+        self.stroked_arc(center, inner, outer, 0.0, std::f32::consts::TAU, segs, color);
+    }
+
     /// Add text. The block's origin is transformed through the current
     /// affine; uniform scale (the geometric mean of the X and Y axis basis
     /// lengths, i.e. `sqrt(|det|)`) is applied to font_size, line_height and
     /// max_width. Under non-uniform scale this picks the "average" zoom so a
     /// 2x-by-1x stretch becomes ~1.41x text rather than picking only one axis.
-    /// Rotation/shear is **not supported** by glyphon — when the transform
-    /// has any rotation we log a one-shot warning and render axis-aligned.
+    /// Rotation/shear is **not supported** by the text pipeline (glyphs are
+    /// emitted as axis-aligned MSDF quads) — when the transform has any
+    /// rotation we log a one-shot warning and render axis-aligned.
     pub fn text(&mut self, mut block: TextBlock) {
         let m = self.current_transform();
         if !m.is_axis_aligned() && !self.text_rotation_warned {
             log::warn!(
                 "wgpu-gameui: TextBlock pushed under a rotated/sheared transform — \
-                 text will render axis-aligned (glyphon limitation)"
+                 text will render axis-aligned (MSDF text pipeline limitation)"
             );
             self.text_rotation_warned = true;
         }
@@ -625,6 +828,95 @@ mod tests {
 
         assert!(list.vertices.len() > 12);
         assert!(list.indices.len() > 18);
+    }
+
+    #[test]
+    fn rect_outline_emits_four_edge_quads() {
+        let mut list = DrawList::new();
+        list.rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 2.0, [1.0; 4]);
+        // Four quads = 16 vertices, 24 indices.
+        assert_eq!(list.vertices.len(), 16);
+        assert_eq!(list.indices.len(), 24);
+    }
+
+    #[test]
+    fn rect_outline_degenerates_to_two_quads_when_thick() {
+        // Thickness >= half height: inner strip collapses, only top+bottom drawn.
+        let mut list = DrawList::new();
+        list.rect_outline(Rect::new(0.0, 0.0, 100.0, 10.0), 50.0, [1.0; 4]);
+        assert_eq!(list.vertices.len(), 8); // two quads
+    }
+
+    #[test]
+    fn rect_outline_zero_thickness_draws_nothing() {
+        let mut list = DrawList::new();
+        list.rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 0.0, [1.0; 4]);
+        assert!(list.vertices.is_empty());
+    }
+
+    #[test]
+    fn rounded_rect_outline_emits_geometry() {
+        let mut list = DrawList::new();
+        list.rounded_rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 8.0, 2.0, [1.0; 4]);
+        // 4 edge quads + 4 corner arcs (8 segments × 2 tris each).
+        assert!(list.vertices.len() > 12);
+        assert!(list.indices.len() > 18);
+    }
+
+    #[test]
+    fn rounded_rect_outline_zero_radius_falls_back_to_rect_outline() {
+        let mut rounded = DrawList::new();
+        rounded.rounded_rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 0.0, 2.0, [1.0; 4]);
+        let mut plain = DrawList::new();
+        plain.rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 2.0, [1.0; 4]);
+        assert_eq!(rounded.vertices.len(), plain.vertices.len());
+    }
+
+    #[test]
+    fn circle_emits_fan_within_radius() {
+        let mut list = DrawList::new();
+        let r = 20.0;
+        list.circle((50.0, 50.0), r, [1.0; 4]);
+        assert!(!list.vertices.is_empty());
+        // Every vertex lies within (or on) the circle of radius r about center.
+        for v in &list.vertices {
+            let dx = v.position[0] - 50.0;
+            let dy = v.position[1] - 50.0;
+            assert!((dx * dx + dy * dy).sqrt() <= r + 1e-3);
+        }
+    }
+
+    #[test]
+    fn circle_outline_band_spans_radius() {
+        let mut list = DrawList::new();
+        let (r, t) = (20.0, 4.0);
+        list.circle_outline((0.0, 0.0), r, t, [1.0; 4]);
+        // Vertices sit on the inner or outer ring: distance in [r - t/2, r + t/2].
+        let lo = r - t * 0.5 - 1e-3;
+        let hi = r + t * 0.5 + 1e-3;
+        for v in &list.vertices {
+            let d = (v.position[0] * v.position[0] + v.position[1] * v.position[1]).sqrt();
+            assert!(d >= lo && d <= hi, "vertex dist {d} outside band [{lo},{hi}]");
+        }
+    }
+
+    #[test]
+    fn circle_zero_radius_draws_nothing() {
+        let mut list = DrawList::new();
+        list.circle((0.0, 0.0), 0.0, [1.0; 4]);
+        list.circle_outline((0.0, 0.0), 0.0, 2.0, [1.0; 4]);
+        assert!(list.vertices.is_empty());
+    }
+
+    #[test]
+    fn outline_primitives_respect_transform() {
+        // Outlines are built from quad()/triangle(), so the active transform must
+        // carry through just like other primitives.
+        let mut list = DrawList::new();
+        list.translate(100.0, 50.0);
+        list.rect_outline(Rect::new(0.0, 0.0, 10.0, 10.0), 2.0, [1.0; 4]);
+        // First vertex of the top strip: local (0,0) -> world (100,50).
+        assert_eq!(list.vertices[0].position, [100.0, 50.0]);
     }
 
     #[test]

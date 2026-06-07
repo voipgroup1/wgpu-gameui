@@ -265,15 +265,19 @@ impl ApplicationHandler for App {
                     [1.0, 1.0, 1.0, 1.0],
                 );
 
+                // Title: MSDF outline demo (white fill, dark 2px outline).
                 list.text(
                     TextBlock::new("hello_ui — wgpu-gameui", 80.0, 80.0)
                         .with_size(22.0)
-                        .with_color(255, 255, 255),
+                        .with_color(255, 255, 255)
+                        .with_outline(10, 12, 18, 255, 2.0),
                 );
+                // Subtitle: MSDF drop-shadow demo.
                 list.text(
                     TextBlock::new("Click 'Open Modal' to demo the layer system", 80.0, 120.0)
                         .with_size(14.0)
-                        .with_color(200, 210, 230),
+                        .with_color(200, 210, 230)
+                        .with_shadow(0, 0, 0, 180, 1.0, 1.0, 1.0),
                 );
                 list.text(
                     TextBlock::new("Open Modal", 110.0, 232.0)

@@ -11,11 +11,28 @@ wgpu = "24"
 bytemuck = { version = "1", features = ["derive"] }
 glyphon = "0.8"
 log = "0.4"
+# Profiling (optional, behind "tracy" feature). Emits `tracing` spans that the
+# host application's tracing-tracy subscriber collects into the same capture.
+tracing = { version = "0.1", optional = true }
+# MSDF text: pure-Rust multi-channel signed distance field generation from glyph
+# outlines. `image` only for the `RgbImage` buffer fdsm fills — no codecs at runtime
+# (PNG is dev-only, for the glyph-dump test).
+fdsm = "0.8"
+fdsm-ttf-parser = "0.2"
+ttf-parser = "0.25"
+nalgebra = "0.34"
+image = { version = "0.25", default-features = false }
+
+[features]
+# Emit tracing spans around the render path for Tracy profiling.
+tracy = ["dep:tracing"]
 
 [dev-dependencies]
 winit = "0.30"
 pollster = "0.3"
 env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+notosans = "0.1.0"
 
 [[example]]
 name = "hello_ui"

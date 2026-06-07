@@ -1,14 +1,31 @@
-//! Text rendering using glyphon.
-//! Provides GPU-accelerated text rendering with proper font shaping.
+//! MSDF text rendering.
+//!
+//! Shaping and layout still go through **cosmic-text** (via the `glyphon`
+//! re-export), exactly as before — so wrapping and measurement are unchanged. What
+//! changed is the *rasterize + atlas + GPU draw* stage: instead of glyphon's
+//! grayscale-alpha glyph cache, each glyph is rendered from a **multi-channel
+//! signed distance field** ([`crate::render::MsdfGlyphAtlas`]). This gives crisp
+//! fill at any size and is the foundation for outline/shadow/glow effects
+//! (Teardown `UiTextOutline`/`UiTextShadow` parity) added in later phases.
+//!
+//! [`TextRenderer`] is self-contained: it owns the MSDF atlas, a linear-sampled
+//! `Rgba8Unorm` (NOT sRGB — the texels are distances, not colors) GPU texture, the
+//! MSDF pipeline, and its own ortho uniform. [`TextRenderer::render`] shapes each
+//! [`TextBlock`], emits one quad per glyph, lazily generates any unseen glyph into
+//! the atlas, uploads the atlas if it changed, and draws — all in one call.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::layout::Rect;
+use bytemuck::{Pod, Zeroable};
 
-use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonRenderer, Viewport,
-};
+use crate::layout::Rect;
+use crate::render::{ortho_matrix, GlyphTile, MsdfGlyphAtlas};
+
+use glyphon::cosmic_text::fontdb;
+use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
+
+const MSDF_SHADER: &str = include_str!("render/ui_msdf.wgsl");
 
 /// Shared handle to a glyphon `FontSystem`.
 ///
@@ -22,12 +39,61 @@ pub fn shared_font_system() -> FontSystemHandle {
     Arc::new(Mutex::new(FontSystem::new()))
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct MsdfVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+    fill: [f32; 4],
+    clip: [f32; 4],
+    clip_enabled: f32,
+    /// Distance-ramp width of the field in atlas texels (constant per atlas).
+    px_range: f32,
+    /// Outline/glow color composited under the fill (a == 0 disables).
+    outline: [f32; 4],
+    /// Outline width in screen px (glyph grown outward by this much).
+    outline_width: f32,
+    /// Extra AA spread in screen px (soft shadows / glow); 0 = crisp.
+    softness: f32,
+}
+
+const MSDF_VERTEX_ATTRIBS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
+    0 => Float32x2,
+    1 => Float32x2,
+    2 => Float32x4,
+    3 => Float32x4,
+    4 => Float32,
+    5 => Float32,
+    6 => Float32x4,
+    7 => Float32,
+    8 => Float32,
+];
+
 pub struct TextRenderer {
     font_system: FontSystemHandle,
-    swash_cache: SwashCache,
-    viewport: Viewport,
-    atlas: TextAtlas,
-    renderer: GlyphonRenderer,
+
+    // MSDF glyph atlas (CPU source of truth) + its GPU mirror.
+    atlas: MsdfGlyphAtlas,
+    texture: wgpu::Texture,
+    sampler: wgpu::Sampler,
+    atlas_bgl: wgpu::BindGroupLayout,
+    atlas_bind_group: wgpu::BindGroup,
+    current_atlas_size: u32,
+
+    // Ortho projection (owned, sized from `resize`).
+    uniform_buffer: wgpu::Buffer,
+    uniform_bind_group: wgpu::BindGroup,
+
+    pipeline: wgpu::RenderPipeline,
+
+    vbo: wgpu::Buffer,
+    vbo_capacity: u64,
+
+    /// Stable per-font keys for the atlas, assigned on first sighting. Decouples
+    /// the atlas from cosmic-text's `fontdb::ID`.
+    font_keys: HashMap<fontdb::ID, u64>,
+    next_font_key: u64,
+
     width: u32,
     height: u32,
 }
@@ -41,23 +107,109 @@ impl TextRenderer {
     /// Construct a `TextRenderer` reusing an existing shared `FontSystem`.
     pub fn with_font_system(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         font_system: FontSystemHandle,
     ) -> Self {
-        let swash_cache = SwashCache::new();
-        let cache = Cache::new(device);
-        let mut atlas = TextAtlas::new(device, queue, &cache, format);
-        let renderer =
-            GlyphonRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
-        let viewport = Viewport::new(device, &cache);
+        let atlas = MsdfGlyphAtlas::new();
+
+        // Uniform (group 0): ortho projection, matching the main UI pipelines.
+        let uniform_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("msdf text uniform"),
+                contents: bytemuck::cast_slice(&[ortho_matrix(1.0, 1.0)]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+        let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("msdf uniform bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("msdf uniform bg"),
+            layout: &uniform_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        // Atlas texture (group 1): linear filtering, linear (non-sRGB) format.
+        let (texture, sampler, atlas_bgl, atlas_bind_group) =
+            create_msdf_texture(device, atlas.width(), atlas.height());
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("msdf text shader"),
+            source: wgpu::ShaderSource::Wgsl(MSDF_SHADER.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("msdf text pipeline layout"),
+            bind_group_layouts: &[&uniform_bgl, &atlas_bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("msdf text pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_msdf"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MsdfVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &MSDF_VERTEX_ATTRIBS,
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_msdf"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let vbo_capacity = (4096 * std::mem::size_of::<MsdfVertex>()) as u64;
+        let vbo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("msdf text vbo"),
+            size: vbo_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             font_system,
-            swash_cache,
-            viewport,
             atlas,
-            renderer,
+            texture,
+            sampler,
+            atlas_bgl,
+            atlas_bind_group,
+            current_atlas_size: 0, // forces first upload
+            uniform_buffer,
+            uniform_bind_group,
+            pipeline,
+            vbo,
+            vbo_capacity,
+            font_keys: HashMap::new(),
+            next_font_key: 0,
             width: 1,
             height: 1,
         }
@@ -72,17 +224,241 @@ impl TextRenderer {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.width = width;
-        self.height = height;
+        self.width = width.max(1);
+        self.height = height.max(1);
     }
 
-    /// Measure text using glyphon's shaping/layout path without preparing GPU atlas state.
-    ///
-    /// This mutates the internal font system cache as glyphon shapes text, but does not
-    /// mutate rendered atlas or renderer state.
+    /// Measure text using cosmic-text's shaping/layout path without touching GPU state.
     pub fn measure(&mut self, text: &str, font_size: f32) -> (f32, f32) {
         let mut fs = self.font_system.lock().expect("FontSystem poisoned");
         measure_with_font_system(&mut fs, text, font_size, None)
+    }
+
+    /// Pre-generate the printable-ASCII glyph set into the atlas so the first
+    /// frame that displays them doesn't hitch. Call once after construction.
+    pub fn prewarm_ascii(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let ascii: String = (0x20u8..=0x7e).map(|c| c as char).collect();
+        // Clone the handle so the guard borrows a local, not `self` (frees `self`
+        // for `self.font_key`/`self.atlas`).
+        let fs_handle = Arc::clone(&self.font_system);
+        let mut fs = fs_handle.lock().expect("FontSystem poisoned");
+        let mut buffer = Buffer::new(&mut fs, Metrics::new(self.atlas.ref_px(), self.atlas.ref_px()));
+        buffer.set_text(
+            &mut fs,
+            &ascii,
+            Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+        );
+        buffer.shape_until_scroll(&mut fs, false);
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                let font_key = self.font_key(glyph.font_id);
+                if let Some(font) = fs.get_font(glyph.font_id) {
+                    self.atlas.glyph(font_key, glyph.glyph_id, font.data());
+                }
+            }
+        }
+        drop(fs);
+        self.upload_atlas(device, queue);
+    }
+
+    fn font_key(&mut self, id: fontdb::ID) -> u64 {
+        if let Some(k) = self.font_keys.get(&id) {
+            return *k;
+        }
+        let k = self.next_font_key;
+        self.next_font_key += 1;
+        self.font_keys.insert(id, k);
+        k
+    }
+
+    /// Build glyph quads for all text blocks, generating any unseen glyphs into the
+    /// atlas. Returns the vertex list (6 verts/glyph, triangle list).
+    fn build_vertices(&mut self, texts: &[TextBlock]) -> Vec<MsdfVertex> {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::info_span!("gameui_text_shape").entered();
+
+        let fs_handle = Arc::clone(&self.font_system);
+        let mut fs = fs_handle.lock().expect("FontSystem poisoned");
+        let px_range = self.atlas.px_range();
+        let ref_px = self.atlas.ref_px();
+
+        // First pass: shape every block and generate any unseen glyphs, collecting
+        // per-glyph placements. We resolve uv only *after* this pass, because glyph
+        // generation can grow the atlas (changing the size uv divides by) — pixel
+        // regions stay valid (top-left origin) but uv must use the final size.
+        let mut placements: Vec<GlyphPlacement> = Vec::new();
+
+        for block in texts {
+            if block.content.is_empty() {
+                continue;
+            }
+            let mut buffer = Buffer::new(&mut fs, Metrics::new(block.font_size, block.line_height));
+            buffer.set_size(&mut fs, Some(block.max_width), None);
+            buffer.set_text(
+                &mut fs,
+                &block.content,
+                Attrs::new().family(Family::SansSerif).color(block.color),
+                Shaping::Advanced,
+            );
+            buffer.shape_until_scroll(&mut fs, false);
+
+            let default_fill = color_to_rgba(block.color);
+            let clip = block.clip.map(|c| [c.x, c.y, c.width, c.height]);
+            let outline = block.outline.as_ref().map(|o| (color_to_rgba(o.color), o.width_px));
+            let shadow = block
+                .shadow
+                .as_ref()
+                .map(|s| (color_to_rgba(s.color), s.offset, s.softness));
+            let glow = block.glow.as_ref().map(|g| (color_to_rgba(g.color), g.radius_px));
+
+            for run in buffer.layout_runs() {
+                for glyph in run.glyphs {
+                    let font_size = glyph.font_size;
+                    // Pen origin on the baseline, in screen space (mirrors
+                    // cosmic-text's `glyph.physical((left, run.line_y), 1.0)`).
+                    let pen_x = block.x + glyph.x + font_size * glyph.x_offset;
+                    let baseline_y = block.y + run.line_y + glyph.y - font_size * glyph.y_offset;
+
+                    let font_key = self.font_key(glyph.font_id);
+                    let Some(font) = fs.get_font(glyph.font_id) else {
+                        continue;
+                    };
+                    let Some(tile) = self.atlas.glyph(font_key, glyph.glyph_id, font.data()) else {
+                        continue; // whitespace / outline-less
+                    };
+
+                    let fill = glyph.color_opt.map(color_to_rgba).unwrap_or(default_fill);
+                    placements.push(GlyphPlacement {
+                        tile,
+                        pen_x,
+                        baseline_y,
+                        font_size,
+                        clip,
+                        fill,
+                        outline,
+                        shadow,
+                        glow,
+                    });
+                }
+            }
+        }
+        drop(fs);
+
+        // Second pass: resolve uv against the final atlas size and emit quads in
+        // back-to-front sweeps so every glyph's shadow/glow sits behind ALL fills:
+        //   1. shadows  2. glow  3. fill (+ outline)
+        let (aw, ah) = (self.atlas.width(), self.atlas.height());
+        let mut verts: Vec<MsdfVertex> = Vec::with_capacity(placements.len() * 6);
+
+        for p in &placements {
+            if let Some((color, offset, softness)) = p.shadow {
+                // A shadow is a fill with widened AA; cap the blur to the field reach.
+                let safe = field_reach(p.font_size, px_range, ref_px);
+                push_glyph_quad(
+                    &mut verts,
+                    p,
+                    aw,
+                    ah,
+                    px_range,
+                    &QuadStyle {
+                        fill: color,
+                        outline: [0.0; 4],
+                        outline_width: 0.0,
+                        softness: softness.min(safe),
+                        offset,
+                    },
+                );
+            }
+        }
+        for p in &placements {
+            if let Some((color, radius)) = p.glow {
+                // The glow is a grown, soft, fill-less halo. Cap its band (width +
+                // softness) to the field's valid reach so it follows the glyph instead
+                // of filling the tile rectangle (graceful degradation at small sizes).
+                let safe = field_reach(p.font_size, px_range, ref_px);
+                let radius = radius.min(safe / 1.5);
+                let softness = (radius * 0.5).max(0.5).min((safe - radius).max(0.0));
+                push_glyph_quad(
+                    &mut verts,
+                    p,
+                    aw,
+                    ah,
+                    px_range,
+                    &QuadStyle {
+                        fill: [0.0; 4],
+                        outline: color,
+                        outline_width: radius,
+                        softness,
+                        offset: [0.0, 0.0],
+                    },
+                );
+            }
+        }
+        for p in &placements {
+            let (outline, outline_width) = p.outline.unwrap_or(([0.0; 4], 0.0));
+            // Cap the outline thickness to the field reach to avoid tile-fill artifacts.
+            let safe = field_reach(p.font_size, px_range, ref_px);
+            push_glyph_quad(
+                &mut verts,
+                p,
+                aw,
+                ah,
+                px_range,
+                &QuadStyle {
+                    fill: p.fill,
+                    outline,
+                    outline_width: outline_width.min(safe),
+                    softness: 0.0,
+                    offset: [0.0, 0.0],
+                },
+            );
+        }
+        verts
+    }
+
+    /// (Re)upload the atlas pixels to the GPU if the CPU atlas changed. Recreates
+    /// the texture + bind group when the atlas has grown.
+    fn upload_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::info_span!("gameui_text_atlas_upload").entered();
+        if self.atlas.width() != self.current_atlas_size {
+            let (texture, sampler, _bgl, bind_group) =
+                create_msdf_texture_with_bgl(device, &self.atlas_bgl, self.atlas.width(), self.atlas.height());
+            self.texture = texture;
+            self.sampler = sampler;
+            self.atlas_bind_group = bind_group;
+            self.current_atlas_size = self.atlas.width();
+            let _ = self.atlas.take_dirty();
+            self.write_atlas_pixels(queue);
+        } else if self.atlas.take_dirty() {
+            self.write_atlas_pixels(queue);
+        }
+    }
+
+    fn write_atlas_pixels(&self, queue: &wgpu::Queue) {
+        let pixels = self.atlas.build_pixel_buffer();
+        let w = self.atlas.width();
+        let h = self.atlas.height();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Prepare and render text in a single call.
@@ -98,63 +474,30 @@ impl TextRenderer {
             return;
         }
 
-        // Update viewport
-        self.viewport.update(
-            queue,
-            Resolution {
-                width: self.width,
-                height: self.height,
-            },
+        #[cfg(feature = "tracy")]
+        let _span = tracing::info_span!("gameui_text_render").entered();
+
+        // Keep the ortho uniform in sync with the current viewport.
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[ortho_matrix(self.width as f32, self.height as f32)]),
         );
 
-        let mut fs = self.font_system.lock().expect("FontSystem poisoned");
+        let verts = self.build_vertices(texts);
+        // Glyph generation may have dirtied / grown the atlas — upload before drawing.
+        self.upload_atlas(device, queue);
 
-        // Create buffers for each text block
-        let mut buffers: Vec<Buffer> = Vec::with_capacity(texts.len());
-        for text in texts {
-            let mut buffer = Buffer::new(&mut *fs, Metrics::new(text.font_size, text.line_height));
-            buffer.set_size(&mut *fs, Some(text.max_width), None);
-            buffer.set_text(
-                &mut *fs,
-                &text.content,
-                Attrs::new().family(Family::SansSerif).color(text.color),
-                Shaping::Advanced,
-            );
-            buffer.shape_until_scroll(&mut *fs, false);
-            buffers.push(buffer);
+        if verts.is_empty() {
+            return;
         }
+        self.ensure_vbo_capacity(device, verts.len());
+        queue.write_buffer(&self.vbo, 0, bytemuck::cast_slice(&verts));
 
-        // Build text areas referencing the buffers
-        let text_areas: Vec<TextArea> = texts
-            .iter()
-            .zip(buffers.iter())
-            .map(|(text, buffer)| TextArea {
-                buffer,
-                left: text.x,
-                top: text.y,
-                scale: 1.0,
-                bounds: text.bounds(),
-                default_color: text.color,
-                custom_glyphs: &[],
-            })
-            .collect();
-
-        // Prepare the renderer
-        self.renderer
-            .prepare(
-                device,
-                queue,
-                &mut *fs,
-                &mut self.atlas,
-                &self.viewport,
-                text_areas,
-                &mut self.swash_cache,
-            )
-            .unwrap();
-
-        // Render
+        #[cfg(feature = "tracy")]
+        let _pass_span = tracing::info_span!("gameui_text_pass").entered();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Text Render Pass"),
+            label: Some("msdf text pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
@@ -167,16 +510,225 @@ impl TextRenderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vbo.slice(..));
+        pass.draw(0..verts.len() as u32, 0..1);
+    }
 
-        self.renderer
-            .render(&self.atlas, &self.viewport, &mut pass)
-            .unwrap();
+    fn ensure_vbo_capacity(&mut self, device: &wgpu::Device, verts: usize) {
+        let needed = (verts * std::mem::size_of::<MsdfVertex>()) as u64;
+        if needed > self.vbo_capacity {
+            self.vbo_capacity = needed.next_power_of_two();
+            self.vbo = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("msdf text vbo"),
+                size: self.vbo_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
     }
 }
 
+/// Convert a cosmic-text `Color` (sRGB u8 RGBA) to a normalized `[f32; 4]`. Matches
+/// how the colored-quad pipeline treats `Vertex` colors (pass-through), so MSDF text
+/// fill matches solid UI colors.
+fn color_to_rgba(c: Color) -> [f32; 4] {
+    [
+        c.r() as f32 / 255.0,
+        c.g() as f32 / 255.0,
+        c.b() as f32 / 255.0,
+        c.a() as f32 / 255.0,
+    ]
+}
+
+/// A glyph ready to be turned into quads, captured before uv resolution. Carries
+/// the block's resolved effect parameters so the emit sweeps can build shadow /
+/// glow / fill quads from one record.
+struct GlyphPlacement {
+    tile: GlyphTile,
+    pen_x: f32,
+    baseline_y: f32,
+    font_size: f32,
+    clip: Option<[f32; 4]>,
+    fill: [f32; 4],
+    /// (color, width_px)
+    outline: Option<([f32; 4], f32)>,
+    /// (color, offset, softness)
+    shadow: Option<([f32; 4], [f32; 2], f32)>,
+    /// (color, radius_px)
+    glow: Option<([f32; 4], f32)>,
+}
+
+/// Maximum effect reach (screen px) a glyph's distance field supports at a given
+/// font size, leaving 0.5px AA headroom. Effects (outline width, shadow/glow blur)
+/// clamped to this never read past the field's valid range, so they follow the
+/// glyph shape instead of filling the tile rectangle.
+///
+/// The field is valid for `±(px_range/2)` tile texels around the edge; one tile
+/// texel maps to `font_size / ref_px` screen px.
+fn field_reach(font_size: f32, px_range: f32, ref_px: f32) -> f32 {
+    (0.5 * px_range * font_size / ref_px - 0.5).max(0.0)
+}
+
+/// Per-quad appearance for one emit sweep.
+struct QuadStyle {
+    fill: [f32; 4],
+    outline: [f32; 4],
+    outline_width: f32,
+    softness: f32,
+    /// Screen-space translation applied to the quad (drop-shadow offset).
+    offset: [f32; 2],
+}
+
+/// Emit two triangles (6 verts) for one glyph's MSDF tile with the given style.
+fn push_glyph_quad(
+    out: &mut Vec<MsdfVertex>,
+    p: &GlyphPlacement,
+    atlas_w: u32,
+    atlas_h: u32,
+    px_range: f32,
+    style: &QuadStyle,
+) {
+    let m = &p.tile.metrics;
+    let font_size = p.font_size;
+    let (ox, oy) = (style.offset[0], style.offset[1]);
+    // Screen rect (y-down): top_em is above the baseline (positive), bottom_em below.
+    let x0 = p.pen_x + m.left_em * font_size + ox;
+    let x1 = p.pen_x + m.right_em * font_size + ox;
+    let y0 = p.baseline_y - m.top_em * font_size + oy;
+    let y1 = p.baseline_y - m.bottom_em * font_size + oy;
+
+    let uv = p.tile.region.uv(atlas_w, atlas_h);
+    let (u0, v0, u1, v1) = (uv[0], uv[1], uv[2], uv[3]);
+
+    let (clip_rect, clip_on) = match p.clip {
+        Some(c) => (c, 1.0),
+        None => ([0.0; 4], 0.0),
+    };
+
+    let v = |x: f32, y: f32, u: f32, vv: f32| MsdfVertex {
+        position: [x, y],
+        uv: [u, vv],
+        fill: style.fill,
+        clip: clip_rect,
+        clip_enabled: clip_on,
+        px_range,
+        outline: style.outline,
+        outline_width: style.outline_width,
+        softness: style.softness,
+    };
+
+    // TL, TR, BR / TL, BR, BL
+    out.push(v(x0, y0, u0, v0));
+    out.push(v(x1, y0, u1, v0));
+    out.push(v(x1, y1, u1, v1));
+    out.push(v(x0, y0, u0, v0));
+    out.push(v(x1, y1, u1, v1));
+    out.push(v(x0, y1, u0, v1));
+}
+
+fn create_msdf_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::Sampler, wgpu::BindGroupLayout, wgpu::BindGroup) {
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("msdf atlas bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let (texture, sampler, _bgl, bg) = create_msdf_texture_with_bgl(device, &bgl, width, height);
+    (texture, sampler, bgl, bg)
+}
+
+fn create_msdf_texture_with_bgl(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::Sampler, (), wgpu::BindGroup) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("msdf atlas texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        // Linear (NOT sRGB): MSDF texels are distances, not colors.
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("msdf atlas bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    (texture, sampler, (), bg)
+}
+
+/// Maximum number of cached text measurements before the cache is flushed.
+///
+/// Dynamic strings (an FPS counter, a coordinate readout) change every frame and
+/// would otherwise grow the cache without bound. When the cache reaches this many
+/// entries it is cleared wholesale; static labels are simply re-measured once and
+/// re-cached on the next frame. 4096 short entries is a few hundred KB at most.
+const MEASURE_CACHE_CAP: usize = 4096;
+
 /// CPU-side glyphon text measurer for layout and widget construction.
+///
+/// Shaping a string through glyphon to obtain its dimensions is not free, and most
+/// UI text is static across frames (labels, button captions). [`TextMeasurer`] caches
+/// `(text, font_size, max_width) -> (width, height)` so repeated measurements of the
+/// same string are a hash lookup instead of a re-shape.
+///
+/// The cache assumes the underlying `FontSystem`'s font set does not change after the
+/// first measurement (true for the system-font default). If fonts are loaded into the
+/// shared `FontSystem` after measuring, call [`TextMeasurer::clear_cache`] to drop
+/// stale metrics.
 pub struct TextMeasurer {
     font_system: FontSystemHandle,
+    /// Keyed by quantized `(font_size_bits, max_width_bits)` so the inner
+    /// `HashMap<String, _>` can be probed with a borrowed `&str` — no key
+    /// allocation on a cache hit, only on a miss when we insert.
+    cache: HashMap<(u32, Option<u32>), HashMap<String, (f32, f32)>>,
+    cache_entries: usize,
 }
 
 impl TextMeasurer {
@@ -187,13 +739,19 @@ impl TextMeasurer {
     pub fn new() -> Self {
         Self {
             font_system: shared_font_system(),
+            cache: HashMap::new(),
+            cache_entries: 0,
         }
     }
 
     /// Create a measurer that shares its `FontSystem` with another component (typically
     /// a `TextRenderer`).
     pub fn with_font_system(font_system: FontSystemHandle) -> Self {
-        Self { font_system }
+        Self {
+            font_system,
+            cache: HashMap::new(),
+            cache_entries: 0,
+        }
     }
 
     /// Get a clone of the shared font system handle.
@@ -201,17 +759,50 @@ impl TextMeasurer {
         Arc::clone(&self.font_system)
     }
 
-    /// Measure text using glyphon's shaping/layout path.
+    /// Drop all cached measurements.
+    ///
+    /// Call this if the shared `FontSystem`'s font set changes after measuring, so the
+    /// next measurement re-shapes against the new fonts.
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.cache_entries = 0;
+    }
+
+    /// Measure text using glyphon's shaping/layout path, with a result cache.
     ///
     /// `max_width` constrains the shaping width; pass `None` for unconstrained
     /// single-line measurement, or `Some(w)` to let glyphon wrap the text and report
     /// the resulting multi-line height.
     ///
-    /// This mutates glyphon's font system cache while shaping; it does not touch any GPU
-    /// renderer, atlas, or swash cache state.
+    /// On a cache hit this performs only a hash lookup and does not lock the
+    /// `FontSystem`. On a miss it shapes the text (mutating glyphon's font system cache)
+    /// and stores the result; it never touches any GPU renderer, atlas, or swash state.
     pub fn measure(&mut self, text: &str, font_size: f32, max_width: Option<f32>) -> (f32, f32) {
-        let mut fs = self.font_system.lock().expect("FontSystem poisoned");
-        measure_with_font_system(&mut fs, text, font_size, max_width)
+        let key = (font_size.to_bits(), max_width.map(f32::to_bits));
+
+        if let Some(inner) = self.cache.get(&key) {
+            if let Some(&dims) = inner.get(text) {
+                return dims;
+            }
+        }
+
+        let dims = {
+            let mut fs = self.font_system.lock().expect("FontSystem poisoned");
+            measure_with_font_system(&mut fs, text, font_size, max_width)
+        };
+
+        // Bound memory: dynamic strings (FPS, coordinates) would grow the cache
+        // forever. Flush wholesale when full — static labels re-cache next frame.
+        if self.cache_entries >= MEASURE_CACHE_CAP {
+            self.clear_cache();
+        }
+        self.cache
+            .entry(key)
+            .or_default()
+            .insert(text.to_string(), dims);
+        self.cache_entries += 1;
+
+        dims
     }
 }
 
@@ -253,6 +844,34 @@ fn measure_with_font_system(
     }
 }
 
+/// Crisp outline drawn around glyphs, composited under the fill. Maps to
+/// Teardown's `UiTextOutline(r, g, b, a, thickness)`.
+#[derive(Clone, Copy, Debug)]
+pub struct TextOutline {
+    pub color: Color,
+    /// Outline thickness in screen pixels.
+    pub width_px: f32,
+}
+
+/// Drop shadow drawn offset behind the text. Maps to Teardown's
+/// `UiTextShadow(r, g, b, a, distance, blur)`.
+#[derive(Clone, Copy, Debug)]
+pub struct TextShadow {
+    pub color: Color,
+    /// Screen-space offset `[dx, dy]`.
+    pub offset: [f32; 2],
+    /// Edge softness (blur) in screen pixels.
+    pub softness: f32,
+}
+
+/// Soft colored halo around glyphs (a wide, soft, fill-less outline).
+#[derive(Clone, Copy, Debug)]
+pub struct TextGlow {
+    pub color: Color,
+    /// Halo radius in screen pixels.
+    pub radius_px: f32,
+}
+
 /// A block of text to render.
 #[derive(Clone)]
 pub struct TextBlock {
@@ -264,6 +883,12 @@ pub struct TextBlock {
     pub max_width: f32,
     pub color: Color,
     pub clip: Option<Rect>,
+    /// Optional crisp outline (off by default).
+    pub outline: Option<TextOutline>,
+    /// Optional drop shadow (off by default).
+    pub shadow: Option<TextShadow>,
+    /// Optional soft glow halo (off by default).
+    pub glow: Option<TextGlow>,
 }
 
 impl TextBlock {
@@ -277,6 +902,9 @@ impl TextBlock {
             max_width: 800.0,
             color: Color::rgb(255, 255, 255),
             clip: None,
+            outline: None,
+            shadow: None,
+            glow: None,
         }
     }
 
@@ -306,28 +934,84 @@ impl TextBlock {
         self
     }
 
-    fn bounds(&self) -> TextBounds {
-        if let Some(clip) = self.clip {
-            TextBounds {
-                left: clip.x as i32,
-                top: clip.y as i32,
-                right: (clip.x + clip.width) as i32,
-                bottom: (clip.y + clip.height) as i32,
-            }
-        } else {
-            TextBounds {
-                left: self.x as i32,
-                top: self.y as i32,
-                right: (self.x + self.max_width) as i32,
-                bottom: (self.y + 2000.0) as i32,
-            }
-        }
+    /// Add a crisp outline of `width_px` screen pixels in the given color.
+    pub fn with_outline(mut self, r: u8, g: u8, b: u8, a: u8, width_px: f32) -> Self {
+        self.outline = Some(TextOutline {
+            color: Color::rgba(r, g, b, a),
+            width_px,
+        });
+        self
+    }
+
+    /// Add a drop shadow offset by `(dx, dy)` screen px with `softness` px blur.
+    ///
+    /// The `(r, g, b, a, dx, dy, softness)` shape mirrors Teardown's
+    /// `UiTextShadow(r, g, b, a, distance, blur)` for a direct binding mapping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_shadow(mut self, r: u8, g: u8, b: u8, a: u8, dx: f32, dy: f32, softness: f32) -> Self {
+        self.shadow = Some(TextShadow {
+            color: Color::rgba(r, g, b, a),
+            offset: [dx, dy],
+            softness,
+        });
+        self
+    }
+
+    /// Add a soft glow halo of `radius_px` screen pixels.
+    pub fn with_glow(mut self, r: u8, g: u8, b: u8, a: u8, radius_px: f32) -> Self {
+        self.glow = Some(TextGlow {
+            color: Color::rgba(r, g, b, a),
+            radius_px,
+        });
+        self
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TextMeasurer;
+    use super::{color_to_rgba, field_reach, TextBlock, TextMeasurer};
+    use glyphon::Color;
+
+    #[test]
+    fn color_to_rgba_normalizes_channels() {
+        let c = Color::rgba(255, 128, 0, 64);
+        let v = color_to_rgba(c);
+        assert!((v[0] - 1.0).abs() < 1e-6);
+        assert!((v[1] - 128.0 / 255.0).abs() < 1e-6);
+        assert!((v[2] - 0.0).abs() < 1e-6);
+        assert!((v[3] - 64.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn field_reach_scales_with_font_size() {
+        // Reach grows linearly with font size and is zero (clamped) for tiny fonts.
+        let small = field_reach(8.0, 12.0, 40.0);
+        let large = field_reach(40.0, 12.0, 40.0);
+        assert!(large > small);
+        // At 40px with px_range 12 / ref 40: 0.5*12*40/40 - 0.5 = 5.5 px.
+        assert!((large - 5.5).abs() < 1e-4);
+        // Never negative.
+        assert_eq!(field_reach(0.5, 12.0, 40.0).max(0.0), field_reach(0.5, 12.0, 40.0));
+        assert!(field_reach(0.1, 12.0, 40.0) >= 0.0);
+    }
+
+    #[test]
+    fn effect_builders_are_opt_in_and_set_fields() {
+        let plain = TextBlock::new("x", 0.0, 0.0);
+        assert!(plain.outline.is_none() && plain.shadow.is_none() && plain.glow.is_none());
+
+        let styled = TextBlock::new("x", 0.0, 0.0)
+            .with_outline(0, 0, 0, 255, 2.0)
+            .with_shadow(10, 20, 30, 200, 1.0, 2.0, 1.5)
+            .with_glow(80, 180, 255, 255, 3.0);
+        let o = styled.outline.unwrap();
+        assert_eq!(o.width_px, 2.0);
+        let s = styled.shadow.unwrap();
+        assert_eq!(s.offset, [1.0, 2.0]);
+        assert_eq!(s.softness, 1.5);
+        let g = styled.glow.unwrap();
+        assert_eq!(g.radius_px, 3.0);
+    }
 
     #[test]
     fn measures_text_with_glyphon_layout() {
@@ -349,5 +1033,36 @@ mod tests {
         let (_, h_unwrapped) = measurer.measure(long, 14.0, None);
         let (_, h_wrapped) = measurer.measure(long, 14.0, Some(80.0));
         assert!(h_wrapped > h_unwrapped);
+    }
+
+    #[test]
+    fn cache_returns_identical_results_on_repeat() {
+        let mut measurer = TextMeasurer::new();
+        let first = measurer.measure("Cached label", 16.0, None);
+        // Second call must hit the cache and return the exact same dimensions.
+        let second = measurer.measure("Cached label", 16.0, None);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cache_keys_on_font_size_and_max_width() {
+        let mut measurer = TextMeasurer::new();
+        let small = measurer.measure("Hello", 12.0, None);
+        let large = measurer.measure("Hello", 24.0, None);
+        // Different font sizes are distinct cache entries with distinct metrics.
+        assert!(large.0 > small.0);
+        assert!(large.1 > small.1);
+        // Re-measuring each still returns its own cached value.
+        assert_eq!(measurer.measure("Hello", 12.0, None), small);
+        assert_eq!(measurer.measure("Hello", 24.0, None), large);
+    }
+
+    #[test]
+    fn clear_cache_forces_remeasure_without_changing_result() {
+        let mut measurer = TextMeasurer::new();
+        let before = measurer.measure("Persistent", 18.0, None);
+        measurer.clear_cache();
+        let after = measurer.measure("Persistent", 18.0, None);
+        assert_eq!(before, after);
     }
 }

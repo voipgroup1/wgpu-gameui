@@ -28,7 +28,10 @@
 
 mod text;
 
-pub use text::{FontSystemHandle, TextBlock, TextMeasurer, TextRenderer, shared_font_system};
+pub use text::{
+    FontSystemHandle, TextBlock, TextGlow, TextMeasurer, TextOutline, TextRenderer, TextShadow,
+    shared_font_system,
+};
 
 pub mod affine;
 pub mod layer;

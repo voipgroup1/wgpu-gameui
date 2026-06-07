@@ -257,8 +257,11 @@ impl UiRenderer {
             mapped_at_creation: false,
         });
 
-        let text_renderer =
+        let mut text_renderer =
             TextRenderer::with_font_system(device, queue, format, font_system);
+        // Generate the printable-ASCII MSDF set up front so the first frame that
+        // shows text doesn't hitch on per-glyph generation.
+        text_renderer.prewarm_ascii(device, queue);
 
         let current_atlas_size = atlas.width();
 
@@ -343,6 +346,8 @@ impl UiRenderer {
     /// Force-upload pending atlas changes to the GPU. Called automatically by
     /// `render()`, exposed for callers that want to control timing.
     pub fn flush_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::info_span!("gameui_flush_atlas").entered();
         if self.atlas.width() != self.current_atlas_size {
             self.texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("ui atlas texture"),
@@ -421,6 +426,8 @@ impl UiRenderer {
         viewport: (u32, u32),
         draw_list: &DrawList,
     ) {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::info_span!("gameui_render").entered();
         self.prepare_frame(device, queue, viewport);
         self.render_one(device, queue, encoder, view, draw_list);
     }
@@ -437,6 +444,8 @@ impl UiRenderer {
         viewport: (u32, u32),
         layers: &LayerStack,
     ) {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::info_span!("gameui_render_layers").entered();
         self.prepare_frame(device, queue, viewport);
         self.render_one(device, queue, encoder, view, layers.base());
         for layer in layers.layers() {
@@ -450,6 +459,8 @@ impl UiRenderer {
         queue: &wgpu::Queue,
         viewport: (u32, u32),
     ) {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::info_span!("gameui_prepare_frame").entered();
         let uniforms = Uniforms {
             view_proj: ortho_matrix(viewport.0 as f32, viewport.1 as f32),
         };
@@ -466,38 +477,57 @@ impl UiRenderer {
         view: &wgpu::TextureView,
         draw_list: &DrawList,
     ) {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::info_span!("gameui_render_one").entered();
+
         // Layering, bottom→top: nine-slice backgrounds, colored quads (panels,
         // rounded-rect fills, sliders, custom shapes), icons, text. Each
         // requires its own pass because consecutive layers swap pipelines or
         // change vertex formats.
 
         // ---------- 1. Nine-slices ----------
-        let nine_slice_verts = self.tessellate_nine_slices(&draw_list.nine_slices);
-        if !nine_slice_verts.is_empty() {
-            self.draw_textured(device, queue, encoder, view, &nine_slice_verts);
+        {
+            #[cfg(feature = "tracy")]
+            let _s = tracing::info_span!("gameui_nine_slices").entered();
+            let nine_slice_verts = self.tessellate_nine_slices(&draw_list.nine_slices);
+            if !nine_slice_verts.is_empty() {
+                self.draw_textured(device, queue, encoder, view, &nine_slice_verts);
+            }
         }
 
         // ---------- 2. Colored quads ----------
-        if !draw_list.vertices.is_empty() && !draw_list.indices.is_empty() {
-            self.draw_color(
-                device,
-                queue,
-                encoder,
-                view,
-                &draw_list.vertices,
-                &draw_list.indices,
-            );
+        {
+            #[cfg(feature = "tracy")]
+            let _s = tracing::info_span!("gameui_color_quads").entered();
+            if !draw_list.vertices.is_empty() && !draw_list.indices.is_empty() {
+                self.draw_color(
+                    device,
+                    queue,
+                    encoder,
+                    view,
+                    &draw_list.vertices,
+                    &draw_list.indices,
+                );
+            }
         }
 
         // ---------- 3. Icons ----------
-        let icon_verts = self.tessellate_icons(&draw_list.icons);
-        if !icon_verts.is_empty() {
-            self.draw_textured(device, queue, encoder, view, &icon_verts);
+        {
+            #[cfg(feature = "tracy")]
+            let _s = tracing::info_span!("gameui_icons").entered();
+            let icon_verts = self.tessellate_icons(&draw_list.icons);
+            if !icon_verts.is_empty() {
+                self.draw_textured(device, queue, encoder, view, &icon_verts);
+            }
         }
 
         // ---------- 4. Text ----------
-        self.text_renderer
-            .render(device, queue, encoder, view, &draw_list.texts);
+        {
+            #[cfg(feature = "tracy")]
+            let _s = tracing::info_span!("gameui_text").entered();
+            self.text_renderer
+                .render(device, queue, encoder, view, &draw_list.texts);
+        }
     }
 
     fn tessellate_icons(&self, icons: &[IconDraw]) -> Vec<TexVertex> {
@@ -755,7 +785,7 @@ fn create_atlas_texture(
     (texture, sampler, bgl, bg)
 }
 
-fn ortho_matrix(width: f32, height: f32) -> [[f32; 4]; 4] {
+pub(crate) fn ortho_matrix(width: f32, height: f32) -> [[f32; 4]; 4] {
     // Top-left origin; positive Y down. Matches DrawList coordinate system.
     let (l, r, t, b) = (0.0, width, 0.0, height);
     [
