@@ -52,7 +52,7 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [x] **P0 — Lines / strokes** (`line(p0, p1, thickness, color)`) with
       thickness/joins/caps/AA. Teardown's `DrawLine` is top-30. Also needed
       for slider tick marks, debug overlays.
-- [ ] **P1 — Circles / arcs / ellipses** (`UiCircle`).
+- [x] **P1 — Circles / arcs / ellipses** (`DrawList::circle`, `circle_outline`, `stroked_arc`; `UiContext::circle`, `circle_outline`).
 - [x] **P1 — Textured quad with explicit UV rect.** Atlas `AtlasRegion::uv()`
       drives icon UVs, with optional tint per draw.
 - [x] **P1 — Nine-slice border metadata.** `register_nine_slice(name, sprite,
@@ -93,11 +93,16 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [x] **P1 — Tooltip hover delay actually works.** `TooltipLayer::tick(dt,
       input)` accumulates hover time per region; `is_visible()` only
       returns true once the configured `with_delay_ms` has elapsed.
-- [ ] **P1 — Slider drag capture identity.** Drag state is a caller-owned
-      `bool`; multiple sliders can't disambiguate active drag
-      (`src/widgets/slider.rs:67`).
-- [ ] **P1 — Checkbox fallback rendering** when icon textures aren't loaded
-      (`src/widgets/checkbox.rs:9,38`).
+- [x] **P1 — Slider drag capture identity.** `DragCapture`/`DragId`
+      (`src/widgets/drag.rs`) arbitrate a single drag owner across the UI.
+      `Slider::draw` now takes `id: DragId` + `&mut DragCapture` instead of a
+      caller `bool`, claims the drag only when the capture is free, and updates
+      its value only while it owns the capture (also honors `mouse_consumed`).
+- [x] **P1 — Checkbox fallback rendering** when icon textures aren't loaded.
+      `Checkbox` now defaults to a theme-driven vector box + contrast checkmark
+      (no atlas assets, never blank). Opt into textures via
+      `Checkbox::with_icons(SpriteId, SpriteId)` (pre-resolved, guaranteed
+      non-blank) or `with_icon_keys(&str, &str)` for knowingly-preloaded keys.
 
 ---
 
@@ -127,10 +132,11 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [ ] **P0 — Real focus model.** `TextInput.focused: bool` is set by the
       caller. No focus owner, Tab navigation, blur-on-click-elsewhere,
       Esc-to-blur. Multiple text inputs all activate at once.
-- [ ] **P0 — Full key event model.** `InputState` has only
-      `backspace_pressed`, `enter_pressed`, and a `text_input` string. No
-      Shift/Ctrl/Alt/Cmd, arrows, Home/End, Delete, Ctrl+A/C/V/X. Blocks
-      usable text editing.
+- [x] **P0 — Full key event model.** `InputState` now has `key_left`,
+      `key_right`, `key_home`, `key_end`, `key_delete`, `shift_pressed`,
+      `ctrl_pressed`. Arrows/Home/End/Delete on physical keys; Shift/Ctrl as
+      held modifiers. Ctrl+A/X/C/V handled via ASCII control codes in
+      `text_input` or `ctrl_pressed` + letter. Blocks usable text editing.
 - [x] **P0 — Hit-testing respects clip stack and z-order.** Layer-aware
       input dispatch via `InputState::mouse_consumed` +
       `LayerStack::input_for_layer`/`input_for_base`. `is_hovered()` honors
@@ -158,10 +164,13 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       uses `len() * font_size * 0.5` in 6+ places; broken for proportional
       fonts, multi-byte UTF-8, non-ASCII. (Teardown ships `UiGetTextSize` for
       this reason.)
-- [ ] **P0 — Text selection.** No caret state, shift+arrow selection, or
-      click-to-position-cursor. Cursor hardcoded to end of value
-      (`src/widgets/text_input.rs:94`).
-- [ ] **P0 — Copy/paste / clipboard hooks.**
+- [x] **P0 — Text selection.** Caret state, shift+arrow selection,
+      click-to-position-cursor, selection highlight rendering, Ctrl+A select all,
+      proper backspace/delete. (`src/widgets/text_input.rs`)
+- [x] **P0 — Copy/paste / clipboard hooks.** Closure-based clipboard API on
+      `TextInput` (`clipboard_get`/`clipboard_set`). Users wire the platform
+      clipboard (e.g. `arboard`). Cut/copy/paste (Ctrl+X/C/V) when closures are
+      set.
 - [ ] **P0 — Font system.** Hardcoded `Family::SansSerif`
       (`src/text.rs:74`). No font loading, bold/italic, `UiFont(path,size)`,
       or font fallback. `UiFont` is one of the most-called UI fns in

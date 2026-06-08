@@ -181,6 +181,27 @@ impl DrawList {
         self.text_measurer.measure(text, font_size, max_width)
     }
 
+    /// Compute per-character cursor x-positions for the given text.
+    ///
+    /// Returns a `Vec<(usize, f32)>` mapping byte indices in `text` to their
+    /// x-offset (pixels) from the left edge. Use this for click-to-position
+    /// cursor placement and selection highlight rendering.
+    ///
+    /// `max_width` constrains the layout width (glyphon may wrap). Pass
+    /// `font_size * 0.0` for single-line mode with effectively infinite width.
+    pub fn text_cursor_positions(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+    ) -> Vec<(usize, f32)> {
+        let handle = self.text_measurer.font_system_handle();
+        let mut fs = handle.lock().expect("FontSystem poisoned");
+        let mw = max_width.unwrap_or(f32::MAX / 4.0);
+        let lh = font_size * 1.25;
+        crate::text::text_cursor_positions(&mut fs, text, font_size, lh, mw, None)
+    }
+
     // ---- Clip stack ----
 
     /// Push a clipping rectangle. Nested clips are intersected with the current clip.
@@ -200,9 +221,30 @@ impl DrawList {
         self.clip_stack.push(clip);
     }
 
+    /// Push a clipping rectangle **without** intersecting the parent clip — the
+    /// new clip *replaces* whatever was active (Teardown's `UiClipRect`/`UiWindow`
+    /// with `inherit = false`). The rect is still transformed to its world-space
+    /// AABB by the active transform, with the same rotation caveat as
+    /// [`push_clip`].
+    pub fn push_clip_exact(&mut self, rect: Rect) {
+        let world_rect = self.current_transform().transform_rect_aabb(rect);
+        self.clip_stack.push(world_rect);
+    }
+
     /// Pop the current clipping rectangle.
     pub fn pop_clip(&mut self) {
         self.clip_stack.pop();
+    }
+
+    /// Number of clips currently on the stack. Used to scope clips to a
+    /// push/pop frame (record the depth on push, [`truncate_clip`] back on pop).
+    pub fn clip_len(&self) -> usize {
+        self.clip_stack.len()
+    }
+
+    /// Drop clips until the stack is `len` deep (no-op if already ≤ `len`).
+    pub fn truncate_clip(&mut self, len: usize) {
+        self.clip_stack.truncate(len);
     }
 
     /// Return the active clipping rectangle (in world / screen space).
@@ -1032,6 +1074,33 @@ mod tests {
         assert_eq!(list.icons[0].icon_key, "icon");
         assert_eq!(list.icons[0].tint, [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(list.vertices[4].clip_enabled, 0.0);
+    }
+
+    #[test]
+    fn push_clip_intersects_but_exact_replaces() {
+        let mut list = DrawList::new();
+        // Parent clip.
+        list.push_clip(Rect::new(0.0, 0.0, 50.0, 50.0));
+        // Intersecting child: a larger rect is clipped down to the parent.
+        list.push_clip(Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert_eq!(list.current_clip(), Some(Rect::new(0.0, 0.0, 50.0, 50.0)));
+        list.pop_clip();
+        // Exact child: replaces the parent, even when larger.
+        list.push_clip_exact(Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert_eq!(list.current_clip(), Some(Rect::new(0.0, 0.0, 100.0, 100.0)));
+    }
+
+    #[test]
+    fn clip_len_and_truncate_scope() {
+        let mut list = DrawList::new();
+        assert_eq!(list.clip_len(), 0);
+        let base = list.clip_len();
+        list.push_clip(Rect::new(0.0, 0.0, 10.0, 10.0));
+        list.push_clip_exact(Rect::new(0.0, 0.0, 5.0, 5.0));
+        assert_eq!(list.clip_len(), 2);
+        list.truncate_clip(base);
+        assert_eq!(list.clip_len(), 0);
+        assert_eq!(list.current_clip(), None);
     }
 
     // ---- Transform/tint stack tests ----

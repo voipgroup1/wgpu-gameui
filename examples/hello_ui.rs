@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    FontHandle, InputState, LayerStack, ScrollState, ScrollView, TextAlign, TextBlock, Theme,
-    UiContext, UiRenderer,
+    FontHandle, InputState, LayerStack, ScrollState, ScrollView, TextAlign, TextBlock, TextInput,
+    Theme, UiContext, UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -84,6 +84,7 @@ struct UiState {
     scroll: ScrollState,
     modal_open: bool,
     modal_button_was_clicked: bool,
+    text_input: TextInput,
 }
 
 struct App {
@@ -234,6 +235,54 @@ impl ApplicationHandler for App {
                 self.input.scroll_delta = dy;
                 window.request_redraw();
             }
+            WindowEvent::KeyboardInput {
+                event: ref ke,
+                ..
+            } => {
+                use winit::keyboard::{KeyCode, PhysicalKey};
+                let pressed = ke.state == ElementState::Pressed;
+                // Map physical keys to our input fields.
+                if let PhysicalKey::Code(code) = ke.physical_key {
+                    match code {
+                        KeyCode::ArrowLeft => self.input.key_left = pressed,
+                        KeyCode::ArrowRight => self.input.key_right = pressed,
+                        KeyCode::Home => self.input.key_home = pressed,
+                        KeyCode::End => self.input.key_end = pressed,
+                        KeyCode::Delete => self.input.key_delete = pressed,
+                        KeyCode::Backspace => {
+                            if pressed {
+                                self.input.backspace_pressed = true;
+                            }
+                        }
+                        KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                            self.input.shift_pressed = pressed;
+                        }
+                        KeyCode::ControlLeft | KeyCode::ControlRight => {
+                            self.input.ctrl_pressed = pressed;
+                        }
+                        KeyCode::Enter => {
+                            if pressed {
+                                self.input.enter_pressed = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Capture text from the key event (winit 0.30 replaces `ReceivedCharacter` with
+                // `KeyEvent::text`).
+                if pressed {
+                    if let Some(ref text) = ke.text {
+                        // Filter out control characters (Enter, Tab, etc.) — they're
+                        // handled via physical key mappings above.
+                        for c in text.chars() {
+                            if !c.is_control() {
+                                self.input.text_input.push(c);
+                            }
+                        }
+                    }
+                }
+                window.request_redraw();
+            }
             WindowEvent::RedrawRequested => {
                 let frame = match gpu.surface.get_current_texture() {
                     Ok(f) => f,
@@ -355,6 +404,41 @@ impl ApplicationHandler for App {
                         }
                     },
                 );
+
+                // ---------- Text input demo ----------
+                {
+                    // Position the text input.
+                    self.state.text_input.x = 80.0;
+                    self.state.text_input.y = 300.0;
+                    self.state.text_input.width = 240.0;
+                    self.state.text_input.height = 28.0;
+
+                    // Background label for the input.
+                    list.text(
+                        TextBlock::new("Text Input:", 80.0, 280.0)
+                            .with_size(12.0)
+                            .with_color(180, 190, 210),
+                    );
+                    let text_input_clicked = self.state.text_input.draw(
+                        list,
+                        &self.theme,
+                        &base_input,
+                    );
+                    if text_input_clicked {
+                        self.state.text_input.focused = !self.state.text_input.focused;
+                    }
+                    // Blur on click outside the input area.
+                    if base_input.mouse_clicked
+                        && !base_input.is_hovered(
+                            self.state.text_input.x,
+                            self.state.text_input.y,
+                            self.state.text_input.width,
+                            self.state.text_input.height,
+                        )
+                    {
+                        self.state.text_input.focused = false;
+                    }
+                }
 
                 // ---------- Image + custom font + alignment demo ----------
                 // Decoded image drawn at full size, then the same image cropped

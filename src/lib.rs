@@ -31,6 +31,7 @@ mod text;
 pub use text::{
     FontHandle, FontSystemHandle, TextAlign, TextBlock, TextGlow, TextMeasurer, TextOutline,
     TextRenderer, TextShadow, load_font_bytes, load_font_file, shared_font_system,
+    text_cursor_positions,
 };
 
 pub mod affine;
@@ -75,6 +76,21 @@ pub struct InputState {
     /// applying `scroll_delta` when this is set so wheel events don't
     /// "bubble out" of an inner viewport when the cursor is over it.
     pub scroll_consumed: bool,
+    // ---- Keyboard events (for text editing) ----
+    /// Arrow Left was pressed this frame.
+    pub key_left: bool,
+    /// Arrow Right was pressed this frame.
+    pub key_right: bool,
+    /// Home key was pressed this frame.
+    pub key_home: bool,
+    /// End key was pressed this frame.
+    pub key_end: bool,
+    /// Delete key was pressed this frame.
+    pub key_delete: bool,
+    /// Shift key is currently held.
+    pub shift_pressed: bool,
+    /// Ctrl (or Cmd on macOS) key is currently held.
+    pub ctrl_pressed: bool,
 }
 
 impl InputState {
@@ -82,7 +98,7 @@ impl InputState {
         Self::default()
     }
 
-    /// Clear per-frame state (clicked, released, text input, scroll)
+    /// Clear per-frame state (clicked, released, text input, scroll, keyboard events)
     pub fn end_frame(&mut self) {
         self.mouse_clicked = false;
         self.mouse_released = false;
@@ -95,6 +111,13 @@ impl InputState {
         // clear it here too for cleanliness.
         self.mouse_consumed = false;
         self.scroll_consumed = false;
+        self.key_left = false;
+        self.key_right = false;
+        self.key_home = false;
+        self.key_end = false;
+        self.key_delete = false;
+        // shift_pressed and ctrl_pressed are held-state, cleared by the
+        // windowing layer on key-up; they persist across frames.
     }
 
     /// Check if a rectangle is hovered. Returns false when `mouse_consumed`
@@ -121,6 +144,13 @@ impl InputState {
             text_input: String::new(),
             backspace_pressed: false,
             enter_pressed: false,
+            key_left: false,
+            key_right: false,
+            key_home: false,
+            key_end: false,
+            key_delete: false,
+            // shift/ctrl are modifier state, not events — preserve them
+            // so modals that have text inputs still see modifier keys.
             ..self.clone()
         }
     }

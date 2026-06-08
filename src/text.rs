@@ -23,7 +23,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::layout::Rect;
 use crate::render::{ortho_matrix, GlyphTile, MsdfGlyphAtlas};
 
-use glyphon::cosmic_text::{fontdb, Align as CosmicAlign};
+use glyphon::cosmic_text::{fontdb, Align as CosmicAlign, Wrap};
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 
 const MSDF_SHADER: &str = include_str!("render/ui_msdf.wgsl");
@@ -361,16 +361,39 @@ impl TextRenderer {
             if block.content.is_empty() {
                 continue;
             }
-            let mut buffer = Buffer::new(&mut fs, Metrics::new(block.font_size, block.line_height));
-            buffer.set_size(&mut fs, Some(block.max_width), None);
             let family = block
                 .font
                 .as_ref()
                 .map(|h| Family::Name(h.family()))
                 .unwrap_or(Family::SansSerif);
+
+            // In ellipsis mode the block is a single line truncated to `max_width`
+            // with a trailing '…'; otherwise it wraps at `max_width` as before.
+            let truncated;
+            let content: &str = if block.ellipsize {
+                truncated = ellipsize_to_width(
+                    &mut fs,
+                    &block.content,
+                    block.font_size,
+                    block.line_height,
+                    block.max_width,
+                    family,
+                );
+                &truncated
+            } else {
+                &block.content
+            };
+
+            let mut buffer = Buffer::new(&mut fs, Metrics::new(block.font_size, block.line_height));
+            if block.ellipsize {
+                buffer.set_wrap(&mut fs, Wrap::None);
+                buffer.set_size(&mut fs, None, None);
+            } else {
+                buffer.set_size(&mut fs, Some(block.max_width), None);
+            }
             buffer.set_text(
                 &mut fs,
-                &block.content,
+                content,
                 Attrs::new().family(family).color(block.color),
                 Shaping::Advanced,
             );
@@ -973,6 +996,139 @@ fn measure_with_font_system(
     }
 }
 
+/// Compute per-character cursor x-positions for the given text.
+///
+/// Returns a `Vec<(usize, f32)>` where each entry maps a byte index in `text`
+/// to its x-offset (in screen pixels) from the left edge. The first entry is
+/// always `(0, 0.0)` and the last is `(text.len(), total_width)`. For a single
+/// line of text, these are monotonically increasing.
+///
+/// Use this to implement click-to-position (binary-search on the x values) and
+/// to draw the text cursor / selection highlights at the correct x position
+/// for a given byte offset.
+///
+/// `family_name` selects the font; pass `None` for the default sans-serif.
+pub fn text_cursor_positions(
+    font_system: &mut FontSystem,
+    text: &str,
+    font_size: f32,
+    line_height: f32,
+    max_width: f32,
+    family_name: Option<&str>,
+) -> Vec<(usize, f32)> {
+    let mut positions: Vec<(usize, f32)> = Vec::with_capacity(text.len().saturating_add(1));
+    if text.is_empty() {
+        positions.push((0, 0.0));
+        return positions;
+    }
+
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    buffer.set_size(font_system, Some(max_width), None);
+    let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
+    buffer.set_text(
+        font_system,
+        text,
+        Attrs::new().family(family),
+        Shaping::Advanced,
+    );
+    buffer.shape_until_scroll(font_system, false);
+
+    // Each cluster boundary (byte index) maps to the glyph's x-position.
+    // We iterate in layout-run order (top-to-bottom for multi-line) and
+    // record the x for each glyph's start. The last position is the total
+    // width of the longest line.
+    positions.push((0, 0.0));
+
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs.iter() {
+            let start_idx = glyph.start as usize;
+            // Only record the first time we see each byte index.
+            if start_idx > positions.last().map(|(i, _)| *i).unwrap_or(0) {
+                positions.push((start_idx, glyph.x));
+            }
+        }
+        // After each run, record the line end position.
+        let line_end_x = run.line_w;
+        // Find the last byte index of this run.
+        if let Some(last_glyph) = run.glyphs.last() {
+            let end_idx = last_glyph.end as usize;
+            if end_idx > positions.last().map(|(i, _)| *i).unwrap_or(0) {
+                positions.push((end_idx, line_end_x));
+            }
+        }
+    }
+
+    // Ensure the final byte index is always present.
+    let last_byte = text.len();
+    if positions.last().map(|(i, _)| *i).unwrap_or(0) < last_byte {
+        // Estimate: use the last position's x plus an average char width.
+        let last_x = positions.last().map(|(_, x)| *x).unwrap_or(0.0);
+        positions.push((last_byte, last_x));
+    }
+
+    positions
+}
+
+/// Truncate `content` to a single line that fits within `max_width`, appending a
+/// trailing `'…'`. Returns `content` unchanged when it already fits.
+///
+/// Shapes with no wrapping and reads the laid-out glyph positions to find the
+/// byte cutoff, so it costs at most two extra shaping passes (the content and the
+/// ellipsis) and only for blocks that actually overflow.
+fn ellipsize_to_width(
+    fs: &mut FontSystem,
+    content: &str,
+    font_size: f32,
+    line_height: f32,
+    max_width: f32,
+    family: Family,
+) -> String {
+    if content.is_empty() || !max_width.is_finite() || max_width <= 0.0 {
+        return content.to_string();
+    }
+    let metrics = Metrics::new(font_size, line_height);
+
+    // Shape the full content on a single line.
+    let mut buffer = Buffer::new(fs, metrics);
+    buffer.set_wrap(fs, Wrap::None);
+    buffer.set_size(fs, None, None);
+    buffer.set_text(fs, content, Attrs::new().family(family), Shaping::Advanced);
+    buffer.shape_until_scroll(fs, false);
+
+    let full_w = buffer.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
+    if full_w <= max_width {
+        return content.to_string();
+    }
+
+    // Width of the ellipsis at this size/family, reserved at the right edge.
+    let mut ell = Buffer::new(fs, metrics);
+    ell.set_wrap(fs, Wrap::None);
+    ell.set_size(fs, None, None);
+    ell.set_text(fs, "…", Attrs::new().family(family), Shaping::Advanced);
+    ell.shape_until_scroll(fs, false);
+    let ellipsis_w = ell.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
+
+    let budget = max_width - ellipsis_w;
+    if budget <= 0.0 {
+        return "…".to_string();
+    }
+
+    // Largest byte offset whose glyph still fits within the budget. Take the max
+    // over all fitting glyphs (shaping/ligatures need not be end-ordered).
+    let mut cut = 0usize;
+    for run in buffer.layout_runs() {
+        for g in run.glyphs {
+            if g.x + g.w <= budget {
+                cut = cut.max(g.end);
+            }
+        }
+    }
+    let cut = cut.min(content.len());
+    let mut s = content[..cut].trim_end().to_string();
+    s.push('…');
+    s
+}
+
 /// Crisp outline drawn around glyphs, composited under the fill. Maps to
 /// Teardown's `UiTextOutline(r, g, b, a, thickness)`.
 #[derive(Clone, Copy, Debug)]
@@ -1022,6 +1178,10 @@ pub struct TextBlock {
     pub font: Option<FontHandle>,
     /// Horizontal alignment within `max_width` (default `Left`).
     pub align: TextAlign,
+    /// Single-line ellipsis mode: when `true`, the block is laid out on one line
+    /// (no wrapping) and truncated with a trailing `'…'` if it would exceed
+    /// `max_width`. When `false` (default) the block wraps at `max_width`.
+    pub ellipsize: bool,
 }
 
 impl TextBlock {
@@ -1040,6 +1200,7 @@ impl TextBlock {
             glow: None,
             font: None,
             align: TextAlign::Left,
+            ellipsize: false,
         }
     }
 
@@ -1114,13 +1275,23 @@ impl TextBlock {
         self.align = align;
         self
     }
+
+    /// Enable single-line ellipsis: lay the text out on one line and truncate it
+    /// with a trailing `'…'` if it would exceed [`Self::max_width`]. Use this for
+    /// labels that must stay inside a fixed-width box (set `max_width` to that
+    /// box's inner width).
+    pub fn with_ellipsis(mut self) -> Self {
+        self.ellipsize = true;
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        color_to_rgba, cosmic_align, field_reach, load_font_bytes, shared_font_system, FontHandle,
-        TextAlign, TextBlock, TextMeasurer,
+        color_to_rgba, cosmic_align, ellipsize_to_width, field_reach, load_font_bytes,
+        measure_with_font_system, shared_font_system, FontHandle, TextAlign, TextBlock,
+        TextMeasurer,
     };
     use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping};
 
@@ -1323,5 +1494,44 @@ mod tests {
         let right = leftmost(TextAlign::Right);
         assert!(center > left, "center {center} should exceed left {left}");
         assert!(right > center, "right {right} should exceed center {center}");
+    }
+
+    #[test]
+    fn with_ellipsis_is_opt_in() {
+        assert!(!TextBlock::new("x", 0.0, 0.0).ellipsize);
+        assert!(TextBlock::new("x", 0.0, 0.0).with_ellipsis().ellipsize);
+    }
+
+    #[test]
+    fn ellipsize_leaves_fitting_text_unchanged() {
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        // A wide budget the short string easily fits within.
+        let out = ellipsize_to_width(&mut guard, "short", 16.0, 20.0, 1000.0, Family::SansSerif);
+        assert_eq!(out, "short");
+    }
+
+    #[test]
+    fn ellipsize_truncates_overflowing_text_with_ellipsis() {
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let long = "a_very_long_object_name_that_will_not_fit";
+        let max_width = 80.0;
+        let out = ellipsize_to_width(&mut guard, long, 14.0, 18.0, max_width, Family::SansSerif);
+        assert_ne!(out, long, "overflowing text should be truncated");
+        assert!(out.ends_with('…'), "truncated text should end with an ellipsis");
+        assert!(out.chars().count() < long.chars().count());
+        // The truncated line (incl. the ellipsis) must fit the budget.
+        let (w, _) = measure_with_font_system(&mut guard, &out, 14.0, None, None);
+        assert!(w <= max_width, "ellipsized width {w} must fit {max_width}");
+    }
+
+    #[test]
+    fn ellipsize_degenerate_budget_returns_just_ellipsis() {
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        // A budget too small for even one glyph + the ellipsis.
+        let out = ellipsize_to_width(&mut guard, "anything", 14.0, 18.0, 2.0, Family::SansSerif);
+        assert_eq!(out, "…");
     }
 }
