@@ -23,6 +23,7 @@
 use crate::layout::Rect;
 use crate::{InputState, SpriteId, Theme};
 
+use super::button::{draw_chrome, ButtonVisual};
 use super::{DrawList, Image, ImageAlign, ImageFit};
 
 /// Image / icon button — an [`Image`] with clickable button chrome.
@@ -114,7 +115,16 @@ impl ImageButton {
         let clicked = hovered && input.mouse_clicked;
 
         if self.chrome {
-            self.draw_chrome(rect, hovered, pressed, list, theme);
+            draw_chrome(
+                list,
+                theme,
+                rect,
+                &ButtonVisual {
+                    enabled: self.enabled,
+                    hovered,
+                    pressed,
+                },
+            );
         }
 
         // Image content, inset by padding.
@@ -141,58 +151,6 @@ impl ImageButton {
         }
 
         clicked
-    }
-
-    /// Draw the `Button`-style background and border for the current state.
-    fn draw_chrome(
-        &self,
-        rect: Rect,
-        hovered: bool,
-        pressed: bool,
-        list: &mut DrawList,
-        theme: &Theme,
-    ) {
-        let bg_color = if !self.enabled {
-            let mut c = theme.button;
-            c[3] = 0.5;
-            c
-        } else if pressed {
-            theme.button_pressed
-        } else if hovered {
-            theme.button_hover
-        } else {
-            theme.button
-        };
-
-        if theme.border_radius > 0.0 {
-            list.rounded_rect(rect, theme.border_radius, bg_color);
-        } else {
-            list.quad(rect.x, rect.y, rect.width, rect.height, bg_color);
-        }
-
-        let border = theme.border_width;
-        let border_color = if hovered && self.enabled {
-            theme.accent
-        } else {
-            theme.button_border
-        };
-
-        list.quad(rect.x, rect.y, rect.width, border, border_color);
-        list.quad(
-            rect.x,
-            rect.y + rect.height - border,
-            rect.width,
-            border,
-            border_color,
-        );
-        list.quad(rect.x, rect.y, border, rect.height, border_color);
-        list.quad(
-            rect.x + rect.width - border,
-            rect.y,
-            border,
-            rect.height,
-            border_color,
-        );
     }
 }
 
