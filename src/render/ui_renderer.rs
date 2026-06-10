@@ -29,38 +29,39 @@ struct Uniforms {
     view_proj: [[f32; 4]; 4],
 }
 
+/// Per-instance icon/image record — matches `vs_icon` in `ui.wgsl`.
+///
+/// Icons, sprites, and cropped images all flow through this path. The four
+/// world-space corners are baked in (the `DrawList` already applied the active
+/// transform), so the vertex shader bilinearly interpolates them — rotation,
+/// scale, and shear are handled with no fallback. Replaces re-tessellating 6
+/// verts/icon into the textured soup + re-uploading it every frame.
 #[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-struct TexVertex {
-    position: [f32; 2],
-    uv: [f32; 2],
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+struct IconInstance {
+    /// `[tl.x, tl.y, tr.x, tr.y]` (world space).
+    c_tl_tr: [f32; 4],
+    /// `[br.x, br.y, bl.x, bl.y]` (world space).
+    c_br_bl: [f32; 4],
+    /// Source UV rect `[u0, v0, u1, v1]`.
+    uv_rect: [f32; 4],
+    /// Tint (multiplied with the sampled texel).
     tint: [f32; 4],
+    /// Clip rect `[x, y, w, h]` (ignored unless `flags[0] > 0.5`).
     clip: [f32; 4],
-    clip_enabled: f32,
+    /// `[clip_enabled, _pad, _pad, _pad]`.
+    flags: [f32; 4],
 }
 
-impl TexVertex {
-    fn new(pos: [f32; 2], uv: [f32; 2], tint: [f32; 4], clip: Option<[f32; 4]>) -> Self {
-        let (clip_rect, enabled) = match clip {
-            Some(r) => (r, 1.0),
-            None => ([0.0; 4], 0.0),
-        };
-        Self {
-            position: pos,
-            uv,
-            tint,
-            clip: clip_rect,
-            clip_enabled: enabled,
-        }
-    }
-}
-
-const TEX_VERTEX_ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-    0 => Float32x2,
-    1 => Float32x2,
-    2 => Float32x4,
-    3 => Float32x4,
-    4 => Float32,
+/// Per-instance icon attributes — matches [`IconInstance`] / `vs_icon`
+/// (location 0 is the base-mesh corner).
+const ICON_INSTANCE_ATTRIBS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    1 => Float32x4, // c_tl_tr
+    2 => Float32x4, // c_br_bl
+    3 => Float32x4, // uv_rect
+    4 => Float32x4, // tint
+    5 => Float32x4, // clip
+    6 => Float32x4, // flags
 ];
 
 const COLOR_VERTEX_ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
@@ -89,12 +90,56 @@ const CHROME_BASE_VERTS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0
 /// Two triangles for the unit quad above.
 const CHROME_BASE_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
 
+/// Per-instance nine-slice record — matches `vs_nine_slice` in `ui.wgsl`.
+///
+/// Unlike [`ChromeInstance`] (built in the `DrawList`), this is built in the
+/// renderer because it needs the registered nine-slice's atlas region + border,
+/// which the `DrawList` doesn't know. The full affine is baked in (`lin` +
+/// `translate` linear/translation parts) and applied to the local corner in the
+/// vertex shader, so rotated/scaled nine-slices need no fallback — every panel,
+/// transformed or not, is one instance. Replaces re-tessellating 54 verts/panel
+/// into the textured soup each frame.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+struct NineSliceInstance {
+    /// Affine linear part `[a, b, c, d]` (row-major, from [`Affine2`]).
+    lin: [f32; 4],
+    /// `[tx, ty, clip_enabled, _pad]`.
+    translate: [f32; 4],
+    /// Local-space `[x, y, w, h]` (pre-transform).
+    origin_size: [f32; 4],
+    /// Outer UV edges `[u0, v0, u3, v3]`.
+    uv_outer: [f32; 4],
+    /// Inner border-seam UVs `[u1, v1, u2, v2]`.
+    uv_inner: [f32; 4],
+    /// Border widths in screen px `[left, top, right, bottom]`.
+    border: [f32; 4],
+    /// Tint (multiplied with the sampled texel).
+    tint: [f32; 4],
+    /// Clip rect `[x, y, w, h]` (ignored unless `translate[2] > 0.5`).
+    clip: [f32; 4],
+}
+
+/// Per-instance nine-slice attributes — matches [`NineSliceInstance`] /
+/// `vs_nine_slice` (location 0 is the base-mesh corner).
+const NINE_INSTANCE_ATTRIBS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+    1 => Float32x4, // lin
+    2 => Float32x4, // translate
+    3 => Float32x4, // origin_size
+    4 => Float32x4, // uv_outer
+    5 => Float32x4, // uv_inner
+    6 => Float32x4, // border
+    7 => Float32x4, // tint
+    8 => Float32x4, // clip
+];
+
 /// Public renderer.
 pub struct UiRenderer {
     // Pipelines
     color_pipeline: wgpu::RenderPipeline,
-    tex_pipeline: wgpu::RenderPipeline,
+    icon_pipeline: wgpu::RenderPipeline,
     chrome_pipeline: wgpu::RenderPipeline,
+    nine_slice_pipeline: wgpu::RenderPipeline,
 
     // Uniforms (shared by both pipelines via group(0))
     uniform_buffer: wgpu::Buffer,
@@ -127,9 +172,11 @@ pub struct UiRenderer {
     color_vbo_offset: u64,
     color_ibo_offset: u64,
 
-    tex_vbo: wgpu::Buffer,
-    tex_vbo_capacity: u64,
-    tex_vbo_offset: u64,
+    // Instanced icons: reuses the chrome unit-quad base mesh + a growing
+    // per-frame instance buffer (bump offset, reset in `prepare_frame`).
+    icon_inst_buffer: wgpu::Buffer,
+    icon_inst_capacity: u64,
+    icon_inst_offset: u64,
 
     // Instanced chrome: a persistent unit-quad base mesh + a growing per-frame
     // instance buffer (bump offset like the others, reset in `prepare_frame`).
@@ -138,6 +185,12 @@ pub struct UiRenderer {
     chrome_inst_buffer: wgpu::Buffer,
     chrome_inst_capacity: u64,
     chrome_inst_offset: u64,
+
+    // Instanced nine-slice: reuses the chrome unit-quad base mesh + a growing
+    // per-frame instance buffer (bump offset, reset in `prepare_frame`).
+    nine_inst_buffer: wgpu::Buffer,
+    nine_inst_capacity: u64,
+    nine_inst_offset: u64,
 
     // Text
     text_renderer: TextRenderer,
@@ -235,29 +288,38 @@ impl UiRenderer {
             cache: None,
         });
 
-        // Textured pipeline (uses texture bind group at slot 1)
-        let tex_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ui tex pipeline layout"),
+        // Icon (instanced textured-quad) pipeline. Shares the ortho uniform
+        // (group 0) AND the atlas texture (group 1). Two vertex buffers: the
+        // chrome unit-quad base mesh + per-instance records.
+        let icon_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ui icon pipeline layout"),
             bind_group_layouts: &[&uniform_bgl, &texture_bgl],
             push_constant_ranges: &[],
         });
 
-        let tex_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ui tex pipeline"),
-            layout: Some(&tex_pipeline_layout),
+        let icon_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ui icon pipeline"),
+            layout: Some(&icon_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_tex"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<TexVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &TEX_VERTEX_ATTRIBS,
-                }],
+                entry_point: Some("vs_icon"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &CHROME_BASE_ATTRIBS,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<IconInstance>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &ICON_INSTANCE_ATTRIBS,
+                    },
+                ],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_tex"),
+                entry_point: Some("fs_icon"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -318,6 +380,54 @@ impl UiRenderer {
             cache: None,
         });
 
+        // Nine-slice (instanced) pipeline. Shares the ortho uniform (group 0)
+        // AND the atlas texture (group 1, like the textured path). Two vertex
+        // buffers: the chrome unit-quad base mesh + per-instance records.
+        let nine_slice_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ui nine-slice pipeline layout"),
+                bind_group_layouts: &[&uniform_bgl, &texture_bgl],
+                push_constant_ranges: &[],
+            });
+
+        let nine_slice_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ui nine-slice pipeline"),
+            layout: Some(&nine_slice_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_nine_slice"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &CHROME_BASE_ATTRIBS,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<NineSliceInstance>()
+                            as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &NINE_INSTANCE_ATTRIBS,
+                    },
+                ],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_nine_slice"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let chrome_base_vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ui chrome base vbo"),
             contents: bytemuck::cast_slice(&CHROME_BASE_VERTS),
@@ -332,7 +442,7 @@ impl UiRenderer {
         // Initial dynamic buffers — sized for a typical frame; grow on demand.
         let color_vbo_capacity = (4096 * std::mem::size_of::<Vertex>()) as u64;
         let color_ibo_capacity = (8192 * std::mem::size_of::<u32>()) as u64;
-        let tex_vbo_capacity = (4096 * std::mem::size_of::<TexVertex>()) as u64;
+        let icon_inst_capacity = (1024 * std::mem::size_of::<IconInstance>()) as u64;
 
         let color_vbo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ui color vbo"),
@@ -346,9 +456,9 @@ impl UiRenderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let tex_vbo = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ui tex vbo"),
-            size: tex_vbo_capacity,
+        let icon_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui icon inst buffer"),
+            size: icon_inst_capacity,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -369,10 +479,19 @@ impl UiRenderer {
             mapped_at_creation: false,
         });
 
+        let nine_inst_capacity = (256 * std::mem::size_of::<NineSliceInstance>()) as u64;
+        let nine_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui nine-slice inst buffer"),
+            size: nine_inst_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             color_pipeline,
-            tex_pipeline,
+            icon_pipeline,
             chrome_pipeline,
+            nine_slice_pipeline,
             uniform_buffer,
             uniform_bind_group,
             atlas,
@@ -390,14 +509,17 @@ impl UiRenderer {
             color_ibo_capacity,
             color_vbo_offset: 0,
             color_ibo_offset: 0,
-            tex_vbo,
-            tex_vbo_capacity,
-            tex_vbo_offset: 0,
+            icon_inst_buffer,
+            icon_inst_capacity,
+            icon_inst_offset: 0,
             chrome_base_vbo,
             chrome_base_ibo,
             chrome_inst_buffer,
             chrome_inst_capacity,
             chrome_inst_offset: 0,
+            nine_inst_buffer,
+            nine_inst_capacity,
+            nine_inst_offset: 0,
             text_renderer,
             warned_missing: RefCell::new(HashSet::new()),
         }
@@ -649,8 +771,9 @@ impl UiRenderer {
         // Reset the per-frame bump cursors so this frame's draws start at 0.
         self.color_vbo_offset = 0;
         self.color_ibo_offset = 0;
-        self.tex_vbo_offset = 0;
+        self.icon_inst_offset = 0;
         self.chrome_inst_offset = 0;
+        self.nine_inst_offset = 0;
         self.text_renderer.begin_frame();
         self.flush_atlas(device, queue);
     }
@@ -671,13 +794,13 @@ impl UiRenderer {
         // requires its own pass because consecutive layers swap pipelines or
         // change vertex formats.
 
-        // ---------- 1. Nine-slices ----------
+        // ---------- 1. Nine-slices (instanced) ----------
         {
             #[cfg(feature = "tracy")]
             let _s = tracing::info_span!("gameui_nine_slices").entered();
-            let nine_slice_verts = self.tessellate_nine_slices(&draw_list.nine_slices);
-            if !nine_slice_verts.is_empty() {
-                self.draw_textured(device, queue, encoder, view, &nine_slice_verts);
+            let instances = self.build_nine_slice_instances(&draw_list.nine_slices);
+            if !instances.is_empty() {
+                self.draw_nine_slices(device, queue, encoder, view, &instances);
             }
         }
 
@@ -702,13 +825,13 @@ impl UiRenderer {
             }
         }
 
-        // ---------- 3. Icons ----------
+        // ---------- 3. Icons (instanced) ----------
         {
             #[cfg(feature = "tracy")]
             let _s = tracing::info_span!("gameui_icons").entered();
-            let icon_verts = self.tessellate_icons(&draw_list.icons);
-            if !icon_verts.is_empty() {
-                self.draw_textured(device, queue, encoder, view, &icon_verts);
+            let instances = self.build_icon_instances(&draw_list.icons);
+            if !instances.is_empty() {
+                self.draw_icons(device, queue, encoder, view, &instances);
             }
         }
 
@@ -721,10 +844,10 @@ impl UiRenderer {
         }
     }
 
-    fn tessellate_icons(&self, icons: &[IconDraw]) -> Vec<TexVertex> {
+    fn build_icon_instances(&self, icons: &[IconDraw]) -> Vec<IconInstance> {
         let aw = self.atlas.width();
         let ah = self.atlas.height();
-        let mut out: Vec<TexVertex> = Vec::with_capacity(icons.len() * 6);
+        let mut out: Vec<IconInstance> = Vec::with_capacity(icons.len());
 
         for icon in icons {
             let id = match icon.sprite {
@@ -744,22 +867,16 @@ impl UiRenderer {
             let uv = apply_crop_uv(region.uv(aw, ah), icon.src);
             let clip = icon.clip.map(|c| [c.x, c.y, c.width, c.height]);
 
-            push_textured_quad_corners(
-                &mut out,
-                icon.corners,
-                [uv[0], uv[1], uv[2], uv[3]],
-                icon.tint,
-                clip,
-            );
+            out.push(build_icon_instance(icon.corners, uv, icon.tint, clip));
         }
 
         out
     }
 
-    fn tessellate_nine_slices(&self, draws: &[NineSliceDraw]) -> Vec<TexVertex> {
+    fn build_nine_slice_instances(&self, draws: &[NineSliceDraw]) -> Vec<NineSliceInstance> {
         let aw = self.atlas.width();
         let ah = self.atlas.height();
-        let mut out: Vec<TexVertex> = Vec::with_capacity(draws.len() * 54);
+        let mut out: Vec<NineSliceInstance> = Vec::with_capacity(draws.len());
 
         for draw in draws {
             let id = match draw.nine_slice {
@@ -781,8 +898,7 @@ impl UiRenderer {
                 None => continue,
             };
 
-            tessellate_nine_slice(
-                &mut out,
+            out.push(build_nine_slice_instance(
                 draw.local.x,
                 draw.local.y,
                 draw.local.width,
@@ -794,7 +910,7 @@ impl UiRenderer {
                 meta.border,
                 aw,
                 ah,
-            );
+            ));
         }
 
         out
@@ -835,17 +951,17 @@ impl UiRenderer {
         (v_off, i_off)
     }
 
-    /// Ensure the textured vbo holds this pass's bytes at its running frame
-    /// offset; returns the byte offset to write/draw at. Same grow semantics as
-    /// [`ensure_color_capacity`].
-    fn ensure_tex_capacity(&mut self, device: &wgpu::Device, verts: usize) -> u64 {
-        let off = self.tex_vbo_offset;
-        let needed = off + (verts * std::mem::size_of::<TexVertex>()) as u64;
-        if needed > self.tex_vbo_capacity {
-            self.tex_vbo_capacity = needed.next_power_of_two();
-            self.tex_vbo = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("ui tex vbo"),
-                size: self.tex_vbo_capacity,
+    /// Ensure the icon instance buffer holds `count` instances at its running
+    /// frame offset; returns the byte offset to write/draw at. Same grow
+    /// semantics as [`ensure_chrome_capacity`].
+    fn ensure_icon_capacity(&mut self, device: &wgpu::Device, count: usize) -> u64 {
+        let off = self.icon_inst_offset;
+        let needed = off + (count * std::mem::size_of::<IconInstance>()) as u64;
+        if needed > self.icon_inst_capacity {
+            self.icon_inst_capacity = needed.next_power_of_two();
+            self.icon_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ui icon inst buffer"),
+                size: self.icon_inst_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -998,20 +1114,24 @@ impl UiRenderer {
         }
     }
 
-    fn draw_textured(
+    /// Draw all icons/images as a single instanced call: the chrome unit-quad
+    /// base mesh + one [`IconInstance`] per icon. The vertex shader bilinearly
+    /// interpolates the baked-in corners and the fragment samples the atlas.
+    fn draw_icons(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
-        verts: &[TexVertex],
+        instances: &[IconInstance],
     ) {
-        let off = self.ensure_tex_capacity(device, verts.len());
-        queue.write_buffer(&self.tex_vbo, off, bytemuck::cast_slice(verts));
-        self.tex_vbo_offset = off + (verts.len() * std::mem::size_of::<TexVertex>()) as u64;
+        let off = self.ensure_icon_capacity(device, instances.len());
+        queue.write_buffer(&self.icon_inst_buffer, off, bytemuck::cast_slice(instances));
+        self.icon_inst_offset =
+            off + (instances.len() * std::mem::size_of::<IconInstance>()) as u64;
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("ui tex pass"),
+            label: Some("ui icon pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
@@ -1024,11 +1144,79 @@ impl UiRenderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        pass.set_pipeline(&self.tex_pipeline);
+        pass.set_pipeline(&self.icon_pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         pass.set_bind_group(1, &self.texture_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.tex_vbo.slice(off..));
-        pass.draw(0..verts.len() as u32, 0..1);
+        pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
+        pass.set_vertex_buffer(1, self.icon_inst_buffer.slice(off..));
+        pass.set_index_buffer(self.chrome_base_ibo.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(
+            0..CHROME_BASE_INDICES.len() as u32,
+            0,
+            0..instances.len() as u32,
+        );
+    }
+
+    /// Ensure the nine-slice instance buffer holds `count` instances at its
+    /// running frame offset; returns the byte offset to write/draw at. Same grow
+    /// semantics as [`ensure_chrome_capacity`].
+    fn ensure_nine_capacity(&mut self, device: &wgpu::Device, count: usize) -> u64 {
+        let off = self.nine_inst_offset;
+        let needed = off + (count * std::mem::size_of::<NineSliceInstance>()) as u64;
+        if needed > self.nine_inst_capacity {
+            self.nine_inst_capacity = needed.next_power_of_two();
+            self.nine_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ui nine-slice inst buffer"),
+                size: self.nine_inst_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        off
+    }
+
+    /// Draw all nine-slice panels as a single instanced call: the chrome
+    /// unit-quad base mesh + one [`NineSliceInstance`] per panel. The fragment
+    /// remaps local coords → source UV (nine-region piecewise map) and samples
+    /// the atlas.
+    fn draw_nine_slices(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        instances: &[NineSliceInstance],
+    ) {
+        let off = self.ensure_nine_capacity(device, instances.len());
+        queue.write_buffer(&self.nine_inst_buffer, off, bytemuck::cast_slice(instances));
+        self.nine_inst_offset =
+            off + (instances.len() * std::mem::size_of::<NineSliceInstance>()) as u64;
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ui nine-slice pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.nine_slice_pipeline);
+        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(1, &self.texture_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
+        pass.set_vertex_buffer(1, self.nine_inst_buffer.slice(off..));
+        pass.set_index_buffer(self.chrome_base_ibo.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(
+            0..CHROME_BASE_INDICES.len() as u32,
+            0,
+            0..instances.len() as u32,
+        );
     }
 }
 
@@ -1130,34 +1318,42 @@ fn apply_crop_uv(full: [f32; 4], src: Option<[f32; 4]>) -> [f32; 4] {
     }
 }
 
-/// Emit two triangles for a quad whose 4 corners are given in TL, TR, BR, BL
-/// order (matching `Affine2::transform_rect_corners`). Used for icons that may
-/// have been rotated/scaled by the active transform.
-fn push_textured_quad_corners(
-    out: &mut Vec<TexVertex>,
+/// Build one [`IconInstance`] from a quad's 4 world-space corners (TL, TR, BR,
+/// BL — matching `Affine2::transform_rect_corners`), its source UV rect, tint,
+/// and clip. The corners are baked in and bilinearly interpolated in `vs_icon`,
+/// so any rotation/scale/shear from the active transform is preserved with no
+/// fallback. Mirrors the per-vertex UV assignment the old tessellator did.
+fn build_icon_instance(
     corners: [[f32; 2]; 4],
     uv: [f32; 4], // u0, v0, u1, v1
     tint: [f32; 4],
     clip: Option<[f32; 4]>,
-) {
-    let (u0, v0, u1, v1) = (uv[0], uv[1], uv[2], uv[3]);
+) -> IconInstance {
+    let (clip_rect, clip_enabled) = match clip {
+        Some(r) => (r, 1.0),
+        None => ([0.0; 4], 0.0),
+    };
     let tl = corners[0];
     let tr = corners[1];
     let br = corners[2];
     let bl = corners[3];
-
-    out.push(TexVertex::new(tl, [u0, v0], tint, clip));
-    out.push(TexVertex::new(tr, [u1, v0], tint, clip));
-    out.push(TexVertex::new(br, [u1, v1], tint, clip));
-
-    out.push(TexVertex::new(br, [u1, v1], tint, clip));
-    out.push(TexVertex::new(bl, [u0, v1], tint, clip));
-    out.push(TexVertex::new(tl, [u0, v0], tint, clip));
+    IconInstance {
+        c_tl_tr: [tl[0], tl[1], tr[0], tr[1]],
+        c_br_bl: [br[0], br[1], bl[0], bl[1]],
+        uv_rect: uv,
+        tint,
+        clip: clip_rect,
+        flags: [clip_enabled, 0.0, 0.0, 0.0],
+    }
 }
 
+/// Build one [`NineSliceInstance`] from a panel's local rect, transform, tint,
+/// clip, and the resolved atlas region + border. The 9-region UV map and the
+/// border collapse are evaluated per-pixel in `fs_nine_slice`; here we only
+/// resolve the outer/inner UV stops and pack the affine. Mirrors the UV math the
+/// old `tessellate_nine_slice` did on the CPU.
 #[allow(clippy::too_many_arguments)]
-fn tessellate_nine_slice(
-    out: &mut Vec<TexVertex>,
+fn build_nine_slice_instance(
     x: f32,
     y: f32,
     w: f32,
@@ -1169,33 +1365,11 @@ fn tessellate_nine_slice(
     border: [u32; 4],
     atlas_w: u32,
     atlas_h: u32,
-) {
+) -> NineSliceInstance {
     let bl = border[0] as f32;
     let bt = border[1] as f32;
     let br = border[2] as f32;
     let bb = border[3] as f32;
-
-    // Screen X columns: x0..x1 = left border, x2..x3 = right border.
-    let x0 = x;
-    let mut x1 = x + bl;
-    let mut x2 = x + w - br;
-    let x3 = x + w;
-    if x1 > x2 {
-        // Panel narrower than borders: collapse middle column.
-        let mid = (x1 + x2) * 0.5;
-        x1 = mid;
-        x2 = mid;
-    }
-
-    let y0 = y;
-    let mut y1 = y + bt;
-    let mut y2 = y + h - bb;
-    let y3 = y + h;
-    if y1 > y2 {
-        let mid = (y1 + y2) * 0.5;
-        y1 = mid;
-        y2 = mid;
-    }
 
     // UVs: convert source-pixel borders against atlas dimensions.
     let aw = atlas_w as f32;
@@ -1209,40 +1383,20 @@ fn tessellate_nine_slice(
     let v2 = ((region.y + region.h) as f32 - bb) / ah;
     let v3 = (region.y + region.h) as f32 / ah;
 
-    let xs = [x0, x1, x2, x3];
-    let ys = [y0, y1, y2, y3];
-    let us = [u0, u1, u2, u3];
-    let vs = [v0, v1, v2, v3];
+    let (clip_rect, clip_enabled) = match clip {
+        Some(r) => (r, 1.0),
+        None => ([0.0; 4], 0.0),
+    };
 
-    for row in 0..3 {
-        for col in 0..3 {
-            let px0 = xs[col];
-            let px1 = xs[col + 1];
-            let py0 = ys[row];
-            let py1 = ys[row + 1];
-
-            if (px1 - px0).abs() < 0.001 || (py1 - py0).abs() < 0.001 {
-                continue;
-            }
-
-            let tu0 = us[col];
-            let tu1 = us[col + 1];
-            let tv0 = vs[row];
-            let tv1 = vs[row + 1];
-
-            let tl = transform.transform_point([px0, py0]);
-            let tr = transform.transform_point([px1, py0]);
-            let br = transform.transform_point([px1, py1]);
-            let bl = transform.transform_point([px0, py1]);
-
-            out.push(TexVertex::new(tl, [tu0, tv0], tint, clip));
-            out.push(TexVertex::new(tr, [tu1, tv0], tint, clip));
-            out.push(TexVertex::new(br, [tu1, tv1], tint, clip));
-
-            out.push(TexVertex::new(br, [tu1, tv1], tint, clip));
-            out.push(TexVertex::new(bl, [tu0, tv1], tint, clip));
-            out.push(TexVertex::new(tl, [tu0, tv0], tint, clip));
-        }
+    NineSliceInstance {
+        lin: [transform.a, transform.b, transform.c, transform.d],
+        translate: [transform.tx, transform.ty, clip_enabled, 0.0],
+        origin_size: [x, y, w, h],
+        uv_outer: [u0, v0, u3, v3],
+        uv_inner: [u1, v1, u2, v2],
+        border: [bl, bt, br, bb],
+        tint,
+        clip: clip_rect,
     }
 }
 
@@ -1274,36 +1428,53 @@ mod tests {
     }
 
     #[test]
-    fn nine_slice_emits_nine_quads() {
-        let mut out = Vec::new();
-        let region = AtlasRegion {
-            x: 0,
-            y: 0,
-            w: 32,
-            h: 32,
-        };
-        let identity = crate::affine::Affine2::IDENTITY;
-        tessellate_nine_slice(
-            &mut out,
-            0.0,
-            0.0,
-            100.0,
-            80.0,
-            &identity,
-            [1.0; 4],
-            None,
-            region,
-            [4, 4, 4, 4],
-            64,
-            64,
+    fn icon_instance_packs_corners_uv_clip() {
+        // Corners in TL, TR, BR, BL order (as transform_rect_corners yields).
+        let corners = [[10.0, 20.0], [110.0, 20.0], [110.0, 70.0], [10.0, 70.0]];
+        let inst = build_icon_instance(
+            corners,
+            [0.1, 0.2, 0.3, 0.4],
+            [1.0, 0.5, 0.25, 1.0],
+            Some([1.0, 2.0, 3.0, 4.0]),
         );
-        // 9 quads, 6 vertices each
-        assert_eq!(out.len(), 54);
+        assert_eq!(inst.c_tl_tr, [10.0, 20.0, 110.0, 20.0]);
+        assert_eq!(inst.c_br_bl, [110.0, 70.0, 10.0, 70.0]);
+        assert_eq!(inst.uv_rect, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(inst.tint, [1.0, 0.5, 0.25, 1.0]);
+        assert_eq!(inst.clip, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(inst.flags[0], 1.0); // clip enabled
     }
 
     #[test]
-    fn nine_slice_corner_uvs_match_border() {
-        let mut out = Vec::new();
+    fn icon_instance_clip_none_disables() {
+        let corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let inst = build_icon_instance(corners, [0.0, 0.0, 1.0, 1.0], [1.0; 4], None);
+        assert_eq!(inst.flags[0], 0.0); // clip disabled
+        assert_eq!(inst.clip, [0.0; 4]);
+    }
+
+    #[test]
+    fn nine_slice_instance_packs_affine_and_size() {
+        let region = AtlasRegion {
+            x: 0,
+            y: 0,
+            w: 32,
+            h: 32,
+        };
+        // Translation-only transform: linear part is identity, translate carries
+        // the offset. clip None => clip_enabled 0.
+        let t = crate::affine::Affine2::translation(7.0, 11.0);
+        let inst = build_nine_slice_instance(
+            5.0, 6.0, 100.0, 80.0, &t, [1.0; 4], None, region, [4, 4, 4, 4], 64, 64,
+        );
+        assert_eq!(inst.lin, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(inst.translate, [7.0, 11.0, 0.0, 0.0]);
+        assert_eq!(inst.origin_size, [5.0, 6.0, 100.0, 80.0]);
+        assert_eq!(inst.border, [4.0, 4.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn nine_slice_instance_uvs_match_border() {
         let region = AtlasRegion {
             x: 0,
             y: 0,
@@ -1311,27 +1482,41 @@ mod tests {
             h: 32,
         };
         let identity = crate::affine::Affine2::IDENTITY;
-        tessellate_nine_slice(
-            &mut out,
+        let inst = build_nine_slice_instance(
+            0.0, 0.0, 100.0, 80.0, &identity, [1.0; 4], None, region, [8, 8, 8, 8], 64, 64,
+        );
+        // Outer UV origin = region origin (0,0); far edge = 32/64 = 0.5.
+        approx4(inst.uv_outer, [0.0, 0.0, 0.5, 0.5]);
+        // Inner seams: left/top = 8/64 = 0.125; right/bottom = (32-8)/64 = 0.375.
+        approx4(inst.uv_inner, [0.125, 0.125, 0.375, 0.375]);
+    }
+
+    #[test]
+    fn nine_slice_instance_records_affine_rotation_and_clip() {
+        let region = AtlasRegion {
+            x: 16,
+            y: 16,
+            w: 16,
+            h: 16,
+        };
+        // A rotation injects nonzero off-diagonals — proving the full affine is
+        // baked in (no axis-aligned fallback needed for nine-slices).
+        let r = crate::affine::Affine2::rotation(std::f32::consts::FRAC_PI_2);
+        let inst = build_nine_slice_instance(
             0.0,
             0.0,
-            100.0,
-            80.0,
-            &identity,
+            10.0,
+            10.0,
+            &r,
             [1.0; 4],
-            None,
+            Some([1.0, 2.0, 3.0, 4.0]),
             region,
-            [8, 8, 8, 8],
+            [2, 2, 2, 2],
             64,
             64,
         );
-        // First triangle of first quad (top-left corner). Its UV at (0,0) must
-        // be region origin; second vertex (right edge of TL corner) must match
-        // border-left UV: 8/64 = 0.125.
-        let first = out[0];
-        assert_eq!(first.uv, [0.0, 0.0]);
-        let second = out[1];
-        assert!((second.uv[0] - 8.0 / 64.0).abs() < 1e-6);
-        assert!((second.uv[1] - 0.0).abs() < 1e-6);
+        assert!(inst.lin[1].abs() > 1e-3 || inst.lin[2].abs() > 1e-3);
+        assert_eq!(inst.translate[2], 1.0); // clip_enabled
+        assert_eq!(inst.clip, [1.0, 2.0, 3.0, 4.0]);
     }
 }

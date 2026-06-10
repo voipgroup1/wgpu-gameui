@@ -223,6 +223,23 @@ fn render_widget_gallery() {
         let r = flow.cell(list, "Nine-slice", 64.0, 44.0);
         list.nine_slice_id(nine_slice_id, r.x, r.y, r.width, r.height, [1.0; 4]);
 
+        // Rotated nine-slice: unlike chrome, the instanced nine-slice bakes the
+        // full affine into the instance (UV mapping is local-space), so rotation
+        // is exact with no fallback — strictly more capable than the old soup.
+        let r = flow.cell(list, "Nine-slice (rotated)", 64.0, 44.0);
+        list.push_transform();
+        list.translate(r.x + r.width / 2.0, r.y + r.height / 2.0);
+        list.rotate(0.18);
+        list.nine_slice_id(
+            nine_slice_id,
+            -r.width / 2.0,
+            -r.height / 2.0,
+            r.width,
+            r.height,
+            [1.0; 4],
+        );
+        list.pop_transform();
+
         let r = flow.cell(list, "Icon sprite", 40.0, 40.0);
         list.icon_sprite(ball, r.x, r.y, r.width, r.height, [1.0; 4]);
 
