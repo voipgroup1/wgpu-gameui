@@ -5,37 +5,109 @@
 //! cargo test -p wgpu-gameui --test widget_gallery -- --ignored --nocapture
 //! ```
 //! Writes `test_output/widget_gallery.png`.
+//!
+//! Layout is driven by [`Flow`] — a left-to-right, wrapping grid of labeled
+//! cells. Each preview reserves a cell (which draws its label) and gets back a
+//! content `Rect` to draw into, so adding a widget is one `flow.cell(...)` call
+//! plus the widget's own draw call — no hand-placed coordinates.
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    Checkbox, ColumnWidth, DragCapture, ImageButton, ImageFit, InputState, LayerStack, ProgressBar,
-    ScrollState, ScrollView, Slider, Table, TableCell, TableColumn, Tabs, TextAlign, TextBlock,
-    TextInput, Theme, TooltipContent, TooltipLayer, UiRenderer,
+    Button, Checkbox, ColumnWidth, DragCapture, DrawList, ImageButton, ImageFit, InputState,
+    LayerStack, ProgressBar, ScrollState, ScrollView, Slider, Table, TableCell, TableColumn, Tabs,
+    TextAlign, TextBlock, TextInput, Theme, TooltipContent, TooltipLayer, UiRenderer,
+    SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
 };
 
 const W: u32 = 800;
-const H: u32 = 950;
+const LABEL_H: f32 = 16.0;
+const LABEL_SIZE: f32 = 11.0;
+/// Rough advance width per character at `LABEL_SIZE`, used so a long label
+/// reserves enough horizontal room to not collide with the next cell.
+const LABEL_CHAR_W: f32 = 6.0;
 
-fn checkerboard_pixels(size: u32, a: [u8; 4], b: [u8; 4]) -> Vec<u8> {
-    let mut out = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            let cell = ((x / 4) + (y / 4)) % 2;
-            let c = if cell == 0 { a } else { b };
-            out.extend_from_slice(&c);
+/// A wrapping grid of labeled preview cells.
+///
+/// `cell` reserves a `w`×`h` content box, draws its label just above it, and
+/// returns the content `Rect`. Cells flow left-to-right and wrap when they run
+/// past `max_x`. `section` breaks to a new row and draws a header.
+struct Flow {
+    x0: f32,
+    y0: f32,
+    max_x: f32,
+    cur_x: f32,
+    cur_y: f32,
+    row_h: f32,
+    col_gap: f32,
+    row_gap: f32,
+}
+
+impl Flow {
+    fn new(x0: f32, y0: f32, max_x: f32) -> Self {
+        Self {
+            x0,
+            y0,
+            max_x,
+            cur_x: x0,
+            cur_y: y0,
+            row_h: 0.0,
+            col_gap: 22.0,
+            row_gap: 16.0,
         }
     }
-    out
+
+    /// Break to a new row and draw a section header.
+    fn section(&mut self, list: &mut DrawList, title: &str) {
+        if self.cur_x > self.x0 {
+            self.cur_y += self.row_h;
+        }
+        // Extra gap above a header (except the very first one).
+        if self.cur_y > self.y0 {
+            self.cur_y += self.row_gap * 1.5;
+        }
+        self.cur_x = self.x0;
+        self.row_h = 0.0;
+        list.text(
+            TextBlock::new(title, self.x0, self.cur_y)
+                .with_size(15.0)
+                .with_color(120, 180, 255),
+        );
+        self.cur_y += 24.0;
+    }
+
+    /// Reserve a labeled `w`×`h` content cell; returns the content rect.
+    fn cell(&mut self, list: &mut DrawList, label: &str, w: f32, h: f32) -> Rect {
+        // A cell is as wide as its content or its label, whichever is larger,
+        // so labels never overlap the neighbouring cell.
+        let cell_w = w.max(label.chars().count() as f32 * LABEL_CHAR_W);
+        if self.cur_x + cell_w > self.max_x && self.cur_x > self.x0 {
+            self.cur_x = self.x0;
+            self.cur_y += self.row_h + self.row_gap;
+            self.row_h = 0.0;
+        }
+        list.text(
+            TextBlock::new(label, self.cur_x, self.cur_y)
+                .with_size(LABEL_SIZE)
+                .with_color(150, 160, 180),
+        );
+        let content = Rect::new(self.cur_x, self.cur_y + LABEL_H, w, h);
+        self.cur_x += cell_w + self.col_gap;
+        self.row_h = self.row_h.max(LABEL_H + h);
+        content
+    }
+
+    /// The y just below all content drawn so far.
+    fn bottom(&self) -> f32 {
+        self.cur_y + self.row_h
+    }
 }
 
 fn solid_with_border(size: u32, fill: [u8; 4], border: [u8; 4], thickness: u32) -> Vec<u8> {
     let mut out = vec![0u8; (size * size * 4) as usize];
     for y in 0..size {
         for x in 0..size {
-            let on_border = x < thickness
-                || y < thickness
-                || x >= size - thickness
-                || y >= size - thickness;
+            let on_border =
+                x < thickness || y < thickness || x >= size - thickness || y >= size - thickness;
             let c = if on_border { border } else { fill };
             let idx = ((y * size + x) * 4) as usize;
             out[idx..idx + 4].copy_from_slice(&c);
@@ -68,200 +140,202 @@ fn render_widget_gallery() {
     let font_system = wgpu_gameui::shared_font_system();
     let mut ui = UiRenderer::new(&device, &queue, format, font_system.clone());
 
-    // Upload test sprites.
-    let icon_pixels = checkerboard_pixels(32, [220, 80, 80, 255], [40, 40, 40, 255]);
-    let icon_sprite = ui.load_sprite_rgba8("icon", 32, 32, &icon_pixels);
+    // Real PNG art from assets/ — decoded through the same `load_image_file`
+    // path the game uses, so the gallery doubles as a smoke test for it.
+    let load = |ui: &mut UiRenderer, name: &str| {
+        ui.load_image_file(format!("assets/{name}.png"))
+            .unwrap_or_else(|e| panic!("load assets/{name}.png: {e:?}"))
+    };
+    let duck = load(&mut ui, "rubberduck");
+    let ball = load(&mut ui, "soccerball");
+    let car = load(&mut ui, "toycar");
+    let board = load(&mut ui, "skateboard");
+    let snow = load(&mut ui, "snowflake");
+    let suitcase = load(&mut ui, "suitcase");
+
+    // Synthetic sprites for primitives that show off tinting / nine-slice.
     let frame_pixels = solid_with_border(32, [180, 180, 200, 255], [60, 60, 90, 255], 4);
     let frame_sprite = ui.load_sprite_rgba8("frame", 32, 32, &frame_pixels);
     let nine_slice_id = ui.register_nine_slice("frame", frame_sprite, [4, 4, 4, 4]);
 
-    let target = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("gallery target"),
-        size: wgpu::Extent3d {
-            width: W,
-            height: H,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    // Slider assets: it draws its track via the `SLIDER_TRACK_NINE_SLICE` key
+    // ("track") and its knob via the `SLIDER_SCRUBBER_ICON` key. Register
+    // placeholders so the slider shows in the gallery (the game ships real art).
+    let track_pixels = solid_with_border(16, [40, 42, 55, 255], [90, 95, 120, 255], 2);
+    let track_sprite = ui.load_sprite_rgba8("slider_track", 16, 16, &track_pixels);
+    ui.register_nine_slice(SLIDER_TRACK_NINE_SLICE, track_sprite, [4, 4, 4, 4]);
+    let knob_pixels = solid_with_border(16, [200, 205, 220, 255], [110, 115, 140, 255], 2);
+    ui.load_sprite_rgba8(SLIDER_SCRUBBER_ICON, 16, 16, &knob_pixels);
 
-    // bytes_per_row must be 256-aligned for wgpu copy.
-    let row_stride = W * 4;
-    let bytes_per_row = (row_stride + 255) & !255;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size: (bytes_per_row * H) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    // Use a LayerStack so we can demo tooltip layers.
     let mut layers = LayerStack::new();
     let theme = Theme::default();
     let mut input = InputState::default();
-    input.mouse_x = 200.0;
-    input.mouse_y = 100.0;
+
+    // Reserved by the flow inside the scope below, used afterwards. The scope
+    // runs unconditionally, so deferred init is sound (and avoids a dead store).
+    let tooltip_rect;
+    let content_bottom;
 
     // =====================================================================
-    // Draw all base-layer widgets in a scope so the `list` borrow on `layers`
-    // is released before we add tooltip layers.
+    // Build the base layer. The `list` borrow on `layers` is released at the
+    // end of this scope so we can add tooltip layers afterwards.
     // =====================================================================
     {
-    let list = layers.base_mut();
+        let list = layers.base_mut();
 
-    // =====================================================================
-    // Title
-    // =====================================================================
-    list.text(
-        TextBlock::new("wgpu-gameui Widget Gallery", 20.0, 16.0)
-            .with_size(24.0)
-            .with_color(255, 255, 255),
-    );
+        list.text(
+            TextBlock::new("wgpu-gameui Widget Gallery", 20.0, 16.0)
+                .with_size(24.0)
+                .with_color(255, 255, 255),
+        );
 
-    // =====================================================================
-    // Row 1: Basic primitives (y ~ 50)
-    // =====================================================================
-    list.rounded_rect(Rect::new(20.0, 50.0, 120.0, 50.0), 8.0, [0.25, 0.40, 0.65, 1.0]);
-    list.text(
-        TextBlock::new("RoundedRect", 28.0, 65.0)
-            .with_size(12.0)
-            .with_color(255, 255, 255),
-    );
+        let mut flow = Flow::new(20.0, 56.0, (W as f32) - 20.0);
 
-    list.line([160.0, 60.0], [260.0, 90.0], 3.0, [0.95, 0.65, 0.25, 1.0]);
+        // ---- Primitives -------------------------------------------------
+        flow.section(list, "Primitives");
 
-    list.circle((320.0, 75.0), 25.0, [0.30, 0.70, 0.40, 1.0]);
-    list.circle_outline((390.0, 75.0), 25.0, 3.0, [0.70, 0.30, 0.40, 1.0]);
+        let r = flow.cell(list, "Rounded rect", 120.0, 44.0);
+        list.rounded_rect(r, 8.0, [0.25, 0.40, 0.65, 1.0]);
 
-    list.nine_slice_id(nine_slice_id, 460.0, 55.0, 60.0, 40.0, [1.0; 4]);
-    list.icon_sprite(icon_sprite, 550.0, 60.0, 32.0, 32.0, [1.0; 4]);
-    list.image(icon_sprite, Rect::new(600.0, 60.0, 32.0, 32.0), [1.0; 4]);
+        let r = flow.cell(list, "Line", 90.0, 44.0);
+        list.line(
+            [r.x, r.y + r.height],
+            [r.x + r.width, r.y],
+            3.0,
+            [0.95, 0.65, 0.25, 1.0],
+        );
 
-    // =====================================================================
-    // Row 2: Text styles (y ~ 120)
-    // =====================================================================
-    list.text(
-        TextBlock::new("Normal 16px text — The quick brown fox jumps", 20.0, 120.0)
-            .with_size(16.0)
-            .with_color(200, 210, 230),
-    );
-    list.text(
-        TextBlock::new("20px white + dark outline", 20.0, 150.0)
-            .with_size(20.0)
-            .with_color(255, 255, 255)
-            .with_outline(10, 12, 18, 255, 2.0),
-    );
-    list.text(
-        TextBlock::new("Shadowed text (offset 1,1)", 20.0, 185.0)
-            .with_size(16.0)
-            .with_color(200, 220, 255)
-            .with_shadow(0, 0, 0, 200, 1.0, 1.0, 1.0),
-    );
-    list.text(
-        TextBlock::new("Glow effect", 320.0, 185.0)
-            .with_size(24.0)
-            .with_color(255, 255, 200)
-            .with_glow(80, 200, 255, 255, 3.0),
-    );
-    list.text(
-        TextBlock::new("Right-aligned", 480.0, 220.0)
-            .with_size(14.0)
-            .with_color(180, 190, 210)
-            .with_max_width(150.0)
-            .with_align(TextAlign::Right),
-    );
-    list.text(
-        TextBlock::new("Centered in 150px", 480.0, 240.0)
-            .with_size(14.0)
-            .with_color(180, 190, 210)
-            .with_max_width(150.0)
-            .with_align(TextAlign::Center),
-    );
+        let r = flow.cell(list, "Circle", 50.0, 50.0);
+        list.circle(
+            (r.x + r.width / 2.0, r.y + r.height / 2.0),
+            r.width / 2.0,
+            [0.30, 0.70, 0.40, 1.0],
+        );
 
-    // =====================================================================
-    // Row 3: Button, Checkbox, ProgressBar, Slider (y ~ 280)
-    // =====================================================================
-    let btn_rect = Rect::new(20.0, 280.0, 100.0, 32.0);
-    list.rounded_rect(btn_rect, 6.0, [0.30, 0.55, 0.85, 1.0]);
-    list.text(
-        TextBlock::new("Button", 44.0, 287.0)
-            .with_size(14.0)
-            .with_color(255, 255, 255),
-    );
+        let r = flow.cell(list, "Circle outline", 50.0, 50.0);
+        list.circle_outline(
+            (r.x + r.width / 2.0, r.y + r.height / 2.0),
+            r.width / 2.0,
+            3.0,
+            [0.70, 0.30, 0.40, 1.0],
+        );
 
-    // Checkboxes: draw(&self, checked, label, rect, list, theme, input)
-    let cb = Checkbox::new();
-    cb.draw(false, "Option A", Rect::new(140.0, 285.0, 100.0, 20.0), &mut *list, &theme, &input);
-    cb.draw(true, "Option B (checked)", Rect::new(140.0, 310.0, 160.0, 20.0), &mut *list, &theme, &input);
+        let r = flow.cell(list, "Nine-slice", 64.0, 44.0);
+        list.nine_slice_id(nine_slice_id, r.x, r.y, r.width, r.height, [1.0; 4]);
 
-    // ProgressBar: draw(&self, rect, list, theme)
-    let pb = ProgressBar::new(0.65);
-    pb.draw(Rect::new(320.0, 285.0, 150.0, 20.0), &mut *list, &theme);
+        let r = flow.cell(list, "Icon sprite", 40.0, 40.0);
+        list.icon_sprite(ball, r.x, r.y, r.width, r.height, [1.0; 4]);
 
-    // Slider: draw(&self, value, id, capture, rect, list, theme, input)
-    let slider_val = 40.0;
-    let mut capture = DragCapture::default();
-    let slider = Slider::new(0.0, 100.0);
-    slider.draw(
-        slider_val,
-        0,
-        &mut capture,
-        Rect::new(300.0, 330.0, 150.0, 20.0),
-        &mut *list,
-        &theme,
-        &input,
-    );
-    list.text(
-        TextBlock::new(&format!("Slider val: {:.0}", slider_val), 470.0, 332.0)
-            .with_size(12.0)
-            .with_color(200, 210, 230),
-    );
+        let r = flow.cell(list, "Image", 40.0, 40.0);
+        list.image(car, r, [1.0; 4]);
 
-    // =====================================================================
-    // Row 4: Tabs (y ~ 380)
-    // =====================================================================
-    let tabs = Tabs::new(&["Tab A", "Tab B", "Tab C"]);
-    let _output = tabs.draw(
-        Rect::new(20.0, 380.0, 300.0, 30.0),
-        0,
-        &mut *list,
-        &theme,
-        &mut input,
-    );
+        let r = flow.cell(list, "Image (cropped)", 40.0, 40.0);
+        list.image_cropped(snow, r, [0.0, 0.0, 0.5, 0.5], [1.0; 4]);
 
-    // =====================================================================
-    // Row 5: TextInput (y ~ 420)
-    // =====================================================================
-    {
-        let mut ti = TextInput::new(20.0, 425.0, 220.0, 28.0)
+        let r = flow.cell(list, "Rect outline", 100.0, 32.0);
+        list.rect_outline(r, 2.0, [0.70, 0.30, 0.40, 1.0]);
+
+        // ---- Text -------------------------------------------------------
+        flow.section(list, "Text");
+
+        let r = flow.cell(list, "Plain", 190.0, 20.0);
+        list.text(
+            TextBlock::new("The quick brown fox", r.x, r.y)
+                .with_size(16.0)
+                .with_color(200, 210, 230),
+        );
+
+        let r = flow.cell(list, "Outline", 130.0, 24.0);
+        list.text(
+            TextBlock::new("Outlined", r.x, r.y)
+                .with_size(20.0)
+                .with_color(255, 255, 255)
+                .with_outline(10, 12, 18, 255, 2.0),
+        );
+
+        let r = flow.cell(list, "Shadow", 120.0, 20.0);
+        list.text(
+            TextBlock::new("Shadowed", r.x, r.y)
+                .with_size(16.0)
+                .with_color(200, 220, 255)
+                .with_shadow(0, 0, 0, 200, 1.0, 1.0, 1.0),
+        );
+
+        let r = flow.cell(list, "Glow", 120.0, 26.0);
+        list.text(
+            TextBlock::new("Glow", r.x, r.y)
+                .with_size(24.0)
+                .with_color(255, 255, 200)
+                .with_glow(80, 200, 255, 255, 3.0),
+        );
+
+        let r = flow.cell(list, "Align right", 150.0, 20.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        list.text(
+            TextBlock::new("Right", r.x, r.y + 2.0)
+                .with_size(14.0)
+                .with_color(180, 190, 210)
+                .with_max_width(r.width)
+                .with_align(TextAlign::Right),
+        );
+
+        let r = flow.cell(list, "Align center", 150.0, 20.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        list.text(
+            TextBlock::new("Center", r.x, r.y + 2.0)
+                .with_size(14.0)
+                .with_color(180, 190, 210)
+                .with_max_width(r.width)
+                .with_align(TextAlign::Center),
+        );
+
+        // ---- Widgets ----------------------------------------------------
+        flow.section(list, "Widgets");
+
+        let r = flow.cell(list, "Button", 100.0, 32.0);
+        Button::draw_at("Button", r, true, list, &theme, &input);
+
+        let r = flow.cell(list, "Button (bare)", 100.0, 32.0);
+        Button::new("Bare").bare().draw(r, list, &theme, &input);
+
+        let r = flow.cell(list, "Button (disabled)", 110.0, 32.0);
+        Button::draw_at("Disabled", r, false, list, &theme, &input);
+
+        let cb = Checkbox::new();
+        let r = flow.cell(list, "Checkbox", 120.0, 20.0);
+        cb.draw(false, "Off", r, list, &theme, &input);
+
+        let r = flow.cell(list, "Checkbox (checked)", 120.0, 20.0);
+        cb.draw(true, "On", r, list, &theme, &input);
+
+        let r = flow.cell(list, "Progress bar", 150.0, 20.0);
+        ProgressBar::new(0.65).draw(r, list, &theme);
+
+        let r = flow.cell(list, "Slider", 160.0, 24.0);
+        let mut capture = DragCapture::default();
+        Slider::new(0.0, 100.0).draw(40.0, 0, &mut capture, r, list, &theme, &input);
+
+        let r = flow.cell(list, "Tabs", 240.0, 30.0);
+        Tabs::new(&["Tab A", "Tab B", "Tab C"]).draw(r, 0, list, &theme, &input);
+
+        let r = flow.cell(list, "Text input", 200.0, 28.0);
+        TextInput::new(r.x, r.y, r.width, r.height)
             .with_value("Hello, wgpu-gameui!")
-            .with_focused(true);
-        let _ = ti.draw(&mut *list, &theme, &input);
-    }
-    {
-        let mut ti = TextInput::new(260.0, 425.0, 200.0, 28.0)
-            .with_placeholder("Placeholder...");
-        let _ = ti.draw(&mut *list, &theme, &input);
-    }
+            .with_focused(true)
+            .draw(list, &theme, &input);
 
-    // =====================================================================
-    // Row 6: ScrollView (y ~ 470)
-    // =====================================================================
-    let scroll_viewport = Rect::new(20.0, 485.0, 180.0, 100.0);
-    list.rounded_rect(scroll_viewport, 4.0, [0.06, 0.07, 0.10, 1.0]);
-    let mut scroll_state = ScrollState::default();
-    scroll_state.content_size = [160.0, 300.0];
-    ScrollView::new(scroll_viewport)
-        .vertical_only()
-        .draw(
+        let r = flow.cell(list, "Text input (empty)", 200.0, 28.0);
+        TextInput::new(r.x, r.y, r.width, r.height)
+            .with_placeholder("Placeholder...")
+            .draw(list, &theme, &input);
+
+        let r = flow.cell(list, "Scroll view", 180.0, 100.0);
+        list.rounded_rect(r, 4.0, [0.06, 0.07, 0.10, 1.0]);
+        let mut scroll_state = ScrollState::default();
+        scroll_state.content_size = [160.0, 300.0];
+        ScrollView::new(r).vertical_only().draw(
             &mut scroll_state,
-            &mut *list,
+            list,
             &theme,
             &mut input,
             |list, vp| {
@@ -282,10 +356,6 @@ fn render_widget_gallery() {
             },
         );
 
-    // =====================================================================
-    // Row 7: Table (y ~ 480 alongside scrollview)
-    // =====================================================================
-    {
         let columns = &[
             TableColumn::new("Name", ColumnWidth::Fixed(100.0)),
             TableColumn::new("Score", ColumnWidth::Fixed(60.0)),
@@ -308,122 +378,86 @@ fn render_widget_gallery() {
                 TableCell::new("Fail"),
             ],
         ];
-        let table_rect = Rect::new(220.0, 485.0, 270.0, 80.0);
-        list.rounded_rect(table_rect, 4.0, [0.06, 0.07, 0.10, 1.0]);
-        Table::new(columns).draw(
-            table_rect,
-            &rows,
-            &mut ScrollState::default(),
-            &mut *list,
-            &theme,
-            &mut input,
-        );
-    }
+        let r = flow.cell(list, "Table", 270.0, 88.0);
+        list.rounded_rect(r, 4.0, [0.06, 0.07, 0.10, 1.0]);
+        Table::new(columns).draw(r, &rows, &mut ScrollState::default(), list, &theme, &mut input);
 
-    // =====================================================================
-    // Row 8: Rect outline (y ~ 595)
-    // =====================================================================
-    list.rect_outline(Rect::new(20.0, 600.0, 100.0, 30.0), 2.0, [0.70, 0.30, 0.40, 1.0]);
-    list.text(
-        TextBlock::new("Rect outline", 28.0, 606.0)
-            .with_size(12.0)
-            .with_color(200, 210, 230),
-    );
+        let r = flow.cell(list, "Image button", 40.0, 40.0);
+        ImageButton::sprite(duck)
+            .fit(ImageFit::Contain)
+            .natural_size(48.0, 48.0)
+            .draw(r, list, &theme, &input);
 
-    // ImageButton: chrome / bare / disabled variants (draw returns clicked).
-    ImageButton::sprite(icon_sprite)
-        .fit(ImageFit::Contain)
-        .natural_size(32.0, 32.0)
-        .draw(Rect::new(200.0, 595.0, 40.0, 40.0), &mut *list, &theme, &input);
-    ImageButton::sprite(icon_sprite)
-        .bare()
-        .fit(ImageFit::Contain)
-        .natural_size(32.0, 32.0)
-        .draw(Rect::new(250.0, 595.0, 40.0, 40.0), &mut *list, &theme, &input);
-    ImageButton::sprite(icon_sprite)
-        .enabled(false)
-        .fit(ImageFit::Contain)
-        .natural_size(32.0, 32.0)
-        .draw(Rect::new(300.0, 595.0, 40.0, 40.0), &mut *list, &theme, &input);
-    list.text(
-        TextBlock::new("ImageButton: chrome / bare / disabled", 200.0, 640.0)
-            .with_size(11.0)
-            .with_color(180, 190, 210),
-    );
+        let r = flow.cell(list, "Image button (bare)", 40.0, 40.0);
+        ImageButton::sprite(board)
+            .bare()
+            .fit(ImageFit::Contain)
+            .natural_size(48.0, 48.0)
+            .draw(r, list, &theme, &input);
 
-    // =====================================================================
-    // Row 9: Labels / title helpers (y ~ 645)
-    // =====================================================================
-    list.text(
-        TextBlock::new("label_at + title_at (panel helpers)", 20.0, 645.0)
-            .with_size(14.0)
-            .with_color(180, 190, 210),
-    );
-    wgpu_gameui::label_at(
-        &mut *list,
-        &theme,
-        "Label: some value",
-        Rect::new(20.0, 665.0, 200.0, 20.0),
-    );
-    wgpu_gameui::title_at(
-        &mut *list,
-        &theme,
-        "Title: Section Header",
-        Rect::new(20.0, 690.0, 250.0, 22.0),
-    );
-    wgpu_gameui::label_centered_at(
-        &mut *list,
-        &theme,
-        "Centered Label",
-        Rect::new(300.0, 665.0, 160.0, 20.0),
-    );
+        let r = flow.cell(list, "Image button (disabled)", 40.0, 40.0);
+        ImageButton::sprite(suitcase)
+            .enabled(false)
+            .fit(ImageFit::Contain)
+            .natural_size(48.0, 48.0)
+            .draw(r, list, &theme, &input);
 
-    // =====================================================================
-    // Row 10: Image cropped (y ~ 730)
-    // =====================================================================
-    list.image_cropped(
-        icon_sprite,
-        Rect::new(20.0, 735.0, 40.0, 40.0),
-        [0.0, 0.0, 0.5, 0.5],
-        [1.0; 4],
-    );
-    list.text(
-        TextBlock::new("Cropped (TL quarter)", 68.0, 748.0)
-            .with_size(11.0)
-            .with_color(180, 190, 210),
-    );
-
-    // =====================================================================
-    // Row 11: Tooltip layer (y ~ 790)
-    // =====================================================================
-    } // drop `list` borrow on layers before tooltip layer ops
-    {
-        let list = layers.base_mut();
-        list.rounded_rect(Rect::new(20.0, 800.0, 120.0, 24.0), 4.0, [0.25, 0.30, 0.40, 1.0]);
+        // Tooltip target last: its popup floats down-and-right into the empty
+        // headroom below, overlapping no other widget.
+        let r = flow.cell(list, "Tooltip target", 120.0, 24.0);
+        list.rounded_rect(r, 4.0, [0.25, 0.30, 0.40, 1.0]);
         list.text(
-            TextBlock::new("Hoverable region", 26.0, 803.0)
-                .with_size(11.0)
+            TextBlock::new("Hover me", r.x + 8.0, r.y + 5.0)
+                .with_size(12.0)
                 .with_color(200, 210, 230),
         );
-    } // drop `list` so we can borrow layers mutably again
+        tooltip_rect = r;
 
-    // Build and draw tooltip layer (no concurrent `list` borrow on layers).
-    {
-        let mut tooltip = TooltipLayer::new();
-        tooltip.register(
-            Rect::new(20.0, 800.0, 120.0, 24.0),
-            TooltipContent::text("This is a tooltip!"),
-        );
-        let mut tip_input = InputState::default();
-        tip_input.mouse_x = 50.0;
-        tip_input.mouse_y = 810.0;
-        tooltip.tick(999.0, &tip_input);
-        tooltip.draw_into_layers(&mut layers, &tip_input, &theme, 50.0, 810.0);
+        // Leave headroom below the last row for the tooltip popup.
+        content_bottom = flow.bottom() + 70.0;
     }
 
-    // =====================================================================
-    // Render
-    // =====================================================================
+    // Size the target to the laid-out content first, so the tooltip layer
+    // knows the real screen height (it flips the popup up/left near the edges).
+    let h = (content_bottom.ceil() as u32).max(64);
+
+    // Tooltip layer, hovering the reserved target.
+    {
+        let mut tooltip = TooltipLayer::new();
+        tooltip.register(tooltip_rect, TooltipContent::text("This is a tooltip!"));
+        let mut tip_input = InputState::default();
+        tip_input.mouse_x = tooltip_rect.x + tooltip_rect.width / 2.0;
+        tip_input.mouse_y = tooltip_rect.y + tooltip_rect.height / 2.0;
+        tooltip.tick(999.0, &tip_input);
+        tooltip.draw_into_layers(&mut layers, &tip_input, &theme, W as f32, h as f32);
+    }
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("gallery target"),
+        size: wgpu::Extent3d {
+            width: W,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // bytes_per_row must be 256-aligned for wgpu copy.
+    let row_stride = W * 4;
+    let bytes_per_row = (row_stride + 255) & !255;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: (bytes_per_row * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("encoder"),
     });
@@ -449,14 +483,7 @@ fn render_widget_gallery() {
         });
     }
 
-    ui.render_layers(
-        &device,
-        &queue,
-        &mut encoder,
-        &view,
-        (W, H),
-        &layers,
-    );
+    ui.render_layers(&device, &queue, &mut encoder, &view, (W, h), &layers);
 
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -470,12 +497,12 @@ fn render_widget_gallery() {
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(H),
+                rows_per_image: Some(h),
             },
         },
         wgpu::Extent3d {
             width: W,
-            height: H,
+            height: h,
             depth_or_array_layers: 1,
         },
     );
@@ -493,16 +520,16 @@ fn render_widget_gallery() {
     // drifts by the padding amount and the image shears diagonally.
     let row_stride = (W * 4) as usize;
     let bpr = bytes_per_row as usize;
-    let mut pixels = Vec::with_capacity(row_stride * H as usize);
-    for row in 0..H as usize {
+    let mut pixels = Vec::with_capacity(row_stride * h as usize);
+    for row in 0..h as usize {
         let start = row * bpr;
         pixels.extend_from_slice(&data[start..start + row_stride]);
     }
 
     std::fs::create_dir_all("test_output").unwrap();
-    let img = image::RgbaImage::from_raw(W, H, pixels).expect("image from raw");
+    let img = image::RgbaImage::from_raw(W, h, pixels).expect("image from raw");
     img.save("test_output/widget_gallery.png").expect("save png");
-    eprintln!("wrote test_output/widget_gallery.png");
+    eprintln!("wrote test_output/widget_gallery.png ({W}x{h})");
 
     // Sanity: at least some pixels are not the clear color.
     let clear = [13u8, 15, 20];
