@@ -62,7 +62,7 @@ impl FontHandle {
 ///
 /// Alignment is relative to [`TextBlock::max_width`]; `Center`/`Right` only
 /// produce a visible shift when `max_width` is wider than the longest line.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TextAlign {
     /// Lines start at the left edge of the box (default).
     #[default]
@@ -167,6 +167,15 @@ pub struct TextRenderer {
     /// the atlas from cosmic-text's `fontdb::ID`.
     font_keys: HashMap<fontdb::ID, u64>,
     next_font_key: u64,
+
+    /// Cross-frame shaped-layout cache. Keyed by everything that affects layout
+    /// except position/color/clip/effects, so a block whose content and metrics
+    /// are unchanged reuses its glyph layout instead of re-shaping every frame
+    /// (the dominant cost in large text-heavy frames). Inner map is keyed by the
+    /// content string so hits borrow `&str` with no allocation.
+    shape_cache: HashMap<ShapeKey, HashMap<String, CachedShape>>,
+    /// Monotonic frame counter stamped onto cache entries for working-set eviction.
+    shape_frame: u64,
 
     width: u32,
     height: u32,
@@ -285,6 +294,8 @@ impl TextRenderer {
             vbo_offset: 0,
             font_keys: HashMap::new(),
             next_font_key: 0,
+            shape_cache: HashMap::new(),
+            shape_frame: 0,
             width: 1,
             height: 1,
         }
@@ -308,6 +319,19 @@ impl TextRenderer {
     /// keeps multiple text passes from aliasing starts fresh.
     pub fn begin_frame(&mut self) {
         self.vbo_offset = 0;
+    }
+
+    /// Drop the cross-frame shaped-text cache, forcing every block to re-shape on
+    /// the next frame.
+    ///
+    /// The cache assumes the shared `FontSystem`'s font set is stable: a layout
+    /// shaped once is reused for any later block with the same content + metrics +
+    /// font + alignment. If you load a new font into the shared `FontSystem` after
+    /// text has been rendered (e.g. [`load_font_bytes`]), call this so blocks that
+    /// reference the new font re-shape against it — mirrors
+    /// [`TextMeasurer::clear_cache`].
+    pub fn clear_shape_cache(&mut self) {
+        self.shape_cache.clear();
     }
 
     /// Measure text using cosmic-text's shaping/layout path without touching GPU state.
@@ -345,13 +369,7 @@ impl TextRenderer {
     }
 
     fn font_key(&mut self, id: fontdb::ID) -> u64 {
-        if let Some(k) = self.font_keys.get(&id) {
-            return *k;
-        }
-        let k = self.next_font_key;
-        self.next_font_key += 1;
-        self.font_keys.insert(id, k);
-        k
+        resolve_font_key(&mut self.font_keys, &mut self.next_font_key, id)
     }
 
     /// Build glyph quads for all text blocks, generating any unseen glyphs into the
@@ -360,21 +378,60 @@ impl TextRenderer {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_text_shape").entered();
 
-        let fs_handle = Arc::clone(&self.font_system);
-        let mut fs = fs_handle.lock().expect("FontSystem poisoned");
         let px_range = self.atlas.px_range();
         let ref_px = self.atlas.ref_px();
+        self.shape_frame = self.shape_frame.wrapping_add(1);
+        let frame = self.shape_frame;
 
-        // First pass: shape every block and generate any unseen glyphs, collecting
-        // per-glyph placements. We resolve uv only *after* this pass, because glyph
-        // generation can grow the atlas (changing the size uv divides by) — pixel
-        // regions stay valid (top-left origin) but uv must use the final size.
+        // First pass: resolve every block to a list of `GlyphPlacement`s, shaping
+        // through cosmic-text only on a *cache miss*. The shaped relative layout
+        // is keyed by everything that affects it (content + metrics + font +
+        // align + ellipsize) and reused across frames, so unchanged labels skip
+        // the expensive re-shape entirely. We resolve uv only *after* this pass,
+        // because glyph generation can grow the atlas (changing the size uv
+        // divides by) — pixel regions stay valid (top-left origin) but uv must use
+        // the final size.
         let mut placements: Vec<GlyphPlacement> = Vec::new();
 
         for block in texts {
             if block.content.is_empty() {
                 continue;
             }
+
+            let key: ShapeKey = (
+                block.font_size.to_bits(),
+                block.line_height.to_bits(),
+                block.max_width.to_bits(),
+                family_hash(block.font.as_ref()),
+                block.align,
+                block.ellipsize,
+            );
+
+            // Fast path: a cached layout for this exact key + content. No
+            // FontSystem lock, no shaping — every cached glyph is already in the
+            // atlas (it never evicts), so `atlas.glyph` re-looks it up without
+            // touching font data. We only stamp the frame for working-set eviction.
+            if let Some(entry) = self
+                .shape_cache
+                .get_mut(&key)
+                .and_then(|inner| inner.get_mut(&block.content))
+            {
+                entry.last_used = frame;
+                append_placements(
+                    &mut self.atlas,
+                    &mut self.font_keys,
+                    &mut self.next_font_key,
+                    block,
+                    &entry.glyphs,
+                    &mut placements,
+                );
+                continue;
+            }
+
+            // Miss: shape now, recording the relative layout for future frames.
+            let fs_handle = Arc::clone(&self.font_system);
+            let mut fs = fs_handle.lock().expect("FontSystem poisoned");
+
             let family = block
                 .font
                 .as_ref()
@@ -420,47 +477,71 @@ impl TextRenderer {
             }
             buffer.shape_until_scroll(&mut fs, false);
 
-            let default_fill = color_to_rgba(block.color);
-            let clip = block.clip.map(|c| [c.x, c.y, c.width, c.height]);
-            let outline = block.outline.as_ref().map(|o| (color_to_rgba(o.color), o.width_px));
-            let shadow = block
-                .shadow
-                .as_ref()
-                .map(|s| (color_to_rgba(s.color), s.offset, s.softness));
-            let glow = block.glow.as_ref().map(|g| (color_to_rgba(g.color), g.radius_px));
-
+            // Collect the relative layout. Whitespace / outline-less glyphs yield
+            // no tile (atlas returns `None`) and are skipped — so every stored
+            // glyph is guaranteed present in the atlas on later frames.
+            let mut shaped: Vec<ShapedGlyph> = Vec::new();
             for run in buffer.layout_runs() {
                 for glyph in run.glyphs {
                     let font_size = glyph.font_size;
-                    // Pen origin on the baseline, in screen space (mirrors
-                    // cosmic-text's `glyph.physical((left, run.line_y), 1.0)`).
-                    let pen_x = block.x + glyph.x + font_size * glyph.x_offset;
-                    let baseline_y = block.y + run.line_y + glyph.y - font_size * glyph.y_offset;
+                    let rel_x = glyph.x + font_size * glyph.x_offset;
+                    let rel_y = run.line_y + glyph.y - font_size * glyph.y_offset;
 
-                    let font_key = self.font_key(glyph.font_id);
+                    let font_key =
+                        resolve_font_key(&mut self.font_keys, &mut self.next_font_key, glyph.font_id);
                     let Some(font) = fs.get_font(glyph.font_id) else {
                         continue;
                     };
-                    let Some(tile) = self.atlas.glyph(font_key, glyph.glyph_id, font.data()) else {
+                    if self
+                        .atlas
+                        .glyph(font_key, glyph.glyph_id, font.data())
+                        .is_none()
+                    {
                         continue; // whitespace / outline-less
-                    };
-
-                    let fill = glyph.color_opt.map(color_to_rgba).unwrap_or(default_fill);
-                    placements.push(GlyphPlacement {
-                        tile,
-                        pen_x,
-                        baseline_y,
+                    }
+                    shaped.push(ShapedGlyph {
+                        font_id: glyph.font_id,
+                        glyph_id: glyph.glyph_id,
+                        rel_x,
+                        rel_y,
                         font_size,
-                        clip,
-                        fill,
-                        outline,
-                        shadow,
-                        glow,
                     });
                 }
             }
+            drop(fs);
+
+            let entry = self
+                .shape_cache
+                .entry(key)
+                .or_default()
+                .entry(block.content.clone())
+                .or_insert(CachedShape {
+                    glyphs: Vec::new(),
+                    last_used: frame,
+                });
+            entry.glyphs = shaped;
+            entry.last_used = frame;
+            append_placements(
+                &mut self.atlas,
+                &mut self.font_keys,
+                &mut self.next_font_key,
+                block,
+                &entry.glyphs,
+                &mut placements,
+            );
         }
-        drop(fs);
+
+        // Evict layouts that fell out of the visible working set once the cache
+        // grows past its cap, so long-running UIs that cycle through many
+        // distinct strings don't grow it without bound. Entries touched this
+        // frame always survive.
+        let total: usize = self.shape_cache.values().map(|inner| inner.len()).sum();
+        if total > SHAPE_CACHE_MAX {
+            for inner in self.shape_cache.values_mut() {
+                inner.retain(|_, e| e.last_used == frame);
+            }
+            self.shape_cache.retain(|_, inner| !inner.is_empty());
+        }
 
         // Second pass: resolve uv against the final atlas size and emit quads in
         // back-to-front sweeps so every glyph's shadow/glow sits behind ALL fills:
@@ -668,6 +749,103 @@ fn color_to_rgba(c: Color) -> [f32; 4] {
         c.b() as f32 / 255.0,
         c.a() as f32 / 255.0,
     ]
+}
+
+/// One shaped glyph, **relative to the block origin**. The block's `x`/`y`,
+/// color, clip and effects are re-applied per frame at emit time, so this layout
+/// is identical for any block that shares the shaping key (content + metrics +
+/// font + align + ellipsize) and can be cached across frames — skipping the
+/// expensive cosmic-text re-shape that dominates large text-heavy frames.
+#[derive(Clone)]
+struct ShapedGlyph {
+    /// cosmic-text font id; resolved to a stable atlas font key + tile each frame.
+    font_id: fontdb::ID,
+    glyph_id: u16,
+    /// Pen x relative to `block.x`: `glyph.x + font_size * glyph.x_offset`.
+    rel_x: f32,
+    /// Baseline y relative to `block.y`: `run.line_y + glyph.y - font_size * glyph.y_offset`.
+    rel_y: f32,
+    /// Per-glyph font size (usually equals the block's, but cosmic-text reports
+    /// it per glyph, so we preserve it).
+    font_size: f32,
+}
+
+/// A cached relative layout for one shaping key, with a frame stamp used to evict
+/// entries that fall out of the visible working set.
+struct CachedShape {
+    glyphs: Vec<ShapedGlyph>,
+    last_used: u64,
+}
+
+/// Outer cache key: everything that affects shaped layout *except* the content
+/// string (which is the inner `HashMap` key, so hits borrow `&str` with no
+/// allocation — mirrors [`TextMeasurer`]). Scalars are stored as bit patterns so
+/// the key is `Hash + Eq`.
+type ShapeKey = (u32, u32, u32, u64, TextAlign, bool);
+
+/// Cap on cached shaping entries before stale ones are evicted. Text-heavy
+/// screens (tables, logs) carry more distinct labels than the measurer's 4096,
+/// so this is larger; eviction keeps only the current frame's working set.
+const SHAPE_CACHE_MAX: usize = 8192;
+
+/// Map a cosmic-text `fontdb::ID` to a stable atlas font key, assigning a fresh
+/// one on first sighting. Free function (rather than a `&mut self` method) so the
+/// `font_keys`/`next_font_key` fields can be borrowed disjointly from the rest of
+/// the renderer during shaping.
+fn resolve_font_key(
+    font_keys: &mut HashMap<fontdb::ID, u64>,
+    next_font_key: &mut u64,
+    id: fontdb::ID,
+) -> u64 {
+    if let Some(k) = font_keys.get(&id) {
+        return *k;
+    }
+    let k = *next_font_key;
+    *next_font_key += 1;
+    font_keys.insert(id, k);
+    k
+}
+
+/// Turn a block's cached relative glyph layout into `GlyphPlacement`s, applying
+/// the block's position, color, clip and effects. Shared by the cache-hit and
+/// cache-miss paths so both produce identical output. Takes the atlas / font-key
+/// fields by `&mut` (not `&mut self`) so the caller can hold a borrow into the
+/// shape cache simultaneously. Every glyph here is already in the atlas, so the
+/// `atlas.glyph` lookup needs no font data (`&[]`).
+fn append_placements(
+    atlas: &mut MsdfGlyphAtlas,
+    font_keys: &mut HashMap<fontdb::ID, u64>,
+    next_font_key: &mut u64,
+    block: &TextBlock,
+    shaped: &[ShapedGlyph],
+    out: &mut Vec<GlyphPlacement>,
+) {
+    let fill = color_to_rgba(block.color);
+    let clip = block.clip.map(|c| [c.x, c.y, c.width, c.height]);
+    let outline = block.outline.as_ref().map(|o| (color_to_rgba(o.color), o.width_px));
+    let shadow = block
+        .shadow
+        .as_ref()
+        .map(|s| (color_to_rgba(s.color), s.offset, s.softness));
+    let glow = block.glow.as_ref().map(|g| (color_to_rgba(g.color), g.radius_px));
+
+    for g in shaped {
+        let font_key = resolve_font_key(font_keys, next_font_key, g.font_id);
+        let Some(tile) = atlas.glyph(font_key, g.glyph_id, &[]) else {
+            continue; // present on every later frame; defensive only
+        };
+        out.push(GlyphPlacement {
+            tile,
+            pen_x: block.x + g.rel_x,
+            baseline_y: block.y + g.rel_y,
+            font_size: g.font_size,
+            clip,
+            fill,
+            outline,
+            shadow,
+            glow,
+        });
+    }
 }
 
 /// A glyph ready to be turned into quads, captured before uv resolution. Carries
@@ -1314,8 +1492,8 @@ impl TextBlock {
 mod tests {
     use super::{
         color_to_rgba, cosmic_align, ellipsize_to_width, field_reach, load_font_bytes,
-        measure_with_font_system, shared_font_system, text_cursor_positions, FontHandle, TextAlign,
-        TextBlock, TextMeasurer,
+        measure_with_font_system, shared_font_system, text_cursor_positions, FontHandle, MsdfVertex,
+        TextAlign, TextBlock, TextMeasurer, TextRenderer,
     };
     use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping};
 
@@ -1656,5 +1834,174 @@ mod tests {
             "should have position at byte 6 (end), got {indices:?}"
         );
         assert_eq!(pos.last().map(|(i, _)| *i), Some(6));
+    }
+
+    // ----- Shaped-text cache (GPU-gated, like the chrome parity test) -----
+
+    /// Build a headless `TextRenderer` + a loaded Noto font handle, or `None` if
+    /// no GPU adapter is available (so the `#[ignore]`d tests below no-op safely).
+    fn headless_renderer() -> Option<(wgpu::Device, wgpu::Queue, TextRenderer, FontHandle)> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("text-cache test device"),
+                ..Default::default()
+            },
+            None,
+        ))
+        .ok()?;
+        let fs = shared_font_system();
+        let font = load_font_bytes(&fs, notosans::REGULAR_TTF).expect("load noto");
+        let renderer = TextRenderer::with_font_system(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            fs,
+        );
+        Some((device, queue, renderer, font))
+    }
+
+    /// Total cached shaping entries across all outer keys.
+    fn cache_total(r: &TextRenderer) -> usize {
+        r.shape_cache.values().map(|inner| inner.len()).sum()
+    }
+
+    /// Reinterpret a vertex slice as raw bytes for exact-equality comparison
+    /// (`MsdfVertex` is `Pod` but not `PartialEq`).
+    fn vbytes(v: &[MsdfVertex]) -> &[u8] {
+        bytemuck::cast_slice(v)
+    }
+
+    fn label(text: &str, font: &FontHandle) -> TextBlock {
+        TextBlock::new(text, 40.0, 40.0)
+            .with_size(18.0)
+            .with_font(font.clone())
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn shape_cache_reuses_layout_and_matches_cold() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        let blocks = [label("Cached label", &font)];
+
+        // Cold: shapes and records exactly one entry.
+        let cold = r.build_vertices(&blocks);
+        assert_eq!(cache_total(&r), 1, "one shaping entry recorded");
+        assert!(!cold.is_empty(), "non-empty glyph geometry");
+
+        // Warm: served from the cache, byte-identical output, still one entry.
+        let warm = r.build_vertices(&blocks);
+        assert_eq!(cache_total(&r), 1, "warm frame adds no new entries");
+        assert_eq!(vbytes(&cold), vbytes(&warm), "cache must not change pixels");
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn moving_block_reuses_cache_and_shifts() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        let a = r.build_vertices(&[label("Move me", &font)]);
+        let mut moved = label("Move me", &font);
+        moved.x += 100.0;
+        moved.y += 50.0;
+        let b = r.build_vertices(&[moved]);
+
+        // Same key + content => still a single cache entry (a hit, not a re-shape).
+        assert_eq!(cache_total(&r), 1, "moved block reuses the cached layout");
+        assert_eq!(a.len(), b.len());
+        for (va, vb) in a.iter().zip(b.iter()) {
+            assert!((vb.position[0] - va.position[0] - 100.0).abs() < 1e-3);
+            assert!((vb.position[1] - va.position[1] - 50.0).abs() < 1e-3);
+            // Everything but position is unchanged: compare uv + fill.
+            assert_eq!(va.uv, vb.uv);
+            assert_eq!(va.fill, vb.fill);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn distinct_attributes_create_distinct_entries() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        // Each variant differs in exactly one keyed attribute, so each is a miss.
+        let base = label("Same", &font);
+        let mut bigger = label("Same", &font);
+        bigger.font_size = 24.0;
+        let mut narrower = label("Same", &font);
+        narrower.max_width = 20.0;
+        let mut centered = label("Same", &font);
+        centered.align = TextAlign::Center;
+        let mut clipped_ellipsis = label("Same", &font);
+        clipped_ellipsis.ellipsize = true;
+        let other_content = label("Different", &font);
+        let default_font = label("Same", &font).with_max_width(800.0);
+        let mut default_font = default_font;
+        default_font.font = None; // None vs Noto => different family hash
+
+        r.build_vertices(&[
+            base,
+            bigger,
+            narrower,
+            centered,
+            clipped_ellipsis,
+            other_content,
+            default_font,
+        ]);
+        assert_eq!(
+            cache_total(&r),
+            7,
+            "each distinct (content|size|width|align|ellipsize|font) is its own entry"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn eviction_prunes_to_working_set() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        // Frame 1: overflow the cap with distinct strings (same key, distinct
+        // content). All are used this frame, so the post-frame eviction retains
+        // them (nothing is stale yet).
+        let many: Vec<TextBlock> = (0..=super::SHAPE_CACHE_MAX)
+            .map(|i| label(&format!("e{i}"), &font))
+            .collect();
+        r.build_vertices(&many);
+        assert!(
+            cache_total(&r) > super::SHAPE_CACHE_MAX,
+            "frame 1 keeps the whole working set"
+        );
+
+        // Frame 2: a tiny working set. The cache is still over cap, so everything
+        // not touched this frame is evicted, leaving just the live entry.
+        r.build_vertices(&[label("e0", &font)]);
+        assert_eq!(cache_total(&r), 1, "stale entries pruned to the working set");
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn clear_shape_cache_forces_reshape_with_identical_result() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        let blocks = [label("Reshape", &font)];
+        let before = r.build_vertices(&blocks);
+        assert_eq!(cache_total(&r), 1);
+
+        r.clear_shape_cache();
+        assert_eq!(cache_total(&r), 0, "clear empties the cache");
+
+        let after = r.build_vertices(&blocks);
+        assert_eq!(cache_total(&r), 1, "re-shaped and re-cached");
+        assert_eq!(vbytes(&before), vbytes(&after), "re-shape is identical");
     }
 }
