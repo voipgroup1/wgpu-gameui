@@ -95,14 +95,21 @@ pub struct UiRenderer {
     // Decoded-image cache (path/key -> atlas sprite + dimensions)
     image_cache: ImageCache,
 
-    // Vertex buffers (grow as needed)
+    // Vertex buffers (grow as needed). Each `draw_*` call bump-allocates its
+    // slice at the running `*_offset` and advances it, so the many draws issued
+    // per submit (nine-slices + icons per layer, every layer) occupy disjoint
+    // regions instead of all aliasing offset 0 and reading the last write at
+    // draw time. Offsets reset to 0 each frame in `prepare_frame`.
     color_vbo: wgpu::Buffer,
     color_ibo: wgpu::Buffer,
     color_vbo_capacity: u64,
     color_ibo_capacity: u64,
+    color_vbo_offset: u64,
+    color_ibo_offset: u64,
 
     tex_vbo: wgpu::Buffer,
     tex_vbo_capacity: u64,
+    tex_vbo_offset: u64,
 
     // Text
     text_renderer: TextRenderer,
@@ -287,8 +294,11 @@ impl UiRenderer {
             color_ibo,
             color_vbo_capacity,
             color_ibo_capacity,
+            color_vbo_offset: 0,
+            color_ibo_offset: 0,
             tex_vbo,
             tex_vbo_capacity,
+            tex_vbo_offset: 0,
             text_renderer,
             warned_missing: RefCell::new(HashSet::new()),
         }
@@ -537,6 +547,11 @@ impl UiRenderer {
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         self.text_renderer.resize(viewport.0, viewport.1);
+        // Reset the per-frame bump cursors so this frame's draws start at 0.
+        self.color_vbo_offset = 0;
+        self.color_ibo_offset = 0;
+        self.tex_vbo_offset = 0;
+        self.text_renderer.begin_frame();
         self.flush_atlas(device, queue);
     }
 
@@ -680,13 +695,18 @@ impl UiRenderer {
         out
     }
 
+    /// Ensure the color vbo/ibo hold this pass's bytes at their running frame
+    /// offsets; returns `(vbo_offset, ibo_offset)` to write/draw at. Grows by
+    /// allocating a fresh buffer; earlier passes keep their old buffer (held by
+    /// the encoder) so their data stays valid.
     fn ensure_color_capacity(
         &mut self,
         device: &wgpu::Device,
         verts: usize,
         indices: usize,
-    ) {
-        let needed_v = (verts * std::mem::size_of::<Vertex>()) as u64;
+    ) -> (u64, u64) {
+        let v_off = self.color_vbo_offset;
+        let needed_v = v_off + (verts * std::mem::size_of::<Vertex>()) as u64;
         if needed_v > self.color_vbo_capacity {
             self.color_vbo_capacity = needed_v.next_power_of_two();
             self.color_vbo = device.create_buffer(&wgpu::BufferDescriptor {
@@ -696,7 +716,8 @@ impl UiRenderer {
                 mapped_at_creation: false,
             });
         }
-        let needed_i = (indices * std::mem::size_of::<u32>()) as u64;
+        let i_off = self.color_ibo_offset;
+        let needed_i = i_off + (indices * std::mem::size_of::<u32>()) as u64;
         if needed_i > self.color_ibo_capacity {
             self.color_ibo_capacity = needed_i.next_power_of_two();
             self.color_ibo = device.create_buffer(&wgpu::BufferDescriptor {
@@ -706,10 +727,15 @@ impl UiRenderer {
                 mapped_at_creation: false,
             });
         }
+        (v_off, i_off)
     }
 
-    fn ensure_tex_capacity(&mut self, device: &wgpu::Device, verts: usize) {
-        let needed = (verts * std::mem::size_of::<TexVertex>()) as u64;
+    /// Ensure the textured vbo holds this pass's bytes at its running frame
+    /// offset; returns the byte offset to write/draw at. Same grow semantics as
+    /// [`ensure_color_capacity`].
+    fn ensure_tex_capacity(&mut self, device: &wgpu::Device, verts: usize) -> u64 {
+        let off = self.tex_vbo_offset;
+        let needed = off + (verts * std::mem::size_of::<TexVertex>()) as u64;
         if needed > self.tex_vbo_capacity {
             self.tex_vbo_capacity = needed.next_power_of_two();
             self.tex_vbo = device.create_buffer(&wgpu::BufferDescriptor {
@@ -719,6 +745,7 @@ impl UiRenderer {
                 mapped_at_creation: false,
             });
         }
+        off
     }
 
     fn draw_color(
@@ -730,9 +757,11 @@ impl UiRenderer {
         verts: &[Vertex],
         indices: &[u32],
     ) {
-        self.ensure_color_capacity(device, verts.len(), indices.len());
-        queue.write_buffer(&self.color_vbo, 0, bytemuck::cast_slice(verts));
-        queue.write_buffer(&self.color_ibo, 0, bytemuck::cast_slice(indices));
+        let (v_off, i_off) = self.ensure_color_capacity(device, verts.len(), indices.len());
+        queue.write_buffer(&self.color_vbo, v_off, bytemuck::cast_slice(verts));
+        queue.write_buffer(&self.color_ibo, i_off, bytemuck::cast_slice(indices));
+        self.color_vbo_offset = v_off + (verts.len() * std::mem::size_of::<Vertex>()) as u64;
+        self.color_ibo_offset = i_off + (indices.len() * std::mem::size_of::<u32>()) as u64;
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui color pass"),
@@ -750,8 +779,10 @@ impl UiRenderer {
         });
         pass.set_pipeline(&self.color_pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.color_vbo.slice(..));
-        pass.set_index_buffer(self.color_ibo.slice(..), wgpu::IndexFormat::Uint32);
+        // Index 0 maps to the first vertex of this pass's slice (base_vertex 0
+        // + the sliced vertex buffer), so per-pass indices stay 0-based.
+        pass.set_vertex_buffer(0, self.color_vbo.slice(v_off..));
+        pass.set_index_buffer(self.color_ibo.slice(i_off..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
     }
 
@@ -763,8 +794,9 @@ impl UiRenderer {
         view: &wgpu::TextureView,
         verts: &[TexVertex],
     ) {
-        self.ensure_tex_capacity(device, verts.len());
-        queue.write_buffer(&self.tex_vbo, 0, bytemuck::cast_slice(verts));
+        let off = self.ensure_tex_capacity(device, verts.len());
+        queue.write_buffer(&self.tex_vbo, off, bytemuck::cast_slice(verts));
+        self.tex_vbo_offset = off + (verts.len() * std::mem::size_of::<TexVertex>()) as u64;
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui tex pass"),
@@ -783,7 +815,7 @@ impl UiRenderer {
         pass.set_pipeline(&self.tex_pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         pass.set_bind_group(1, &self.texture_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.tex_vbo.slice(..));
+        pass.set_vertex_buffer(0, self.tex_vbo.slice(off..));
         pass.draw(0..verts.len() as u32, 0..1);
     }
 }

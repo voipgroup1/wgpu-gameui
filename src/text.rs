@@ -156,6 +156,12 @@ pub struct TextRenderer {
 
     vbo: wgpu::Buffer,
     vbo_capacity: u64,
+    /// Bytes already used in `vbo` this frame. Each `render` pass writes at this
+    /// offset and advances it, so multiple text passes within one submit (e.g.
+    /// base layer + tooltip layer) occupy disjoint regions instead of all
+    /// aliasing offset 0 and reading the last-written data at draw time. Reset
+    /// to 0 by [`begin_frame`](Self::begin_frame) each frame.
+    vbo_offset: u64,
 
     /// Stable per-font keys for the atlas, assigned on first sighting. Decouples
     /// the atlas from cosmic-text's `fontdb::ID`.
@@ -276,6 +282,7 @@ impl TextRenderer {
             pipeline,
             vbo,
             vbo_capacity,
+            vbo_offset: 0,
             font_keys: HashMap::new(),
             next_font_key: 0,
             width: 1,
@@ -294,6 +301,13 @@ impl TextRenderer {
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
+    }
+
+    /// Reset the per-frame vertex-buffer cursor. Call once at the start of each
+    /// frame (before any [`render`](Self::render) pass) so the bump offset that
+    /// keeps multiple text passes from aliasing starts fresh.
+    pub fn begin_frame(&mut self) {
+        self.vbo_offset = 0;
     }
 
     /// Measure text using cosmic-text's shaping/layout path without touching GPU state.
@@ -594,8 +608,12 @@ impl TextRenderer {
         if verts.is_empty() {
             return;
         }
-        self.ensure_vbo_capacity(device, verts.len());
-        queue.write_buffer(&self.vbo, 0, bytemuck::cast_slice(&verts));
+        // Bump-allocate this pass's slice so it doesn't alias earlier passes in
+        // the same submit (which would all read the last write at draw time).
+        let vbytes = (verts.len() * std::mem::size_of::<MsdfVertex>()) as u64;
+        let offset = self.ensure_vbo_capacity(device, vbytes);
+        queue.write_buffer(&self.vbo, offset, bytemuck::cast_slice(&verts));
+        self.vbo_offset = offset + vbytes;
 
         #[cfg(feature = "tracy")]
         let _pass_span = tracing::info_span!("gameui_text_pass").entered();
@@ -616,12 +634,17 @@ impl TextRenderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
         pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.vbo.slice(..));
+        pass.set_vertex_buffer(0, self.vbo.slice(offset..));
         pass.draw(0..verts.len() as u32, 0..1);
     }
 
-    fn ensure_vbo_capacity(&mut self, device: &wgpu::Device, verts: usize) {
-        let needed = (verts * std::mem::size_of::<MsdfVertex>()) as u64;
+    /// Ensure `vbo` can hold `bytes` starting at the current frame offset, and
+    /// return the byte offset to write/draw this pass at. Grows by allocating a
+    /// fresh buffer when needed; earlier passes keep referencing the old buffer
+    /// (held alive by the encoder), so their data stays valid.
+    fn ensure_vbo_capacity(&mut self, device: &wgpu::Device, bytes: u64) -> u64 {
+        let offset = self.vbo_offset;
+        let needed = offset + bytes;
         if needed > self.vbo_capacity {
             self.vbo_capacity = needed.next_power_of_two();
             self.vbo = device.create_buffer(&wgpu::BufferDescriptor {
@@ -631,6 +654,7 @@ impl TextRenderer {
                 mapped_at_creation: false,
             });
         }
+        offset
     }
 }
 
