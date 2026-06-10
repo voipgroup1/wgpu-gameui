@@ -149,6 +149,33 @@ impl Affine2 {
         Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
     }
 
+    /// The inverse transform: `self.compose(&self.inverse())` is the identity.
+    /// Returns [`IDENTITY`](Self::IDENTITY) for a degenerate (zero-determinant)
+    /// transform rather than producing NaNs.
+    ///
+    /// Maps world-space coordinates back into the current local frame — e.g. a
+    /// widget handed a world-space rect that the draw list will re-transform
+    /// needs the *local* rect (and local mouse) to draw and hit-test correctly.
+    pub fn inverse(&self) -> Self {
+        let det = self.determinant();
+        if det.abs() < 1e-12 {
+            return Self::IDENTITY;
+        }
+        let inv_det = 1.0 / det;
+        let ia = self.d * inv_det;
+        let ib = -self.b * inv_det;
+        let ic = -self.c * inv_det;
+        let id = self.a * inv_det;
+        Self {
+            a: ia,
+            b: ib,
+            tx: -(ia * self.tx + ib * self.ty),
+            c: ic,
+            d: id,
+            ty: -(ic * self.tx + id * self.ty),
+        }
+    }
+
     /// Transform the four corners of a rect, returning them in TL, TR, BR, BL
     /// order (matching the per-vertex order used by `quad`/`icon`).
     pub fn transform_rect_corners(&self, rect: Rect) -> [[f32; 2]; 4] {
@@ -197,6 +224,29 @@ mod tests {
     fn scale_transforms_point() {
         let s = Affine2::scale(2.0, 3.0);
         assert_eq!(s.transform_point([4.0, 5.0]), [8.0, 15.0]);
+    }
+
+    #[test]
+    fn inverse_roundtrips_translate_scale() {
+        // translate then scale (the kind of stack the UI builds)
+        let t = Affine2::translation(10.0, 20.0).compose(&Affine2::scale(2.0, 4.0));
+        let inv = t.inverse();
+        let p = [3.0, 5.0];
+        let back = inv.transform_point(t.transform_point(p));
+        assert!(point_approx(back, p), "got {back:?}");
+        // compose(inverse) == identity
+        let id = t.compose(&inv);
+        assert!(point_approx(id.transform_point([7.0, -2.0]), [7.0, -2.0]));
+    }
+
+    #[test]
+    fn inverse_of_identity_is_identity() {
+        assert_eq!(Affine2::IDENTITY.inverse(), Affine2::IDENTITY);
+    }
+
+    #[test]
+    fn inverse_of_degenerate_is_identity() {
+        assert_eq!(Affine2::scale(0.0, 0.0).inverse(), Affine2::IDENTITY);
     }
 
     #[test]
