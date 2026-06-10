@@ -8,9 +8,9 @@
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    Checkbox, ColumnWidth, DragCapture, InputState, LayerStack, ProgressBar, ScrollState,
-    ScrollView, Slider, Table, TableCell, TableColumn, Tabs, TextAlign, TextBlock, TextInput,
-    Theme, TooltipContent, TooltipLayer, UiRenderer,
+    Checkbox, ColumnWidth, DragCapture, ImageButton, ImageFit, InputState, LayerStack, ProgressBar,
+    ScrollState, ScrollView, Slider, Table, TableCell, TableColumn, Tabs, TextAlign, TextBlock,
+    TextInput, Theme, TooltipContent, TooltipLayer, UiRenderer,
 };
 
 const W: u32 = 800;
@@ -328,6 +328,27 @@ fn render_widget_gallery() {
         TextBlock::new("Rect outline", 28.0, 606.0)
             .with_size(12.0)
             .with_color(200, 210, 230),
+    );
+
+    // ImageButton: chrome / bare / disabled variants (draw returns clicked).
+    ImageButton::sprite(icon_sprite)
+        .fit(ImageFit::Contain)
+        .natural_size(32.0, 32.0)
+        .draw(Rect::new(200.0, 595.0, 40.0, 40.0), &mut *list, &theme, &input);
+    ImageButton::sprite(icon_sprite)
+        .bare()
+        .fit(ImageFit::Contain)
+        .natural_size(32.0, 32.0)
+        .draw(Rect::new(250.0, 595.0, 40.0, 40.0), &mut *list, &theme, &input);
+    ImageButton::sprite(icon_sprite)
+        .enabled(false)
+        .fit(ImageFit::Contain)
+        .natural_size(32.0, 32.0)
+        .draw(Rect::new(300.0, 595.0, 40.0, 40.0), &mut *list, &theme, &input);
+    list.text(
+        TextBlock::new("ImageButton: chrome / bare / disabled", 200.0, 640.0)
+            .with_size(11.0)
+            .with_color(180, 190, 210),
     );
 
     // =====================================================================

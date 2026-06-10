@@ -84,7 +84,13 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `ImageAlign`, tint, and automatic UV cropping for `Cover` (via
       `DrawList::image_cropped`). Natural size supplied by the caller (from
       `UiRenderer::image_size`); aspect fits fall back to Stretch without it.
-- [ ] **P1 — Image / icon button** (`UiImageButton`/`UiButtonImageBox`).
+- [x] **P1 — Image / icon button.** `ImageButton`
+      (`src/widgets/image_button.rs`) layers the `Image` widget (full
+      `ImageFit`/`ImageAlign`/tint) over `Button`-style chrome with
+      hover/press/disabled feedback, returning a click bool like `Button`.
+      `.bare()` drops the chrome (image is the hit target, overlay-only
+      feedback); `.padding()` insets the image. Disabled dims via overlay so
+      string-key sources without tint still read as disabled.
 - [ ] **P1 — Radio button group.**
 - [ ] **P1 — Tree view / collapsing header.**
 - [ ] **P1 — Number input / spin box** with validation. TextInput is raw text.
