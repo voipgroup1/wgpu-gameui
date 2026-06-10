@@ -402,6 +402,33 @@ fn render_widget_gallery() {
             .natural_size(48.0, 48.0)
             .draw(r, list, &theme, &input);
 
+        // ---- Instanced chrome (SDF rounded-rect) ------------------------
+        // Every `Button` already routes its background+border through the
+        // instanced `chrome_rect` path; this section makes the batching
+        // explicit (a strip of same-shape buttons collapses to one base mesh +
+        // N instances) and shows the rotated-transform fallback still renders.
+        flow.section(list, "Instanced chrome");
+
+        for i in 0..6 {
+            let r = flow.cell(list, "", 70.0, 30.0);
+            Button::new(format!("#{i}")).draw(r, list, &theme, &input);
+        }
+
+        // Rotated chrome: `chrome_rect` can't express a rotation as a single
+        // axis-aligned instance, so it falls back to immediate tessellation.
+        let r = flow.cell(list, "Rotated (fallback)", 80.0, 40.0);
+        list.push_transform();
+        list.translate(r.x + r.width / 2.0, r.y + r.height / 2.0);
+        list.rotate(0.18);
+        list.chrome_rect(
+            Rect::new(-r.width / 2.0, -r.height / 2.0, r.width, r.height),
+            8.0,
+            2.0,
+            [0.30, 0.55, 0.35, 1.0],
+            [0.80, 0.90, 0.80, 1.0],
+        );
+        list.pop_transform();
+
         // Tooltip target last: its popup floats down-and-right into the empty
         // headroom below, overlapping no other widget.
         let r = flow.cell(list, "Tooltip target", 120.0, 24.0);

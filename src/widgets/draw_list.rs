@@ -62,6 +62,46 @@ pub struct IconDraw {
     pub src: Option<[f32; 4]>,
 }
 
+/// A single instanced "chrome" rect (button background + border) for the SDF
+/// rounded-rect pipeline.
+///
+/// Field layout matches the per-instance vertex attributes in `ui.wgsl`
+/// (`vs_chrome`), so a `&[ChromeInstance]` uploads straight to the instance
+/// buffer with no repacking. All geometry is computed in the fragment shader
+/// from these values, which is why thousands of identical-shape buttons collapse
+/// to one base mesh + N small records instead of re-tessellating ~80 verts each.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ChromeInstance {
+    /// World-space rect: `[x, y, w, h]` (transform already baked in).
+    pub rect: [f32; 4],
+    /// Fill (background) color, tint already applied.
+    pub bg: [f32; 4],
+    /// Border color, tint already applied.
+    pub border: [f32; 4],
+    /// Clip rect `[x, y, w, h]` (ignored unless `params[2] > 0.5`).
+    pub clip: [f32; 4],
+    /// `[corner_radius, border_thickness, clip_enabled, _pad]`.
+    pub params: [f32; 4],
+}
+
+/// One entry in a [`DrawList`]'s ordered color-stage command stream.
+///
+/// The colored-quad stage is no longer a single soup draw: chrome rects are
+/// instanced and must interleave with surrounding soup geometry in submission
+/// order (a hover overlay quad drawn *over* a button, a panel *under* it). The
+/// renderer walks these in order, drawing each soup index sub-range with the
+/// color pipeline and each chrome instance sub-range with the instanced chrome
+/// pipeline. When no `chrome_rect` is ever called the stream stays empty and the
+/// renderer keeps its original single-draw fast path.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ColorCmd {
+    /// Draw soup index positions `start..end` (absolute into `indices`).
+    Soup { indices: std::ops::Range<u32> },
+    /// Draw chrome instances `start..end` (into `chrome_instances`).
+    Chrome { instances: std::ops::Range<u32> },
+}
+
 /// Opaque handle to a registered nine-slice resource.
 pub type NineSliceId = u32;
 
@@ -96,6 +136,16 @@ pub struct DrawList {
     pub texts: Vec<TextBlock>,
     pub icons: Vec<IconDraw>,
     pub nine_slices: Vec<NineSliceDraw>,
+    /// Instanced chrome rects (button backgrounds/borders). Drawn by the chrome
+    /// pipeline; interleaved with soup geometry via [`DrawList::color_cmds`].
+    pub chrome_instances: Vec<ChromeInstance>,
+    /// Ordered color-stage command stream (soup runs interleaved with chrome
+    /// instance runs). Empty unless [`DrawList::chrome_rect`] was used, in which
+    /// case the renderer falls back to a single soup draw.
+    pub(crate) color_cmds: Vec<ColorCmd>,
+    /// Count of soup index positions already committed to a `Soup` command. Soup
+    /// appended after the last command is the implicit trailing run.
+    pub(crate) soup_committed_indices: u32,
     pub(crate) text_measurer: TextMeasurer,
     clip_stack: Vec<Rect>,
     transform_stack: Vec<Affine2>,
@@ -113,6 +163,9 @@ impl Default for DrawList {
             texts: Vec::new(),
             icons: Vec::new(),
             nine_slices: Vec::new(),
+            chrome_instances: Vec::new(),
+            color_cmds: Vec::new(),
+            soup_committed_indices: 0,
             text_measurer: TextMeasurer::default(),
             clip_stack: Vec::new(),
             transform_stack: vec![Affine2::IDENTITY],
@@ -147,6 +200,9 @@ impl DrawList {
             texts: Vec::new(),
             icons: Vec::new(),
             nine_slices: Vec::new(),
+            chrome_instances: Vec::new(),
+            color_cmds: Vec::new(),
+            soup_committed_indices: 0,
             text_measurer: TextMeasurer::with_font_system(font_system),
             clip_stack: Vec::new(),
             transform_stack: vec![Affine2::IDENTITY],
@@ -161,6 +217,9 @@ impl DrawList {
         self.texts.clear();
         self.icons.clear();
         self.nine_slices.clear();
+        self.chrome_instances.clear();
+        self.color_cmds.clear();
+        self.soup_committed_indices = 0;
         self.clip_stack.clear();
         self.transform_stack.clear();
         self.transform_stack.push(Affine2::IDENTITY);
@@ -647,6 +706,94 @@ impl DrawList {
             seg,
             color,
         );
+    }
+
+    /// Draw a rounded-rect "chrome" panel (button background + border) via the
+    /// **instanced SDF pipeline** when possible, rather than tessellating ~80
+    /// vertices into the soup every frame.
+    ///
+    /// Fast path (active transform is translation-only): records a single
+    /// [`ChromeInstance`] — world rect, tinted `bg`/`border`, current clip,
+    /// `radius`/`thickness` — that the renderer rasterizes from a signed
+    /// distance field. Thousands of same-shape buttons collapse to one base
+    /// mesh + N instances, with anti-aliased corners for free.
+    ///
+    /// Fallback (any rotation/scale/shear in the transform): defers to the
+    /// immediate [`DrawList::rounded_rect`] + [`DrawList::rounded_rect_outline`]
+    /// so a transformed chrome rect still renders correctly. The SDF instance
+    /// carries only an axis-aligned world rect, so non-translation transforms
+    /// can't be expressed as a single instance.
+    ///
+    /// Ordering with surrounding soup geometry is preserved: each call flushes
+    /// any pending soup into a command before recording its instance.
+    pub fn chrome_rect(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        thickness: f32,
+        bg: [f32; 4],
+        border: [f32; 4],
+    ) {
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+
+        let m = self.current_transform();
+        if !m.is_translate_only() {
+            // Fallback: build it out of the immediate primitives, which already
+            // run every vertex through the active transform.
+            if radius > 0.0 {
+                self.rounded_rect(rect, radius, bg);
+            } else {
+                self.quad(rect.x, rect.y, rect.width, rect.height, bg);
+            }
+            if thickness > 0.0 {
+                self.rounded_rect_outline(rect, radius, thickness, border);
+            }
+            return;
+        }
+
+        // Fast path: one instance. Close out any soup recorded since the last
+        // command so draw order (soup → this chrome) is preserved.
+        self.flush_soup();
+
+        let (clip, clip_enabled) = match self.current_clip() {
+            Some(c) => ([c.x, c.y, c.width, c.height], 1.0),
+            None => ([0.0; 4], 0.0),
+        };
+        let inst = ChromeInstance {
+            rect: [rect.x + m.tx, rect.y + m.ty, rect.width, rect.height],
+            bg: self.apply_tint(bg),
+            border: self.apply_tint(border),
+            clip,
+            params: [radius, thickness, clip_enabled, 0.0],
+        };
+        let idx = self.chrome_instances.len() as u32;
+        self.chrome_instances.push(inst);
+
+        // Extend the trailing chrome run if this instance is contiguous with it,
+        // otherwise start a new run.
+        match self.color_cmds.last_mut() {
+            Some(ColorCmd::Chrome { instances }) if instances.end == idx => {
+                instances.end = idx + 1;
+            }
+            _ => self
+                .color_cmds
+                .push(ColorCmd::Chrome { instances: idx..idx + 1 }),
+        }
+    }
+
+    /// Commit soup geometry appended since the last command into a `Soup`
+    /// command, so a following chrome instance draws after it. No-op if nothing
+    /// new was appended.
+    fn flush_soup(&mut self) {
+        let total = self.indices.len() as u32;
+        if total > self.soup_committed_indices {
+            self.color_cmds.push(ColorCmd::Soup {
+                indices: self.soup_committed_indices..total,
+            });
+            self.soup_committed_indices = total;
+        }
     }
 
     /// Emit a thick arc band between `inner` and `outer` radius from
@@ -1222,6 +1369,156 @@ mod tests {
         let c = list.icons[0].corners;
         assert_eq!(c[0], [10.0, 10.0]);
         assert_eq!(c[2], [30.0, 30.0]);
+    }
+
+    // ---- chrome_rect (instanced SDF) tests ----
+
+    #[test]
+    fn chrome_rect_fast_path_records_one_instance() {
+        let mut list = DrawList::new();
+        list.chrome_rect(
+            Rect::new(10.0, 20.0, 80.0, 30.0),
+            6.0,
+            2.0,
+            [0.1, 0.2, 0.3, 1.0],
+            [0.4, 0.5, 0.6, 1.0],
+        );
+        // One instance, one Chrome command, no soup geometry.
+        assert_eq!(list.chrome_instances.len(), 1);
+        assert_eq!(
+            list.color_cmds,
+            vec![super::ColorCmd::Chrome { instances: 0..1 }]
+        );
+        assert!(list.vertices.is_empty());
+        let inst = list.chrome_instances[0];
+        assert_eq!(inst.rect, [10.0, 20.0, 80.0, 30.0]);
+        assert_eq!(inst.bg, [0.1, 0.2, 0.3, 1.0]);
+        assert_eq!(inst.border, [0.4, 0.5, 0.6, 1.0]);
+        assert_eq!(inst.params, [6.0, 2.0, 0.0, 0.0]); // radius, thickness, no clip
+    }
+
+    #[test]
+    fn chrome_rect_bakes_translation_into_world_rect() {
+        let mut list = DrawList::new();
+        list.translate(100.0, 50.0);
+        list.chrome_rect(Rect::new(5.0, 5.0, 20.0, 10.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        assert_eq!(list.chrome_instances[0].rect, [105.0, 55.0, 20.0, 10.0]);
+    }
+
+    #[test]
+    fn chrome_rect_consecutive_calls_batch_into_one_run() {
+        let mut list = DrawList::new();
+        for i in 0..4 {
+            list.chrome_rect(
+                Rect::new(i as f32 * 10.0, 0.0, 8.0, 8.0),
+                4.0,
+                1.0,
+                [1.0; 4],
+                [0.0; 4],
+            );
+        }
+        assert_eq!(list.chrome_instances.len(), 4);
+        // All four collapse into a single contiguous Chrome run.
+        assert_eq!(
+            list.color_cmds,
+            vec![super::ColorCmd::Chrome { instances: 0..4 }]
+        );
+    }
+
+    #[test]
+    fn chrome_rect_interleaves_with_soup_in_order() {
+        let mut list = DrawList::new();
+        // soup, chrome, soup, chrome
+        list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]); // 6 indices
+        list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
+        list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]); // 6 more indices
+        list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
+        assert_eq!(
+            list.color_cmds,
+            vec![
+                super::ColorCmd::Soup { indices: 0..6 },
+                super::ColorCmd::Chrome { instances: 0..1 },
+                super::ColorCmd::Soup { indices: 6..12 },
+                super::ColorCmd::Chrome { instances: 1..2 },
+            ]
+        );
+        // Trailing soup (after the last command) is implicit: committed cursor
+        // sits at the last flush, anything past it is the trailing run.
+        assert_eq!(list.soup_committed_indices, 12);
+        assert_eq!(list.indices.len(), 12);
+    }
+
+    #[test]
+    fn chrome_rect_trailing_soup_left_uncommitted() {
+        let mut list = DrawList::new();
+        list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
+        list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]); // soup after chrome
+        // The trailing quad is NOT in a command; the renderer draws
+        // indices[committed..total] as the trailing run.
+        assert_eq!(
+            list.color_cmds,
+            vec![super::ColorCmd::Chrome { instances: 0..1 }]
+        );
+        assert_eq!(list.soup_committed_indices, 0);
+        assert_eq!(list.indices.len(), 6);
+    }
+
+    #[test]
+    fn chrome_rect_falls_back_to_soup_under_rotation() {
+        let mut list = DrawList::new();
+        list.rotate(std::f32::consts::FRAC_PI_4);
+        list.chrome_rect(Rect::new(0.0, 0.0, 40.0, 20.0), 6.0, 2.0, [1.0; 4], [0.5; 4]);
+        // No instance recorded; geometry went into the soup, transformed.
+        assert!(list.chrome_instances.is_empty());
+        assert!(list.color_cmds.is_empty());
+        assert!(!list.vertices.is_empty());
+    }
+
+    #[test]
+    fn chrome_rect_applies_tint() {
+        let mut list = DrawList::new();
+        list.set_tint([0.5, 0.5, 0.5, 1.0]);
+        list.chrome_rect(
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            0.0,
+            1.0,
+            [0.4, 0.6, 0.8, 1.0],
+            [0.2, 0.2, 0.2, 1.0],
+        );
+        let inst = list.chrome_instances[0];
+        assert!(approx(inst.bg[0], 0.2) && approx(inst.bg[1], 0.3) && approx(inst.bg[2], 0.4));
+        assert!(approx(inst.border[0], 0.1));
+    }
+
+    #[test]
+    fn chrome_rect_records_active_clip() {
+        let mut list = DrawList::new();
+        list.push_clip(Rect::new(5.0, 6.0, 30.0, 40.0));
+        list.chrome_rect(Rect::new(0.0, 0.0, 10.0, 10.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        let inst = list.chrome_instances[0];
+        assert_eq!(inst.clip, [5.0, 6.0, 30.0, 40.0]);
+        assert_eq!(inst.params[2], 1.0); // clip_enabled
+    }
+
+    #[test]
+    fn chrome_rect_zero_size_draws_nothing() {
+        let mut list = DrawList::new();
+        list.chrome_rect(Rect::new(0.0, 0.0, 0.0, 10.0), 4.0, 1.0, [1.0; 4], [0.0; 4]);
+        assert!(list.chrome_instances.is_empty());
+        assert!(list.color_cmds.is_empty());
+    }
+
+    #[test]
+    fn clear_resets_chrome_state() {
+        let mut list = DrawList::new();
+        list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]);
+        list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
+        assert!(!list.chrome_instances.is_empty());
+        assert!(!list.color_cmds.is_empty());
+        list.clear();
+        assert!(list.chrome_instances.is_empty());
+        assert!(list.color_cmds.is_empty());
+        assert_eq!(list.soup_committed_indices, 0);
     }
 
     #[test]

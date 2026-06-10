@@ -53,20 +53,27 @@ impl ButtonVisual {
 /// (0 => square) via [`DrawList::rounded_rect`]/[`DrawList::rounded_rect_outline`].
 pub(crate) fn draw_chrome(list: &mut DrawList, theme: &Theme, rect: Rect, v: &ButtonVisual) {
     let bg = v.bg_color(theme);
-    if theme.border_radius > 0.0 {
-        list.rounded_rect(rect, theme.border_radius, bg);
+    let border_color = if v.hovered && v.enabled {
+        theme.accent
     } else {
-        list.quad(rect.x, rect.y, rect.width, rect.height, bg);
-    }
-
-    if theme.border_width > 0.0 {
-        let border_color = if v.hovered && v.enabled {
-            theme.accent
-        } else {
-            theme.button_border
-        };
-        list.rounded_rect_outline(rect, theme.border_radius, theme.border_width, border_color);
-    }
+        theme.button_border
+    };
+    // One instanced SDF rounded-rect carries fill + border. When the border is
+    // disabled (`border_width == 0`) a transparent border color collapses the
+    // SDF to a plain fill. `chrome_rect` falls back to immediate tessellation
+    // under a rotated/scaled transform, so correctness is universal.
+    let border = if theme.border_width > 0.0 {
+        border_color
+    } else {
+        [0.0, 0.0, 0.0, 0.0]
+    };
+    list.chrome_rect(
+        rect,
+        theme.border_radius,
+        theme.border_width,
+        bg,
+        border,
+    );
 }
 
 /// Draw the bare-button feedback overlay (no background/border): a dim for
@@ -268,12 +275,13 @@ mod tests {
         Button::new("Go")
             .bare()
             .draw(rect(), &mut bare, &theme, &input);
-        // Idle chrome draws a background + border the bare idle variant omits.
+        // Chrome records one instanced rounded-rect (background + border) that
+        // the bare idle variant omits entirely (no chrome, no overlay when idle).
+        assert_eq!(chrome.chrome_instances.len(), 1, "chrome draws one instance");
+        assert!(bare.chrome_instances.is_empty(), "bare draws no chrome");
         assert!(
-            chrome.vertices.len() > bare.vertices.len(),
-            "chrome ({}) should add geometry over bare ({})",
-            chrome.vertices.len(),
-            bare.vertices.len()
+            bare.vertices.is_empty(),
+            "bare idle draws no background geometry"
         );
     }
 

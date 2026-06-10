@@ -10,7 +10,7 @@ use crate::layer::LayerStack;
 use crate::render::atlas::{SpriteAtlas, SpriteId};
 use crate::render::image_cache::{decode_rgba8, ImageCache, ImageEntry, ImageError};
 use crate::text::FontSystemHandle;
-use crate::widgets::{DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex};
+use crate::widgets::{ChromeInstance, ColorCmd, DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex};
 use crate::TextRenderer;
 
 const SHADER: &str = include_str!("ui.wgsl");
@@ -70,11 +70,31 @@ const COLOR_VERTEX_ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array
     3 => Float32,
 ];
 
+/// Base unit-quad vertex (one attribute: the corner in `[0,1]²`).
+const CHROME_BASE_ATTRIBS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![
+    0 => Float32x2,
+];
+
+/// Per-instance chrome attributes — matches [`ChromeInstance`] / `vs_chrome`.
+const CHROME_INSTANCE_ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    1 => Float32x4, // rect
+    2 => Float32x4, // bg
+    3 => Float32x4, // border
+    4 => Float32x4, // clip
+    5 => Float32x4, // params (radius, thickness, clip_enabled, _pad)
+];
+
+/// Unit-quad corners (TL, TR, BR, BL) for the chrome base mesh.
+const CHROME_BASE_VERTS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+/// Two triangles for the unit quad above.
+const CHROME_BASE_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
+
 /// Public renderer.
 pub struct UiRenderer {
     // Pipelines
     color_pipeline: wgpu::RenderPipeline,
     tex_pipeline: wgpu::RenderPipeline,
+    chrome_pipeline: wgpu::RenderPipeline,
 
     // Uniforms (shared by both pipelines via group(0))
     uniform_buffer: wgpu::Buffer,
@@ -110,6 +130,14 @@ pub struct UiRenderer {
     tex_vbo: wgpu::Buffer,
     tex_vbo_capacity: u64,
     tex_vbo_offset: u64,
+
+    // Instanced chrome: a persistent unit-quad base mesh + a growing per-frame
+    // instance buffer (bump offset like the others, reset in `prepare_frame`).
+    chrome_base_vbo: wgpu::Buffer,
+    chrome_base_ibo: wgpu::Buffer,
+    chrome_inst_buffer: wgpu::Buffer,
+    chrome_inst_capacity: u64,
+    chrome_inst_offset: u64,
 
     // Text
     text_renderer: TextRenderer,
@@ -244,6 +272,63 @@ impl UiRenderer {
             cache: None,
         });
 
+        // Chrome (instanced SDF rounded-rect) pipeline. Shares the ortho uniform
+        // (group 0); no texture. Two vertex buffers: unit-quad base + instances.
+        let chrome_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ui chrome pipeline layout"),
+                bind_group_layouts: &[&uniform_bgl],
+                push_constant_ranges: &[],
+            });
+
+        let chrome_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ui chrome pipeline"),
+            layout: Some(&chrome_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_chrome"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &CHROME_BASE_ATTRIBS,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<ChromeInstance>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &CHROME_INSTANCE_ATTRIBS,
+                    },
+                ],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_chrome"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let chrome_base_vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ui chrome base vbo"),
+            contents: bytemuck::cast_slice(&CHROME_BASE_VERTS),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let chrome_base_ibo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ui chrome base ibo"),
+            contents: bytemuck::cast_slice(&CHROME_BASE_INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
         // Initial dynamic buffers — sized for a typical frame; grow on demand.
         let color_vbo_capacity = (4096 * std::mem::size_of::<Vertex>()) as u64;
         let color_ibo_capacity = (8192 * std::mem::size_of::<u32>()) as u64;
@@ -276,9 +361,18 @@ impl UiRenderer {
 
         let current_atlas_size = atlas.width();
 
+        let chrome_inst_capacity = (1024 * std::mem::size_of::<ChromeInstance>()) as u64;
+        let chrome_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui chrome inst buffer"),
+            size: chrome_inst_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             color_pipeline,
             tex_pipeline,
+            chrome_pipeline,
             uniform_buffer,
             uniform_bind_group,
             atlas,
@@ -299,6 +393,11 @@ impl UiRenderer {
             tex_vbo,
             tex_vbo_capacity,
             tex_vbo_offset: 0,
+            chrome_base_vbo,
+            chrome_base_ibo,
+            chrome_inst_buffer,
+            chrome_inst_capacity,
+            chrome_inst_offset: 0,
             text_renderer,
             warned_missing: RefCell::new(HashSet::new()),
         }
@@ -551,6 +650,7 @@ impl UiRenderer {
         self.color_vbo_offset = 0;
         self.color_ibo_offset = 0;
         self.tex_vbo_offset = 0;
+        self.chrome_inst_offset = 0;
         self.text_renderer.begin_frame();
         self.flush_atlas(device, queue);
     }
@@ -581,19 +681,24 @@ impl UiRenderer {
             }
         }
 
-        // ---------- 2. Colored quads ----------
+        // ---------- 2. Colored quads (+ instanced chrome) ----------
         {
             #[cfg(feature = "tracy")]
             let _s = tracing::info_span!("gameui_color_quads").entered();
-            if !draw_list.vertices.is_empty() && !draw_list.indices.is_empty() {
-                self.draw_color(
-                    device,
-                    queue,
-                    encoder,
-                    view,
-                    &draw_list.vertices,
-                    &draw_list.indices,
-                );
+            if draw_list.color_cmds.is_empty() {
+                // No chrome instances recorded: original single-draw fast path.
+                if !draw_list.vertices.is_empty() && !draw_list.indices.is_empty() {
+                    self.draw_color(
+                        device,
+                        queue,
+                        encoder,
+                        view,
+                        &draw_list.vertices,
+                        &draw_list.indices,
+                    );
+                }
+            } else {
+                self.draw_color_interleaved(device, queue, encoder, view, draw_list);
             }
         }
 
@@ -784,6 +889,113 @@ impl UiRenderer {
         pass.set_vertex_buffer(0, self.color_vbo.slice(v_off..));
         pass.set_index_buffer(self.color_ibo.slice(i_off..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+    }
+
+    /// Ensure the chrome instance buffer holds `count` instances at its running
+    /// frame offset; returns the byte offset to write/draw at. Same grow
+    /// semantics as [`ensure_tex_capacity`].
+    fn ensure_chrome_capacity(&mut self, device: &wgpu::Device, count: usize) -> u64 {
+        let off = self.chrome_inst_offset;
+        let needed = off + (count * std::mem::size_of::<ChromeInstance>()) as u64;
+        if needed > self.chrome_inst_capacity {
+            self.chrome_inst_capacity = needed.next_power_of_two();
+            self.chrome_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ui chrome inst buffer"),
+                size: self.chrome_inst_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        off
+    }
+
+    /// Render the colored stage as an ordered interleave of soup index runs and
+    /// instanced chrome runs (see [`ColorCmd`]). Soup + instances are each
+    /// uploaded once at their frame bump offsets, then a single render pass
+    /// issues the draws in submission order so layering is preserved.
+    fn draw_color_interleaved(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        draw_list: &DrawList,
+    ) {
+        let verts = &draw_list.vertices;
+        let indices = &draw_list.indices;
+        let instances = &draw_list.chrome_instances;
+
+        // Upload the whole soup once. Soup indices are absolute, so binding the
+        // full sliced vbo/ibo with base_vertex 0 lets each `Soup` sub-range draw
+        // its slice directly.
+        let (v_off, i_off) = if !indices.is_empty() {
+            let (v_off, i_off) = self.ensure_color_capacity(device, verts.len(), indices.len());
+            queue.write_buffer(&self.color_vbo, v_off, bytemuck::cast_slice(verts));
+            queue.write_buffer(&self.color_ibo, i_off, bytemuck::cast_slice(indices));
+            self.color_vbo_offset = v_off + (verts.len() * std::mem::size_of::<Vertex>()) as u64;
+            self.color_ibo_offset = i_off + (indices.len() * std::mem::size_of::<u32>()) as u64;
+            (v_off, i_off)
+        } else {
+            (0, 0)
+        };
+
+        // Upload all chrome instances once.
+        let inst_off = if !instances.is_empty() {
+            let off = self.ensure_chrome_capacity(device, instances.len());
+            queue.write_buffer(&self.chrome_inst_buffer, off, bytemuck::cast_slice(instances));
+            self.chrome_inst_offset =
+                off + (instances.len() * std::mem::size_of::<ChromeInstance>()) as u64;
+            off
+        } else {
+            0
+        };
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ui color+chrome pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+
+        // Draw a soup index sub-range with the color pipeline.
+        let draw_soup = |pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>| {
+            pass.set_pipeline(&self.color_pipeline);
+            pass.set_vertex_buffer(0, self.color_vbo.slice(v_off..));
+            pass.set_index_buffer(self.color_ibo.slice(i_off..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(range, 0, 0..1);
+        };
+
+        for cmd in &draw_list.color_cmds {
+            match cmd {
+                ColorCmd::Soup { indices } => draw_soup(&mut pass, indices.clone()),
+                ColorCmd::Chrome { instances } => {
+                    pass.set_pipeline(&self.chrome_pipeline);
+                    pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
+                    pass.set_vertex_buffer(1, self.chrome_inst_buffer.slice(inst_off..));
+                    pass.set_index_buffer(
+                        self.chrome_base_ibo.slice(..),
+                        wgpu::IndexFormat::Uint16,
+                    );
+                    pass.draw_indexed(0..CHROME_BASE_INDICES.len() as u32, 0, instances.clone());
+                }
+            }
+        }
+
+        // Soup appended after the last recorded command is the trailing run.
+        let committed = draw_list.soup_committed_indices;
+        let total = indices.len() as u32;
+        if total > committed {
+            draw_soup(&mut pass, committed..total);
+        }
     }
 
     fn draw_textured(

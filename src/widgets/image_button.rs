@@ -236,13 +236,10 @@ mod tests {
         ImageButton::sprite(ID)
             .bare()
             .draw(rect(), &mut bare, &theme, &input);
-        // Chrome adds background + border geometry the bare variant omits.
-        assert!(
-            chrome.vertices.len() > bare.vertices.len(),
-            "chrome ({}) should add geometry over bare ({})",
-            chrome.vertices.len(),
-            bare.vertices.len()
-        );
+        // Chrome records one instanced rounded-rect (background + border); the
+        // bare variant draws no chrome instance.
+        assert_eq!(chrome.chrome_instances.len(), 1, "chrome draws one instance");
+        assert!(bare.chrome_instances.is_empty(), "bare draws no chrome");
     }
 
     #[test]
