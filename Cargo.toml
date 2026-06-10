@@ -33,7 +33,12 @@ pollster = "0.3"
 env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
 notosans = "0.1.0"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[example]]
 name = "hello_ui"
 path = "examples/hello_ui.rs"
+
+[[bench]]
+name = "ui_stress"
+harness = false
