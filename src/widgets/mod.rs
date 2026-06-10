@@ -2,7 +2,9 @@
 
 mod button;
 mod checkbox;
+mod drag;
 mod draw_list;
+mod image;
 mod panel;
 mod progress_bar;
 mod scroll_view;
@@ -14,10 +16,12 @@ mod tooltip;
 
 pub use button::Button;
 pub use checkbox::{Checkbox, CHECKBOX_CHECKED_ICON, CHECKBOX_ICON};
+pub use drag::{DragCapture, DragId};
 pub use draw_list::{DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex};
+pub use image::{Image, ImageAlign, ImageFit};
 pub use panel::{label, label_at, label_centered_at, title, title_at, Panel};
 pub use progress_bar::ProgressBar;
-pub use scroll_view::{ScrollState, ScrollView};
+pub use scroll_view::{ScrollBegin, ScrollState, ScrollView};
 pub use slider::{Slider, SliderOutput, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE};
 pub use table::{Align, ColumnWidth, Table, TableCell, TableColumn, TableOutput};
 pub use tabs::{Tabs, TabsOutput};

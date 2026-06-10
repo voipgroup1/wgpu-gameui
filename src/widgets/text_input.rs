@@ -734,4 +734,143 @@ mod tests {
         assert_eq!(ti.selection_start, None);
         assert_eq!(ti.cursor_pos, 2);
     }
+
+    #[test]
+    fn cursor_moves_by_char_not_byte_multibyte() {
+        // "é" is 2 UTF-8 bytes, "あ" is 3 bytes.
+        let mut ti = make_input("éXあ");
+        // Cursor starts at end (byte 6: 2 + 1 + 3).
+        assert_eq!(ti.cursor_pos, 6);
+
+        // Move left: should skip "あ" (3 bytes) → byte 3 (after 'X').
+        ti.cursor_left();
+        assert_eq!(ti.cursor_pos, 3, "left from end should land after X");
+
+        // Move left again: skip 'X' (1 byte) → byte 2 (after 'é').
+        ti.cursor_left();
+        assert_eq!(ti.cursor_pos, 2, "left from X should land after é");
+
+        // Move left again: skip 'é' (2 bytes) → byte 0.
+        ti.cursor_left();
+        assert_eq!(ti.cursor_pos, 0, "left from é should land at start");
+
+        // Move right: skip 'é' (2 bytes) → byte 2.
+        ti.cursor_right();
+        assert_eq!(ti.cursor_pos, 2, "right from start should land after é");
+
+        // Move right: skip 'X' (1 byte) → byte 3.
+        ti.cursor_right();
+        assert_eq!(ti.cursor_pos, 3, "right from é should land after X");
+
+        // Move right: skip 'あ' (3 bytes) → byte 6.
+        ti.cursor_right();
+        assert_eq!(ti.cursor_pos, 6, "right from X should land at end");
+    }
+
+    #[test]
+    fn cut_with_clipboard() {
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let mut ti = make_input("hello world");
+        ti.selection_start = Some(0);
+        ti.cursor_pos = 5; // select "hello"
+        ti.set_clipboard_set({
+            let copied = copied.clone();
+            move |t| *copied.borrow_mut() = t
+        });
+        ti.cut();
+        assert_eq!(ti.value, " world");
+        assert_eq!(ti.cursor_pos, 0);
+        assert_eq!(ti.selection_start, None);
+        assert_eq!(*copied.borrow(), "hello");
+    }
+
+    #[test]
+    fn copy_with_clipboard() {
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let mut ti = make_input("hello world");
+        ti.selection_start = Some(6);
+        ti.cursor_pos = 11; // select "world"
+        ti.set_clipboard_set({
+            let copied = copied.clone();
+            move |t| *copied.borrow_mut() = t
+        });
+        ti.copy();
+        // Value unchanged after copy.
+        assert_eq!(ti.value, "hello world");
+        assert_eq!(ti.selection_start, Some(6));
+        assert_eq!(ti.cursor_pos, 11);
+        assert_eq!(*copied.borrow(), "world");
+    }
+
+    #[test]
+    fn paste_with_clipboard() {
+        let mut ti = make_input("heo");
+        ti.cursor_pos = 2; // between 'e' and 'o'
+        ti.set_clipboard_get(|| "ll".to_string());
+        ti.paste();
+        assert_eq!(ti.value, "hello");
+        assert_eq!(ti.cursor_pos, 4);
+    }
+
+    #[test]
+    fn paste_replaces_selection() {
+        let mut ti = make_input("hello world");
+        ti.selection_start = Some(6);
+        ti.cursor_pos = 11; // select "world"
+        ti.set_clipboard_get(|| "there".to_string());
+        ti.paste();
+        assert_eq!(ti.value, "hello there");
+        assert_eq!(ti.cursor_pos, 11);
+        assert_eq!(ti.selection_start, None);
+    }
+
+    #[test]
+    fn ctrl_x_cut_with_clipboard() {
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let mut ti = make_input("abcdef");
+        ti.selection_start = Some(1);
+        ti.cursor_pos = 4; // select "bcd"
+        ti.set_clipboard_set({
+            let copied = copied.clone();
+            move |t| *copied.borrow_mut() = t
+        });
+        let mut input = fake_input();
+        input.ctrl_pressed = true;
+        // Ctrl+X: the 'x' may come as ASCII control code 0x18 or as the letter 'x'.
+        input.text_input = "\x18".to_string();
+        ti.process_keyboard(&input);
+        assert_eq!(ti.value, "aef");
+        assert_eq!(*copied.borrow(), "bcd");
+    }
+
+    #[test]
+    fn ctrl_c_copy_with_clipboard() {
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let mut ti = make_input("abcdef");
+        ti.selection_start = Some(2);
+        ti.cursor_pos = 5; // select "cde"
+        ti.set_clipboard_set({
+            let copied = copied.clone();
+            move |t| *copied.borrow_mut() = t
+        });
+        let mut input = fake_input();
+        input.ctrl_pressed = true;
+        input.text_input = "\x03".to_string(); // Ctrl+C ASCII code
+        ti.process_keyboard(&input);
+        assert_eq!(ti.value, "abcdef"); // unchanged
+        assert_eq!(*copied.borrow(), "cde");
+    }
+
+    #[test]
+    fn ctrl_v_paste_with_clipboard() {
+        let mut ti = make_input("helo");
+        ti.cursor_pos = 3; // between 'l' and 'o'
+        ti.set_clipboard_get(|| "l".to_string());
+        let mut input = fake_input();
+        input.ctrl_pressed = true;
+        input.text_input = "\x16".to_string(); // Ctrl+V ASCII code
+        ti.process_keyboard(&input);
+        assert_eq!(ti.value, "hello");
+        assert_eq!(ti.cursor_pos, 4);
+    }
 }

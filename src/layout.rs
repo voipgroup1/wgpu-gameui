@@ -158,11 +158,78 @@ impl SizeSpec {
     }
 }
 
-/// Size for both dimensions.
+/// Optional lower/upper pixel bounds applied to an already-resolved dimension.
+///
+/// Orthogonal to [`SizeSpec`]: the base spec computes a preferred size, then the
+/// constraint clamps it. This mirrors CSS `min-*`/`max-*` — e.g. "fill the
+/// parent, but never narrower than 120px nor wider than 400px" is
+/// `SizeSpec::Fill` + `Constraint::between(120.0, 400.0)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Constraint {
+    pub min: Option<f32>,
+    pub max: Option<f32>,
+}
+
+impl Constraint {
+    /// No bounds (the default).
+    pub const NONE: Self = Self { min: None, max: None };
+
+    /// Lower bound only.
+    pub fn min(min: f32) -> Self {
+        Self { min: Some(min), max: None }
+    }
+
+    /// Upper bound only.
+    pub fn max(max: f32) -> Self {
+        Self { min: None, max: Some(max) }
+    }
+
+    /// Both bounds.
+    pub fn between(min: f32, max: f32) -> Self {
+        Self { min: Some(min), max: Some(max) }
+    }
+
+    /// Set the lower bound, keeping any existing upper bound.
+    pub fn with_min(mut self, min: f32) -> Self {
+        self.min = Some(min);
+        self
+    }
+
+    /// Set the upper bound, keeping any existing lower bound.
+    pub fn with_max(mut self, max: f32) -> Self {
+        self.max = Some(max);
+        self
+    }
+
+    /// True when neither bound is set (clamping is a no-op).
+    pub fn is_unbounded(&self) -> bool {
+        self.min.is_none() && self.max.is_none()
+    }
+
+    /// Clamp `value` to `[min, max]`. The upper bound is applied first, so when
+    /// `min > max` the lower bound wins — matching CSS, where `min-width`
+    /// overrides `max-width`.
+    pub fn apply(&self, value: f32) -> f32 {
+        let mut v = value;
+        if let Some(mx) = self.max {
+            v = v.min(mx);
+        }
+        if let Some(mn) = self.min {
+            v = v.max(mn);
+        }
+        v
+    }
+}
+
+/// Size for both dimensions, with optional per-axis min/max clamps.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Size {
     pub width: SizeSpec,
     pub height: SizeSpec,
+    /// Clamp applied to the resolved width.
+    pub width_constraint: Constraint,
+    /// Clamp applied to the resolved height.
+    pub height_constraint: Constraint,
 }
 
 impl Size {
@@ -170,6 +237,7 @@ impl Size {
         Self {
             width: SizeSpec::Fixed(width),
             height: SizeSpec::Fixed(height),
+            ..Default::default()
         }
     }
 
@@ -177,6 +245,7 @@ impl Size {
         Self {
             width: SizeSpec::Percent(width),
             height: SizeSpec::Percent(height),
+            ..Default::default()
         }
     }
 
@@ -184,6 +253,7 @@ impl Size {
         Self {
             width: SizeSpec::Fill,
             height: SizeSpec::Fill,
+            ..Default::default()
         }
     }
 
@@ -191,6 +261,7 @@ impl Size {
         Self {
             width: SizeSpec::Fit,
             height: SizeSpec::Fit,
+            ..Default::default()
         }
     }
 
@@ -201,6 +272,42 @@ impl Size {
 
     pub fn height_fixed(mut self, height: f32) -> Self {
         self.height = SizeSpec::Fixed(height);
+        self
+    }
+
+    /// Set the width clamp.
+    pub fn width_constraint(mut self, c: Constraint) -> Self {
+        self.width_constraint = c;
+        self
+    }
+
+    /// Set the height clamp.
+    pub fn height_constraint(mut self, c: Constraint) -> Self {
+        self.height_constraint = c;
+        self
+    }
+
+    /// Minimum resolved width in pixels.
+    pub fn min_width(mut self, min: f32) -> Self {
+        self.width_constraint = self.width_constraint.with_min(min);
+        self
+    }
+
+    /// Maximum resolved width in pixels.
+    pub fn max_width(mut self, max: f32) -> Self {
+        self.width_constraint = self.width_constraint.with_max(max);
+        self
+    }
+
+    /// Minimum resolved height in pixels.
+    pub fn min_height(mut self, min: f32) -> Self {
+        self.height_constraint = self.height_constraint.with_min(min);
+        self
+    }
+
+    /// Maximum resolved height in pixels.
+    pub fn max_height(mut self, max: f32) -> Self {
+        self.height_constraint = self.height_constraint.with_max(max);
         self
     }
 }
@@ -262,8 +369,14 @@ impl<T: LayoutNode> LayoutNode for Positioned<T> {
 
     fn layout(&self, parent: Rect) -> LayoutResult {
         let (content_w, content_h) = self.child.content_size();
-        let width = self.size.width.resolve(parent.width, content_w);
-        let height = self.size.height.resolve(parent.height, content_h);
+        let width = self
+            .size
+            .width_constraint
+            .apply(self.size.width.resolve(parent.width, content_w));
+        let height = self
+            .size
+            .height_constraint
+            .apply(self.size.height.resolve(parent.height, content_h));
         let (x, y) = self.anchor.resolve(parent, width, height);
 
         let bounds = Rect::new(x, y, width, height);
@@ -290,6 +403,8 @@ pub struct StackChild {
     pub size: SizeSpec,
     pub content_size: f32, // Size along stack axis
     pub cross_size: f32,   // Size perpendicular to stack axis
+    /// Clamp applied to the resolved main-axis size of this child.
+    pub constraint: Constraint,
 }
 
 impl VStack {
@@ -312,6 +427,7 @@ impl VStack {
             size: SizeSpec::Fixed(height),
             content_size: height,
             cross_size: width,
+            constraint: Constraint::default(),
         });
         self
     }
@@ -322,6 +438,7 @@ impl VStack {
             size: SizeSpec::Fill,
             content_size: 0.0,
             cross_size: width,
+            constraint: Constraint::default(),
         });
         self
     }
@@ -332,7 +449,22 @@ impl VStack {
             size: SizeSpec::Percent(percent),
             content_size: 0.0,
             cross_size: width,
+            constraint: Constraint::default(),
         });
+        self
+    }
+
+    /// Apply a min/max pixel clamp to the most recently added child's height.
+    /// Composes with any `child*` builder, e.g.
+    /// `VStack::new(4.0).child_fill(100.0).constrain(Constraint::between(50.0, 200.0))`.
+    ///
+    /// Note: for `Fill` children the clamp is applied after remaining space is
+    /// split evenly; this is a single pass, so a clamped `Fill` does not
+    /// redistribute its slack to siblings.
+    pub fn constrain(mut self, constraint: Constraint) -> Self {
+        if let Some(last) = self.children.last_mut() {
+            last.constraint = constraint;
+        }
         self
     }
 }
@@ -388,12 +520,13 @@ impl LayoutNode for VStack {
                 y += self.spacing;
             }
 
-            let height = match child.size {
+            let base_height = match child.size {
                 SizeSpec::Fixed(h) => h,
                 SizeSpec::Percent(p) => inner_height * p,
                 SizeSpec::Fill => fill_height,
                 SizeSpec::Fit => child.content_size,
             };
+            let height = child.constraint.apply(base_height);
 
             rects.push(Rect::new(bounds.x + self.padding, y, inner_width, height));
             y += height;
@@ -423,6 +556,7 @@ impl HStack {
             size: SizeSpec::Fixed(width),
             content_size: width,
             cross_size: height,
+            constraint: Constraint::default(),
         });
         self
     }
@@ -433,6 +567,7 @@ impl HStack {
             size: SizeSpec::Fill,
             content_size: 0.0,
             cross_size: height,
+            constraint: Constraint::default(),
         });
         self
     }
@@ -443,7 +578,22 @@ impl HStack {
             size: SizeSpec::Percent(percent),
             content_size: 0.0,
             cross_size: height,
+            constraint: Constraint::default(),
         });
+        self
+    }
+
+    /// Apply a min/max pixel clamp to the most recently added child's width.
+    /// Composes with any `child*` builder, e.g.
+    /// `HStack::new(4.0).child_fill(100.0).constrain(Constraint::between(50.0, 200.0))`.
+    ///
+    /// Note: for `Fill` children the clamp is applied after remaining space is
+    /// split evenly; this is a single pass, so a clamped `Fill` does not
+    /// redistribute its slack to siblings.
+    pub fn constrain(mut self, constraint: Constraint) -> Self {
+        if let Some(last) = self.children.last_mut() {
+            last.constraint = constraint;
+        }
         self
     }
 }
@@ -499,12 +649,13 @@ impl LayoutNode for HStack {
                 x += self.spacing;
             }
 
-            let width = match child.size {
+            let base_width = match child.size {
                 SizeSpec::Fixed(w) => w,
                 SizeSpec::Percent(p) => inner_width * p,
                 SizeSpec::Fill => fill_width,
                 SizeSpec::Fit => child.content_size,
             };
+            let width = child.constraint.apply(base_width);
 
             rects.push(Rect::new(x, bounds.y + self.padding, width, inner_height));
             x += width;
@@ -574,6 +725,84 @@ mod tests {
         // Third child: y = 98 + 20 + 8 spacing = 126
         assert_eq!(result.rects[3].y, 126.0);
         assert_eq!(result.rects[3].height, 30.0);
+    }
+
+    #[test]
+    fn constraint_apply_clamps_both_bounds() {
+        let c = Constraint::between(50.0, 200.0);
+        assert_eq!(c.apply(10.0), 50.0); // below min -> min
+        assert_eq!(c.apply(120.0), 120.0); // within -> unchanged
+        assert_eq!(c.apply(500.0), 200.0); // above max -> max
+    }
+
+    #[test]
+    fn constraint_apply_single_bounds_and_unbounded() {
+        assert_eq!(Constraint::min(50.0).apply(10.0), 50.0);
+        assert_eq!(Constraint::min(50.0).apply(80.0), 80.0);
+        assert_eq!(Constraint::max(100.0).apply(150.0), 100.0);
+        assert_eq!(Constraint::max(100.0).apply(40.0), 40.0);
+        assert!(Constraint::NONE.is_unbounded());
+        assert_eq!(Constraint::NONE.apply(123.0), 123.0);
+    }
+
+    #[test]
+    fn constraint_min_wins_when_min_exceeds_max() {
+        // CSS semantics: min-width overrides max-width.
+        let c = Constraint::between(200.0, 100.0);
+        assert_eq!(c.apply(150.0), 200.0);
+    }
+
+    #[test]
+    fn positioned_clamps_resolved_size() {
+        // Fill width would be 1000, but max_width caps it; Fit height of 0 from
+        // the leaf is lifted by min_height.
+        let node = Positioned::new(
+            Anchor::TopLeft { offset: (0.0, 0.0) },
+            Size::fill().max_width(300.0).height_fixed(20.0).min_height(50.0),
+            Leaf::new(10.0, 10.0),
+        );
+        let result = node.layout(Rect::new(0.0, 0.0, 1000.0, 1000.0));
+        let r = result.get(0);
+        assert_eq!(r.width, 300.0, "fill width clamped to max_width");
+        assert_eq!(r.height, 50.0, "fixed 20 lifted to min_height 50");
+    }
+
+    #[test]
+    fn vstack_constrain_clamps_fill_child() {
+        // A single Fill child would take all 400px of inner height, but the
+        // clamp caps it at 120.
+        let stack = VStack::new(0.0)
+            .child_fill(60.0)
+            .constrain(Constraint::max(120.0));
+        let result = stack.layout(Rect::new(0.0, 0.0, 60.0, 400.0));
+        assert_eq!(result.rects[1].height, 120.0);
+    }
+
+    #[test]
+    fn vstack_constrain_lifts_small_child_to_min() {
+        // A 10px fixed child raised to a 40px floor.
+        let stack = VStack::new(0.0)
+            .child(10.0, 60.0)
+            .constrain(Constraint::min(40.0));
+        let result = stack.layout(Rect::new(0.0, 0.0, 60.0, 400.0));
+        assert_eq!(result.rects[1].height, 40.0);
+    }
+
+    #[test]
+    fn hstack_constrain_clamps_fill_child() {
+        let stack = HStack::new(0.0)
+            .child_fill(20.0)
+            .constrain(Constraint::between(50.0, 150.0));
+        let result = stack.layout(Rect::new(0.0, 0.0, 1000.0, 20.0));
+        assert_eq!(result.rects[1].width, 150.0, "fill width clamped to max");
+    }
+
+    #[test]
+    fn constrain_without_children_is_noop() {
+        // Should not panic when there's no last child to clamp.
+        let stack = VStack::new(0.0).constrain(Constraint::min(10.0));
+        let result = stack.layout(Rect::new(0.0, 0.0, 60.0, 400.0));
+        assert_eq!(result.rects.len(), 1, "only the container rect");
     }
 
     #[test]

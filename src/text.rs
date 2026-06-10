@@ -1290,8 +1290,8 @@ impl TextBlock {
 mod tests {
     use super::{
         color_to_rgba, cosmic_align, ellipsize_to_width, field_reach, load_font_bytes,
-        measure_with_font_system, shared_font_system, FontHandle, TextAlign, TextBlock,
-        TextMeasurer,
+        measure_with_font_system, shared_font_system, text_cursor_positions, FontHandle, TextAlign,
+        TextBlock, TextMeasurer,
     };
     use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping};
 
@@ -1533,5 +1533,104 @@ mod tests {
         // A budget too small for even one glyph + the ellipsis.
         let out = ellipsize_to_width(&mut guard, "anything", 14.0, 18.0, 2.0, Family::SansSerif);
         assert_eq!(out, "…");
+    }
+
+    // ---- text_cursor_positions tests ----
+
+    #[test]
+    fn cursor_positions_empty_text() {
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let pos = text_cursor_positions(&mut guard, "", 16.0, 20.0, 800.0, None);
+        assert_eq!(pos, &[(0, 0.0)]);
+    }
+
+    #[test]
+    fn cursor_positions_has_origin_first() {
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let pos = text_cursor_positions(&mut guard, "Hi", 16.0, 20.0, 800.0, None);
+        assert_eq!(pos.first(), Some(&(0, 0.0)));
+    }
+
+    #[test]
+    fn cursor_positions_last_is_text_len() {
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let text = "Hello";
+        let pos = text_cursor_positions(&mut guard, text, 16.0, 20.0, 800.0, None);
+        assert_eq!(pos.last().map(|(i, _)| *i), Some(text.len()));
+    }
+
+    #[test]
+    fn cursor_positions_monotonically_increasing() {
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let text = "The quick brown fox";
+        let pos = text_cursor_positions(&mut guard, text, 16.0, 20.0, 800.0, None);
+        for pair in pos.windows(2) {
+            assert!(
+                pair[0].1 <= pair[1].1,
+                "position regressed: {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+            assert!(
+                pair[0].0 <= pair[1].0,
+                "byte index regressed: {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_positions_last_matches_measure_width() {
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let text = "Hello World";
+        let font_size = 16.0;
+        let max_width = 800.0;
+        let pos = text_cursor_positions(&mut guard, text, font_size, font_size * 1.25, max_width, None);
+
+        let (total_w, _) = measure_with_font_system(&mut guard, text, font_size, None, None);
+        let final_x = pos.last().map(|(_, x)| *x).unwrap_or(0.0);
+        // The final x-position should approximate the measured width.
+        assert!(
+            (final_x - total_w).abs() < 2.0,
+            "final x {final_x} differs from measured width {total_w} by >2px"
+        );
+    }
+
+    #[test]
+    fn cursor_positions_multibyte_utf8() {
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        // "é" is 2 bytes (U+00E9), "あ" is 3 bytes (U+3042).
+        // Positions should be recorded at the correct *byte* boundaries:
+        //   "éXあ" → bytes: [0..2) = é, [2..3) = X, [3..6) = あ
+        let text = "éXあ";
+        let pos = text_cursor_positions(&mut guard, text, 16.0, 20.0, 800.0, None);
+
+        // We should have a position for byte 0, byte 2 (after é), byte 3 (after X),
+        // and byte 6 (end of あ).
+        let indices: Vec<usize> = pos.iter().map(|(i, _)| *i).collect();
+        assert!(
+            indices.contains(&0),
+            "should have position at byte 0, got {indices:?}"
+        );
+        assert!(
+            indices.contains(&2),
+            "should have position at byte 2 (after é), got {indices:?}"
+        );
+        assert!(
+            indices.contains(&3),
+            "should have position at byte 3 (after X), got {indices:?}"
+        );
+        assert!(
+            indices.contains(&6),
+            "should have position at byte 6 (end), got {indices:?}"
+        );
+        assert_eq!(pos.last().map(|(i, _)| *i), Some(6));
     }
 }

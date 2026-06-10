@@ -78,8 +78,12 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [x] **P0 — Popup / portal layer** for dropdowns, context menus, tooltips.
       `LayerStack::push_popup`/`push_tooltip`. Tooltip refactored to render
       onto its own layer via `TooltipLayer::draw_into_layers`.
-- [ ] **P0 — Image / sprite widget** with sizing/aspect/tinting/UV-rect
-      (`UiImage`/`UiImageBox`).
+- [x] **P0 — Image / sprite widget** with sizing/aspect/tinting/UV-rect.
+      `Image` (`src/widgets/image.rs`) draws a `SpriteId` or string key into a
+      dest box with `ImageFit` (Stretch/Contain/Cover/ScaleDown/None),
+      `ImageAlign`, tint, and automatic UV cropping for `Cover` (via
+      `DrawList::image_cropped`). Natural size supplied by the caller (from
+      `UiRenderer::image_size`); aspect fits fall back to Stretch without it.
 - [ ] **P1 — Image / icon button** (`UiImageButton`/`UiButtonImageBox`).
 - [ ] **P1 — Radio button group.**
 - [ ] **P1 — Tree view / collapsing header.**
@@ -108,8 +112,12 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 ## Layout
 
-- [ ] **P1 — Min/max size constraints.** `SizeSpec` is Fixed/Percent/Fill/Fit
-      with no `Min`/`Max`/`between`.
+- [x] **P1 — Min/max size constraints.** `Constraint { min, max }`
+      (`Constraint::min`/`max`/`between`, CSS semantics: min overrides max)
+      clamps a resolved dimension orthogonally to `SizeSpec`. `Size` gained
+      `min_width`/`max_width`/`min_height`/`max_height`; `VStack`/`HStack` gained
+      `.constrain(Constraint)` applied to the last-added child. (Single-pass for
+      `Fill` — a clamped fill child doesn't redistribute slack.)
 - [ ] **P1 — Per-child alignment within stack cells** (Center/Start/End on
       cross axis). HStack always fills cross axis (`src/layout.rs:495`).
 - [ ] **P1 — Content-driven children.** `VStack::child(height, width)` takes
@@ -179,7 +187,9 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       separate event, never inserted.
 - [ ] **P1 — Text wrapping policy.** `max_width` set, but smaller-than-text
       causes silent truncation. `UiWordWrap` exists in Teardown.
-- [ ] **P1 — Ellipsis on overflow.**
+- [x] **P1 — Ellipsis on overflow.** `TextBlock::with_ellipsis` lays the text
+      on one line and truncates with an `…` reserved at the right edge
+      (`ellipsize_to_width` in `src/text.rs`); opt-in, no-op when the text fits.
 - [x] **P1 — Cursor x-position from real shaping**, not the same broken
       `len*0.5` formula.
 - [ ] **P2 — Password / masked input.**

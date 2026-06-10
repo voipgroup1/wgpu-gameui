@@ -326,6 +326,16 @@ impl UiRenderer {
         self.atlas.id_for(name)
     }
 
+    /// True if `key` resolves to a sprite already present in the atlas — a
+    /// loaded image (`load_image_*`), an out-of-band sprite
+    /// (`load_sprite_rgba8`), or any registered name. Broader than
+    /// [`UiRenderer::has_image`] (which only sees the decoded-image cache); a
+    /// caller draining deferred image-load requests uses this to skip keys that
+    /// are already drawable (so it never tries to `fs::read` an out-of-band key).
+    pub fn has_sprite(&self, key: &str) -> bool {
+        self.atlas.id_for(key).is_some()
+    }
+
     /// Decode and load an encoded image (PNG/JPEG) from disk, returning an atlas
     /// sprite handle. Cached by path: a repeat load of the same path is free and
     /// returns the existing handle (no re-decode). Backs Teardown's `UiImage`.

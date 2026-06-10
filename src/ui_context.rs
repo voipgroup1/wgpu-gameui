@@ -36,6 +36,14 @@ struct AlignSpec {
     v: AlignV,
 }
 
+/// A `UiWindow` frame: a world-space rect that redefines what `width`/`height`/
+/// `center`/`middle` operate on (Teardown's `UiWindow`). Pushed by
+/// [`UiContext::window_begin`], scoped to the enclosing `push`/`pop`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct WindowFrame {
+    rect: Rect,
+}
+
 impl AlignSpec {
     const DEFAULT: Self = Self {
         h: AlignH::Left,
@@ -103,6 +111,16 @@ impl<'a> Backend<'a> {
 pub struct UiContext<'a> {
     backend: Backend<'a>,
     align_stack: Vec<AlignSpec>,
+    /// Clip-stack depth recorded at each `push`, restored (`truncate_clip`) at the
+    /// matching `pop` — makes `UiClipRect`/`UiWindow` clips scope to their
+    /// push/pop frame, matching Teardown.
+    clip_depth_stack: Vec<usize>,
+    /// Active `UiWindow` frames. The top is the current window; empty means the
+    /// full screen. Scoped to `push`/`pop` like clips.
+    window_stack: Vec<WindowFrame>,
+    /// `window_stack` length recorded at each `push`, restored at the matching
+    /// `pop`.
+    window_depth_stack: Vec<usize>,
     /// Stack of layer kinds still open — used by Drop debug_assert, by
     /// modal_end / popup_end to verify the caller closed the right kind, and
     /// to detect unbalanced begin/end pairs. Length == number of open layers.
@@ -120,6 +138,9 @@ impl<'a> UiContext<'a> {
         Self {
             backend: Backend::List(list),
             align_stack: vec![AlignSpec::DEFAULT],
+            clip_depth_stack: Vec::new(),
+            window_stack: Vec::new(),
+            window_depth_stack: Vec::new(),
             open_layer_kinds: Vec::new(),
             warned_align_tokens: std::collections::HashSet::new(),
         }
@@ -130,27 +151,43 @@ impl<'a> UiContext<'a> {
         Self {
             backend: Backend::Layers(layers),
             align_stack: vec![AlignSpec::DEFAULT],
+            clip_depth_stack: Vec::new(),
+            window_stack: Vec::new(),
+            window_depth_stack: Vec::new(),
             open_layer_kinds: Vec::new(),
             warned_align_tokens: std::collections::HashSet::new(),
         }
     }
 
-    /// Push transform + tint + align (Teardown's `UiPush`).
+    /// Push transform + tint + align + clip/window scope (Teardown's `UiPush`).
     pub fn push(&mut self) {
+        let clip_depth = self.backend.list_mut().clip_len();
+        let window_depth = self.window_stack.len();
         let list = self.backend.list_mut();
         list.push_transform();
         list.push_tint();
         let top = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         self.align_stack.push(top);
+        self.clip_depth_stack.push(clip_depth);
+        self.window_depth_stack.push(window_depth);
     }
 
-    /// Pop transform + tint + align (Teardown's `UiPop`).
+    /// Pop transform + tint + align + clip/window scope (Teardown's `UiPop`).
+    ///
+    /// Any `UiClipRect`/`UiWindow` set since the matching `push` is restored
+    /// here, so clips don't leak past their frame.
     pub fn pop(&mut self) {
         let list = self.backend.list_mut();
         list.pop_transform();
         list.pop_tint();
         if self.align_stack.len() > 1 {
             self.align_stack.pop();
+        }
+        if let Some(depth) = self.clip_depth_stack.pop() {
+            self.backend.list_mut().truncate_clip(depth);
+        }
+        if let Some(depth) = self.window_depth_stack.pop() {
+            self.window_stack.truncate(depth);
         }
     }
 
@@ -232,6 +269,71 @@ impl<'a> UiContext<'a> {
             .transform_rect_aabb(local)
     }
 
+    /// Clip subsequent drawing to a `w`×`h` rect at the current origin
+    /// (Teardown's `UiClipRect`). When `inherit` is true the new clip is
+    /// intersected with the active clip; otherwise it replaces it. Scoped to the
+    /// enclosing `push`/`pop`.
+    pub fn clip_rect(&mut self, w: f32, h: f32, inherit: bool) {
+        let local = Rect::new(0.0, 0.0, w, h);
+        let list = self.backend.list_mut();
+        if inherit {
+            list.push_clip(local);
+        } else {
+            list.push_clip_exact(local);
+        }
+    }
+
+    /// Begin a `w`×`h` window at the current origin (Teardown's `UiWindow`).
+    /// Subsequent `width`/`height`/`center`/`middle` operate in the window's
+    /// size. When `clip` is true the window also clips its contents (see
+    /// [`clip_rect`](Self::clip_rect) for the `inherit` semantics). Scoped to the
+    /// enclosing `push`/`pop`.
+    pub fn window_begin(&mut self, w: f32, h: f32, clip: bool, inherit: bool) {
+        let rect = self
+            .backend
+            .list_mut()
+            .current_transform()
+            .transform_rect_aabb(Rect::new(0.0, 0.0, w, h));
+        self.window_stack.push(WindowFrame { rect });
+        if clip {
+            self.clip_rect(w, h, inherit);
+        }
+    }
+
+    /// The current `UiWindow` rect in world space, or `None` when no window is
+    /// active (full screen).
+    pub fn current_window_rect(&self) -> Option<Rect> {
+        self.window_stack.last().map(|w| w.rect)
+    }
+
+    /// The active clip rect in world space, or `None` when nothing is clipped.
+    pub fn current_clip(&mut self) -> Option<Rect> {
+        self.backend.list_mut().current_clip()
+    }
+
+    /// True when the world-space point `(x, y)` is inside the active clip region
+    /// (always true when nothing is clipped). Teardown's `UiIsInClipRegion`.
+    pub fn is_in_clip_region(&mut self, x: f32, y: f32) -> bool {
+        match self.backend.list_mut().current_clip() {
+            Some(c) => x >= c.x && x <= c.x + c.width && y >= c.y && y <= c.y + c.height,
+            None => true,
+        }
+    }
+
+    /// True when a `w`×`h` rect at the current origin lies fully outside the
+    /// active clip region (never, when nothing is clipped). Teardown's
+    /// `UiIsRectFullyClipped`.
+    pub fn is_rect_fully_clipped(&mut self, w: f32, h: f32) -> bool {
+        let list = self.backend.list_mut();
+        let world = list
+            .current_transform()
+            .transform_rect_aabb(Rect::new(0.0, 0.0, w, h));
+        match list.current_clip() {
+            Some(c) => c.intersection(world).is_none(),
+            None => false,
+        }
+    }
+
     /// Draw a colored quad of the given size at the aligned origin.
     pub fn quad(&mut self, w: f32, h: f32, color: [f32; 4]) {
         let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
@@ -246,6 +348,76 @@ impl<'a> UiContext<'a> {
         self.backend
             .list_mut()
             .rounded_rect(Rect::new(ox, oy, w, h), radius, color);
+    }
+
+    /// Draw a rectangle outline of the given size at the aligned origin
+    /// (Teardown's `UiRectOutline`). The outer edge is flush with the aligned
+    /// box; the border grows inward.
+    pub fn rect_outline(&mut self, w: f32, h: f32, thickness: f32, color: [f32; 4]) {
+        let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
+        let [ox, oy] = align.offset(w, h);
+        self.backend
+            .list_mut()
+            .rect_outline(Rect::new(ox, oy, w, h), thickness, color);
+    }
+
+    /// Draw a rounded-rectangle outline of the given size at the aligned origin
+    /// (Teardown's `UiRoundedRectOutline`).
+    pub fn rounded_rect_outline(
+        &mut self,
+        w: f32,
+        h: f32,
+        radius: f32,
+        thickness: f32,
+        color: [f32; 4],
+    ) {
+        let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
+        let [ox, oy] = align.offset(w, h);
+        self.backend
+            .list_mut()
+            .rounded_rect_outline(Rect::new(ox, oy, w, h), radius, thickness, color);
+    }
+
+    /// Draw a filled circle of the given radius at the aligned origin
+    /// (Teardown's `UiCircle`). The circle occupies a `2r×2r` box for alignment,
+    /// so the default `left top` align puts the *box corner* at the origin and
+    /// `center middle` puts the *center* at the origin.
+    pub fn circle(&mut self, radius: f32, color: [f32; 4]) {
+        let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
+        let [ox, oy] = align.offset(radius * 2.0, radius * 2.0);
+        self.backend
+            .list_mut()
+            .circle((ox + radius, oy + radius), radius, color);
+    }
+
+    /// Draw a circle outline of the given radius/thickness at the aligned origin
+    /// (Teardown's `UiCircleOutline`). Aligned like [`circle`](Self::circle).
+    pub fn circle_outline(&mut self, radius: f32, thickness: f32, color: [f32; 4]) {
+        let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
+        let [ox, oy] = align.offset(radius * 2.0, radius * 2.0);
+        self.backend
+            .list_mut()
+            .circle_outline((ox + radius, oy + radius), radius, thickness, color);
+    }
+
+    /// The current per-axis scale factors of the active transform (Teardown's
+    /// `UiGetScale`). Derived from the basis-vector lengths of the active
+    /// affine, so `UiScale(2, 3)` reports `(2, 3)` and a rotation reports the
+    /// unchanged scale.
+    pub fn current_scale(&mut self) -> (f32, f32) {
+        let m = self.backend.list_mut().current_transform();
+        let sx = (m.a * m.a + m.c * m.c).sqrt();
+        let sy = (m.b * m.b + m.d * m.d).sqrt();
+        (sx, sy)
+    }
+
+    /// Draw an atlas image (by key) of the given size at the aligned origin.
+    /// The key is resolved against the renderer's sprite atlas at render time, so
+    /// the sprite need only exist by the time [`crate::UiRenderer::render`] runs.
+    pub fn icon(&mut self, key: &str, w: f32, h: f32) {
+        let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
+        let [ox, oy] = align.offset(w, h);
+        self.backend.list_mut().icon(key, ox, oy, w, h);
     }
 
     /// Draw a text block whose origin honours align/transform.
@@ -491,6 +663,143 @@ mod tests {
         }
         // First vertex should be at (100 - 10, 100 - 10) = (90, 90).
         assert_eq!(list.vertices[0].position, [90.0, 90.0]);
+    }
+
+    #[test]
+    fn rect_outline_via_context_uses_align() {
+        // Under center-middle, a 20×20 outline at origin 100,100 has its top
+        // strip's first vertex at the box top-left (90, 90).
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::new(&mut list);
+            ui.translate(100.0, 100.0);
+            ui.center();
+            ui.rect_outline(20.0, 20.0, 2.0, [1.0, 1.0, 1.0, 1.0]);
+        }
+        assert!(!list.vertices.is_empty(), "outline emitted geometry");
+        assert_eq!(list.vertices[0].position, [90.0, 90.0]);
+    }
+
+    #[test]
+    fn circle_via_context_centers_under_center_middle() {
+        // center-middle: the circle's center sits at the origin, so the fan's
+        // hub vertex (first vertex of the first triangle) is at the origin.
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::new(&mut list);
+            ui.translate(50.0, 60.0);
+            ui.center();
+            ui.circle(10.0, [1.0, 1.0, 1.0, 1.0]);
+        }
+        assert!(!list.vertices.is_empty(), "circle emitted geometry");
+        assert_eq!(list.vertices[0].position, [50.0, 60.0]);
+    }
+
+    #[test]
+    fn circle_via_context_left_top_offsets_by_radius() {
+        // left-top (default): the 2r box corner is at the origin, so the center
+        // is at origin + (r, r).
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::new(&mut list);
+            ui.translate(50.0, 60.0);
+            ui.circle(10.0, [1.0, 1.0, 1.0, 1.0]);
+        }
+        assert_eq!(list.vertices[0].position, [60.0, 70.0]);
+    }
+
+    #[test]
+    fn current_scale_reports_axis_factors() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.scale(2.0, 3.0);
+        let (sx, sy) = ui.current_scale();
+        assert!(approx(sx, 2.0));
+        assert!(approx(sy, 3.0));
+    }
+
+    #[test]
+    fn current_scale_unaffected_by_rotation() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.rotate(0.7);
+        let (sx, sy) = ui.current_scale();
+        assert!(approx(sx, 1.0));
+        assert!(approx(sy, 1.0));
+    }
+
+    #[test]
+    fn clip_rect_scoped_to_push_pop() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        assert_eq!(ui.current_clip(), None);
+        ui.push();
+        ui.clip_rect(100.0, 50.0, false);
+        assert_eq!(ui.current_clip(), Some(Rect::new(0.0, 0.0, 100.0, 50.0)));
+        ui.pop();
+        // The clip is gone once its frame closes.
+        assert_eq!(ui.current_clip(), None);
+    }
+
+    #[test]
+    fn clip_rect_inherit_intersects_parent() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.push();
+        ui.clip_rect(50.0, 50.0, false); // parent
+        ui.push();
+        ui.clip_rect(100.0, 100.0, true); // inherit → intersected down to 50×50
+        assert_eq!(ui.current_clip(), Some(Rect::new(0.0, 0.0, 50.0, 50.0)));
+        ui.pop();
+        ui.pop();
+    }
+
+    #[test]
+    fn clip_rect_no_inherit_replaces_parent() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.push();
+        ui.clip_rect(50.0, 50.0, false); // parent
+        ui.push();
+        ui.clip_rect(100.0, 100.0, false); // replace → larger than parent
+        assert_eq!(ui.current_clip(), Some(Rect::new(0.0, 0.0, 100.0, 100.0)));
+        ui.pop();
+        // Parent clip restored.
+        assert_eq!(ui.current_clip(), Some(Rect::new(0.0, 0.0, 50.0, 50.0)));
+        ui.pop();
+    }
+
+    #[test]
+    fn window_begin_sets_current_window_and_clips() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.translate(200.0, 100.0);
+        ui.push();
+        ui.window_begin(400.0, 200.0, true, false);
+        assert_eq!(
+            ui.current_window_rect(),
+            Some(Rect::new(200.0, 100.0, 400.0, 200.0))
+        );
+        assert_eq!(ui.current_clip(), Some(Rect::new(200.0, 100.0, 400.0, 200.0)));
+        ui.pop();
+        assert_eq!(ui.current_window_rect(), None);
+        assert_eq!(ui.current_clip(), None);
+    }
+
+    #[test]
+    fn is_rect_fully_clipped_outside_region() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.push();
+        ui.clip_rect(50.0, 50.0, false);
+        // A rect at the origin overlaps the clip.
+        assert!(!ui.is_rect_fully_clipped(10.0, 10.0));
+        // Translate well outside the clip, then test.
+        ui.translate(500.0, 500.0);
+        assert!(ui.is_rect_fully_clipped(10.0, 10.0));
+        ui.pop();
+        // No clip → never fully clipped.
+        assert!(!ui.is_rect_fully_clipped(10.0, 10.0));
     }
 
     #[test]

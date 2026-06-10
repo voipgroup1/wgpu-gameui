@@ -99,6 +99,20 @@ pub struct ScrollView {
     enable_horizontal: bool,
 }
 
+/// Geometry returned by [`ScrollView::begin`] and handed back to
+/// [`ScrollView::end`]. Holds the inner viewport rect plus which scrollbars are
+/// visible and the inner extents (so `end` can place the bars without
+/// recomputing visibility).
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollBegin {
+    /// The scrollable region in world space (viewport minus any visible bars).
+    pub inner: Rect,
+    v_visible: bool,
+    h_visible: bool,
+    inner_w: f32,
+    inner_h: f32,
+}
+
 impl ScrollView {
     pub fn new(viewport: Rect) -> Self {
         Self {
@@ -145,6 +159,10 @@ impl ScrollView {
     /// (the ScrollView cannot know how tall arbitrary content is until it has
     /// been measured). A common pattern is to compute it once based on item
     /// counts, then pass it in.
+    ///
+    /// This is a thin wrapper over [`begin`](Self::begin) + [`end`](Self::end)
+    /// for callers that draw their content in a Rust closure. Immediate-mode
+    /// callers (e.g. a scripting binding) can use `begin`/`end` directly.
     pub fn draw<F>(
         &self,
         state: &mut ScrollState,
@@ -155,6 +173,25 @@ impl ScrollView {
     ) where
         F: FnMut(&mut DrawList, Rect),
     {
+        let begun = self.begin(state, list, theme, input);
+        content(list, begun.inner);
+        self.end(state, list, theme, input, begun);
+    }
+
+    /// Begin a scroll region: handle wheel + thumb-drag input, push the clip and
+    /// the `-offset` transform, and return the viewport geometry. The caller
+    /// then draws content (in world-space pre-offset coords anchored at
+    /// `ScrollBegin::inner`) and **must** call [`end`](Self::end) with the
+    /// returned value to pop the clip/transform and draw the scrollbars.
+    ///
+    /// `state.content_size` must be set before calling (see [`draw`](Self::draw)).
+    pub fn begin(
+        &self,
+        state: &mut ScrollState,
+        list: &mut DrawList,
+        _theme: &Theme,
+        input: &mut InputState,
+    ) -> ScrollBegin {
         // Force-disable axes where content fits.
         if !self.enable_vertical {
             state.offset[1] = 0.0;
@@ -218,27 +255,44 @@ impl ScrollView {
             }
         }
 
-        // Draw content under clip + transform.
+        // Set up clip + transform for the content the caller is about to draw.
         list.push_clip(inner);
         list.push_transform();
         list.translate(-state.offset[0], -state.offset[1]);
-        // Content callback receives the inner rect in **world space pre-offset**
-        // so widgets that draw at "viewport-relative" rects work transparently.
-        content(list, inner);
+
+        ScrollBegin {
+            inner,
+            v_visible,
+            h_visible,
+            inner_w,
+            inner_h,
+        }
+    }
+
+    /// Finish a scroll region opened by [`begin`](Self::begin): pop the
+    /// transform + clip and draw the scrollbars.
+    pub fn end(
+        &self,
+        state: &mut ScrollState,
+        list: &mut DrawList,
+        theme: &Theme,
+        input: &InputState,
+        begun: ScrollBegin,
+    ) {
         list.pop_transform();
         list.pop_clip();
 
         // Draw scrollbars.
-        if v_visible {
-            self.draw_v_bar(state, list, theme, input, inner_h);
+        if begun.v_visible {
+            self.draw_v_bar(state, list, theme, input, begun.inner_h);
         }
-        if h_visible {
-            self.draw_h_bar(state, list, theme, input, inner_w);
+        if begun.h_visible {
+            self.draw_h_bar(state, list, theme, input, begun.inner_w);
         }
 
         // Fill the bottom-right corner gap when both scrollbars are visible
         // so the content underneath doesn't show through.
-        if v_visible && h_visible {
+        if begun.v_visible && begun.h_visible {
             let corner = Rect::new(
                 self.viewport.x + self.viewport.width - self.bar_thickness,
                 self.viewport.y + self.viewport.height - self.bar_thickness,
