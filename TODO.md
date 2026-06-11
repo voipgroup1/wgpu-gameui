@@ -41,8 +41,15 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `SpriteId`/`u32` handles** produced by the atlas. (Both still accept
       string-keyed helpers for ergonomics; `icon_sprite`/`nine_slice_id` are the
       allocation-free path.)
-- [ ] **P1 — Don't `unwrap()` glyphon errors in `TextRenderer::prepare`/
-      `render`** (`src/text.rs:103,130`). Bubble as a typed `UiError`.
+- [x] **P1 — Don't `unwrap()` glyphon errors in `TextRenderer::prepare`/
+      `render`** (`src/text.rs:103,130`). ~~Bubble as a typed `UiError`.~~
+      Obsoleted by the MSDF rewrite (Phase 1-3): glyphon's fallible GPU
+      `prepare`/`render` stage was replaced by the custom `MsdfGlyphAtlas` path.
+      There is no `fn prepare` anymore and `render` is infallible — a crate-wide
+      grep finds zero uses of glyphon's GPU error API. The only remaining
+      `expect`s in `text.rs` are `FontSystem` lock-poison guards (another thread
+      panicked holding the lock = unrecoverable; propagating the panic is the
+      correct idiom, not a recoverable `UiError`).
 - [x] **P1 — Cache glyphon `Buffer`s by content+size hash or pool them.**
       Done better than pooling buffers: `TextRenderer::build_vertices` caches the
       *shaped glyph layout* (relative positions) keyed by
