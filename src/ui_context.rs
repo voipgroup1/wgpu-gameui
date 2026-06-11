@@ -9,11 +9,19 @@
 //! Pop is explicit. There is no `Drop`-based auto-pop, mirroring Teardown's
 //! `UiPush`/`UiPop` semantics.
 
+use crate::affine::Affine2;
 use crate::layer::{LayerKind, LayerStack};
 use crate::layout::Rect;
 use crate::text::{FontHandle, TextBlock};
+use crate::theme::Theme;
+use crate::widgets::{
+    Button, Checkbox, DragCapture, DragId, DropdownState, FocusId, FocusState, ScrollState, Slider,
+    TextInput,
+};
 use crate::widgets::DrawList;
+use crate::InputState;
 use glyphon::{Style, Weight};
+use std::collections::HashMap;
 
 /// Horizontal alignment relative to the current origin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -115,6 +123,55 @@ impl Default for FontSpec {
     }
 }
 
+/// Caller-owned, frame-persistent state backing the interactive `UiContext`
+/// verbs (`text_button`/`slider`/`checkbox`/`text_input`/…). Construct one per UI
+/// surface and thread `&mut` into [`UiContext::interactive`] every frame, the
+/// same way the crate already threads `DragCapture`/`FocusState`/`ScrollState`
+/// into the raw widgets. Persists the bits an immediate-mode UI must remember
+/// between frames: which draggable owns the pointer, which field has keyboard
+/// focus, open dropdowns, scroll offsets, and per-field text-edit cursors.
+#[derive(Default)]
+pub struct UiState {
+    /// Pointer-drag arbitration (sliders, scroll thumbs, …).
+    pub drag: DragCapture,
+    /// Keyboard-focus arbitration (text inputs, Tab ring).
+    pub focus: FocusState,
+    /// Open-dropdown / selection state for `Dropdown` widgets.
+    pub dropdowns: DropdownState,
+    /// Scroll offsets for `ScrollView` widgets.
+    pub scroll: ScrollState,
+    /// Persistent per-field text editors (cursor, selection), keyed by the
+    /// `FocusId` passed to [`UiContext::text_input`]. The caller never touches
+    /// these directly — the verb owns the cursor while the caller owns the
+    /// `String`.
+    text_inputs: HashMap<FocusId, TextInput>,
+    /// Vertical gap inserted between auto-advanced verbs. Re-seeded from
+    /// `theme.spacing` each frame by [`UiState::begin_frame`].
+    pub item_gap: f32,
+}
+
+impl UiState {
+    /// Fresh state. `item_gap` starts at 0 until the first
+    /// [`begin_frame`](Self::begin_frame) seeds it from the theme.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Per-frame setup: arm focus navigation for this frame's Tab/Escape/click
+    /// edges and seed the auto-advance gap from the theme. Call before building
+    /// the frame's interactive verbs (mirrors [`InputState::end_frame`] timing).
+    pub fn begin_frame(&mut self, input: &InputState, theme: &Theme) {
+        self.focus.begin_frame(input);
+        self.item_gap = theme.spacing;
+    }
+
+    /// Per-frame teardown: resolve focus navigation against the widgets
+    /// registered this frame. Call after building the frame's verbs.
+    pub fn end_frame(&mut self) {
+        self.focus.end_frame();
+    }
+}
+
 /// What `UiContext` is rendering into.
 enum Backend<'a> {
     /// Plain draw list (no layer system; modal_begin/popup_begin will panic
@@ -158,6 +215,14 @@ pub struct UiContext<'a> {
     /// Active font selection, scoped to `push`/`pop` like `align_stack`. The top
     /// is the current font; always at least one entry (`FontSpec::default()`).
     font_stack: Vec<FontSpec>,
+    /// Per-frame input snapshot. `Some` only in interactive mode (constructed
+    /// via [`UiContext::interactive`]/[`interactive_layers`](Self::interactive_layers)).
+    input: Option<&'a InputState>,
+    /// Caller-owned persistent widget state. `Some` only in interactive mode.
+    state: Option<&'a mut UiState>,
+    /// Active theme (colours, sizes, fonts). `Some` only in interactive mode —
+    /// every stateful widget needs a `&Theme`.
+    theme: Option<&'a Theme>,
 }
 
 impl<'a> UiContext<'a> {
@@ -174,6 +239,9 @@ impl<'a> UiContext<'a> {
             open_layer_kinds: Vec::new(),
             warned_align_tokens: std::collections::HashSet::new(),
             font_stack: vec![FontSpec::default()],
+            input: None,
+            state: None,
+            theme: None,
         }
     }
 
@@ -188,7 +256,44 @@ impl<'a> UiContext<'a> {
             open_layer_kinds: Vec::new(),
             warned_align_tokens: std::collections::HashSet::new(),
             font_stack: vec![FontSpec::default()],
+            input: None,
+            state: None,
+            theme: None,
         }
+    }
+
+    /// Wrap a `DrawList` in **interactive** mode: stateful verbs
+    /// (`text_button`/`slider`/`checkbox`/`text_input`/…) become available, each
+    /// reading `input`, mutating the caller-owned `state`, and laying out with
+    /// `theme`. Draw-only verbs keep working too. Use
+    /// [`interactive_layers`](Self::interactive_layers) for modal/popup support.
+    pub fn interactive(
+        list: &'a mut DrawList,
+        input: &'a InputState,
+        state: &'a mut UiState,
+        theme: &'a Theme,
+    ) -> Self {
+        let mut ctx = Self::new(list);
+        ctx.input = Some(input);
+        ctx.state = Some(state);
+        ctx.theme = Some(theme);
+        ctx
+    }
+
+    /// Wrap a `LayerStack` in **interactive** mode (see
+    /// [`interactive`](Self::interactive)), additionally enabling
+    /// `modal_begin`/`popup_begin`.
+    pub fn interactive_layers(
+        layers: &'a mut LayerStack,
+        input: &'a InputState,
+        state: &'a mut UiState,
+        theme: &'a Theme,
+    ) -> Self {
+        let mut ctx = Self::with_layers(layers);
+        ctx.input = Some(input);
+        ctx.state = Some(state);
+        ctx.theme = Some(theme);
+        ctx
     }
 
     /// Push transform + tint + align + clip/window scope (Teardown's `UiPush`).
@@ -344,7 +449,7 @@ impl<'a> UiContext<'a> {
             .with_font_opt(spec.font)
             .with_weight(spec.weight)
             .with_style(spec.style);
-        self.text(block);
+        self.text_block(block);
     }
 
     /// Replace the current tint (Teardown's `UiColor`).
@@ -530,8 +635,9 @@ impl<'a> UiContext<'a> {
         self.backend.list_mut().icon(key, ox, oy, w, h);
     }
 
-    /// Draw a text block whose origin honours align/transform.
-    pub fn text(&mut self, mut block: TextBlock) {
+    /// Draw a pre-built [`TextBlock`] whose origin honours align/transform.
+    /// (The auto-advancing string verb is [`text`](Self::text).)
+    pub fn text_block(&mut self, mut block: TextBlock) {
         let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         let w = block.max_width;
         let h = block.line_height;
@@ -545,6 +651,225 @@ impl<'a> UiContext<'a> {
     /// list when running on a `LayerStack`).
     pub fn list(&mut self) -> &mut DrawList {
         self.backend.list_mut()
+    }
+
+    // ------------------------------------------------------------------
+    // Interactive verbs (require `UiContext::interactive[_layers]`)
+    // ------------------------------------------------------------------
+
+    /// Validate interactive mode and return the copied-out `&InputState` +
+    /// `&Theme` refs (both are `Copy` `Option<&_>`, so this borrows nothing of
+    /// `self`). Returns `None` after a `debug_assert!` when called on a draw-only
+    /// context, so verbs degrade to a no-op in release instead of panicking —
+    /// mirroring `modal_begin` on a `DrawList` backend.
+    fn interactive_refs(&self) -> Option<(&'a InputState, &'a Theme)> {
+        match (self.input, self.theme) {
+            (Some(i), Some(t)) => Some((i, t)),
+            _ => {
+                debug_assert!(
+                    false,
+                    "interactive UiContext verb called on a draw-only context; \
+                     construct via UiContext::interactive(list, input, state, theme)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Un-apply the active transform from a placed world rect (and map the mouse
+    /// the same way) so a raw widget — which re-applies the active transform via
+    /// the `DrawList` — lands back at `world` on screen, and its
+    /// `rect.contains(mouse)` hit test matches the on-screen position. `inv` is
+    /// the inverse of the active affine.
+    fn localize(inv: Affine2, world: Rect, input: &InputState) -> (Rect, InputState) {
+        let local = inv.transform_rect_aabb(world);
+        let [mx, my] = inv.transform_point([input.mouse_x, input.mouse_y]);
+        let mut li = input.clone();
+        li.mouse_x = mx;
+        li.mouse_y = my;
+        (local, li)
+    }
+
+    /// Advance the vertical layout cursor by `height` plus the current
+    /// `item_gap` (Teardown-style stacking). No-op gap when state is absent.
+    fn advance(&mut self, height: f32) {
+        let gap = self.state.as_ref().map_or(0.0, |s| s.item_gap);
+        self.backend.list_mut().translate(0.0, height + gap);
+    }
+
+    /// Default widget width: the inner width of the active `UiWindow`, else
+    /// 200px. Used when a verb's width argument is `None`.
+    fn default_field_width(&self) -> f32 {
+        self.current_window_rect().map_or(200.0, |r| r.width)
+    }
+
+    /// Draw a line of text in the current theme text colour using the active
+    /// font stack, then advance the layout cursor by the font size. The
+    /// auto-advancing companion to [`text_block`](Self::text_block) /
+    /// [`text_line`](Self::text_line).
+    pub fn text(&mut self, label: &str) {
+        let color = self.theme.map_or([1.0, 1.0, 1.0, 1.0], |t| t.text);
+        let size = self.current_font().size;
+        self.text_line(label, color);
+        self.advance(size);
+    }
+
+    /// Draw a chrome text button and report whether it was clicked this frame.
+    /// `w`/`h` default to [`default_field_width`](Self::default_field_width) /
+    /// `theme.button_height`. Auto-advances by the button height.
+    pub fn text_button(&mut self, label: &str, w: Option<f32>, h: Option<f32>) -> bool {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return false,
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let height = h.unwrap_or(theme.button_height);
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = Self::localize(inv, world, input);
+        let clicked = {
+            let list = self.backend.list_mut();
+            Button::draw_at(label, local, true, list, theme, &local_input)
+        };
+        self.advance(height);
+        clicked
+    }
+
+    /// Draw a slider for `value` in `[min, max]` and return the (possibly
+    /// updated) value. `id` is a stable per-slider [`DragId`]. `w` defaults to
+    /// [`default_field_width`](Self::default_field_width); height is
+    /// `theme.input_height`. Auto-advances by the height.
+    pub fn slider(&mut self, id: DragId, value: f32, min: f32, max: f32, w: Option<f32>) -> f32 {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return value,
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let height = theme.input_height;
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = Self::localize(inv, world, input);
+        let new_value = {
+            // Disjoint field borrows: `self.backend` (list) and `self.state` (drag).
+            let list = self.backend.list_mut();
+            let capture = match self.state.as_mut() {
+                Some(s) => &mut s.drag,
+                None => {
+                    debug_assert!(false, "UiContext::slider requires interactive state");
+                    return value;
+                }
+            };
+            Slider::new(min, max)
+                .draw(value, id, capture, local, list, theme, &local_input)
+                .value
+        };
+        self.advance(height);
+        new_value
+    }
+
+    /// Draw a checkbox with `label` and current `checked` state; return the new
+    /// checked state (toggles on click). The widget is stateless, so no id is
+    /// needed. Auto-advances by `max(font_size, 20)`.
+    pub fn checkbox(&mut self, label: &str, checked: bool) -> bool {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return checked,
+        };
+        let height = theme.font_size.max(20.0);
+        // The checkbox box is fitted to rect height; give the row enough width
+        // for the box plus the label area (default field width).
+        let width = self.default_field_width();
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = Self::localize(inv, world, input);
+        let toggled = {
+            let list = self.backend.list_mut();
+            Checkbox::new().draw(checked, label, local, list, theme, &local_input)
+        };
+        self.advance(height);
+        if toggled {
+            !checked
+        } else {
+            checked
+        }
+    }
+
+    /// Draw an atlas image (by key) of size `w`×`h` at the aligned origin and
+    /// advance by `h`. The auto-advancing companion to [`icon`](Self::icon);
+    /// needs no input/state, so it works in draw-only mode too.
+    pub fn image_box(&mut self, key: &str, w: f32, h: f32) {
+        self.icon(key, w, h);
+        self.advance(h);
+    }
+
+    /// Draw a single-line text input bound to the caller's `buffer`. Persists
+    /// the edit cursor/selection in `UiState` keyed by `id`; syncs the caller's
+    /// `&mut String` in (external changes win) and out (edits are written back).
+    /// Returns whether the text changed this frame. `w` defaults to
+    /// [`default_field_width`](Self::default_field_width); height is
+    /// `theme.input_height`. Auto-advances by the height.
+    pub fn text_input(
+        &mut self,
+        id: FocusId,
+        buffer: &mut String,
+        placeholder: &str,
+        w: Option<f32>,
+    ) -> bool {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return false,
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let height = theme.input_height;
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = Self::localize(inv, world, input);
+        let changed = {
+            // Disjoint field borrows: `self.backend` (list) and `self.state`.
+            let list = self.backend.list_mut();
+            let state = match self.state.as_mut() {
+                Some(s) => s,
+                None => {
+                    debug_assert!(false, "UiContext::text_input requires interactive state");
+                    return false;
+                }
+            };
+            // Touch two `UiState` fields at once.
+            let UiState {
+                text_inputs, focus, ..
+            } = &mut **state;
+            let ti = text_inputs.entry(id).or_insert_with(|| {
+                let mut t = TextInput::new(local.x, local.y, local.width, local.height);
+                t.value = buffer.clone();
+                t.cursor_pos = t.value.len();
+                t
+            });
+            // Keep geometry + placeholder synced to this frame's placed rect.
+            ti.x = local.x;
+            ti.y = local.y;
+            ti.width = local.width;
+            ti.height = local.height;
+            ti.placeholder.clear();
+            ti.placeholder.push_str(placeholder);
+            // External changes to the caller's buffer win over our cached value.
+            if ti.value != *buffer {
+                ti.value = buffer.clone();
+                if ti.cursor_pos > ti.value.len() {
+                    ti.cursor_pos = ti.value.len();
+                }
+                ti.selection_start = None;
+            }
+            let before = ti.value.clone();
+            ti.draw(id, focus, list, theme, &local_input);
+            let changed = ti.value != before;
+            if changed {
+                buffer.clear();
+                buffer.push_str(&ti.value);
+            }
+            changed
+        };
+        self.advance(height);
+        changed
     }
 
     /// Open a modal layer covering `rect`. Subsequent draw calls go to the
@@ -1098,5 +1423,227 @@ mod tests {
         assert_eq!(ui.warned_align_tokens.len(), 1);
         ui.align("other_typo");
         assert_eq!(ui.warned_align_tokens.len(), 2);
+    }
+
+    // ---- Interactive verbs (P0-B) ----
+
+    fn click_at(x: f32, y: f32) -> InputState {
+        let mut i = InputState::default();
+        i.mouse_x = x;
+        i.mouse_y = y;
+        i.mouse_down = true;
+        i.mouse_clicked = true;
+        i
+    }
+
+    #[test]
+    fn draw_only_ctx_has_no_interactive_fields() {
+        let mut list = DrawList::new();
+        let ui = UiContext::new(&mut list);
+        assert!(ui.input.is_none() && ui.state.is_none() && ui.theme.is_none());
+    }
+
+    #[test]
+    fn interactive_ctx_sets_all_three_fields() {
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        assert!(ui.input.is_some() && ui.state.is_some() && ui.theme.is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "draw-only context")]
+    fn interactive_verb_on_drawonly_panics_in_debug() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.text_button("nope", None, None);
+    }
+
+    #[test]
+    fn localize_roundtrips_under_translate() {
+        let inv = Affine2::translation(100.0, 50.0).inverse();
+        let world = Rect::new(110.0, 60.0, 20.0, 10.0);
+        let mut input = InputState::default();
+        input.mouse_x = 115.0;
+        input.mouse_y = 64.0;
+        let (local, li) = UiContext::localize(inv, world, &input);
+        assert!(approx(local.x, 10.0) && approx(local.y, 10.0));
+        assert!(approx(li.mouse_x, 15.0) && approx(li.mouse_y, 14.0));
+        // The mouse is inside the world rect, so it's inside the localized rect.
+        assert!(local.contains(li.mouse_x, li.mouse_y));
+    }
+
+    #[test]
+    fn localize_roundtrips_under_scale() {
+        let t = Affine2::scale(2.0, 2.0);
+        let inv = t.inverse();
+        let world = t.transform_rect_aabb(Rect::new(5.0, 5.0, 10.0, 10.0)); // (10,10,20,20)
+        let mut input = InputState::default();
+        input.mouse_x = 12.0; // inside world
+        input.mouse_y = 12.0;
+        let (local, li) = UiContext::localize(inv, world, &input);
+        assert!(approx(local.x, 5.0) && approx(local.width, 10.0));
+        assert!(local.contains(li.mouse_x, li.mouse_y));
+    }
+
+    #[test]
+    fn text_button_reports_click_inside_and_not_outside() {
+        let theme = Theme::default();
+        // Inside.
+        {
+            let input = click_at(10.0, 10.0);
+            let mut state = UiState::new();
+            let mut list = DrawList::new();
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            assert!(ui.text_button("OK", Some(100.0), Some(30.0)));
+        }
+        // Outside.
+        {
+            let input = click_at(500.0, 500.0);
+            let mut state = UiState::new();
+            let mut list = DrawList::new();
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            assert!(!ui.text_button("OK", Some(100.0), Some(30.0)));
+        }
+    }
+
+    #[test]
+    fn checkbox_toggles_on_click() {
+        let theme = Theme::default();
+        let input = click_at(5.0, 5.0); // inside the box (fitted to row height)
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        assert!(ui.checkbox("on", false)); // false -> toggled -> true
+    }
+
+    #[test]
+    fn checkbox_no_toggle_when_clicked_away() {
+        let theme = Theme::default();
+        let input = click_at(2000.0, 2000.0);
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        assert!(!ui.checkbox("on", false)); // unchanged
+    }
+
+    #[test]
+    fn slider_drags_and_updates_value() {
+        let theme = Theme::default();
+        let mut input = InputState::default();
+        input.mouse_x = 95.0; // near the right end of a 100px track
+        input.mouse_y = theme.input_height / 2.0;
+        input.mouse_down = true;
+        input.mouse_clicked = true;
+        let mut state = UiState::new();
+        let v = {
+            let mut list = DrawList::new();
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            ui.slider(7, 0.0, 0.0, 1.0, Some(100.0))
+        };
+        assert!(v > 0.5, "value should rise toward the right: {v}");
+        assert!(state.drag.is_active(7), "the slider should own the drag");
+    }
+
+    #[test]
+    fn slider_noop_when_clicked_away() {
+        let theme = Theme::default();
+        let mut input = InputState::default();
+        input.mouse_x = 5000.0;
+        input.mouse_y = 5000.0;
+        input.mouse_down = true;
+        input.mouse_clicked = true;
+        let mut state = UiState::new();
+        let v = {
+            let mut list = DrawList::new();
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            ui.slider(7, 0.42, 0.0, 1.0, Some(100.0))
+        };
+        assert!(approx(v, 0.42));
+        assert!(!state.drag.is_active(7));
+    }
+
+    #[test]
+    fn text_input_edits_caller_buffer() {
+        let theme = Theme::default();
+        let mut state = UiState::new();
+        let mut buffer = String::from("ab");
+        // Frame 1: click inside to take focus.
+        let input1 = click_at(5.0, 5.0);
+        state.begin_frame(&input1, &theme);
+        {
+            let mut list = DrawList::new();
+            let mut ui = UiContext::interactive(&mut list, &input1, &mut state, &theme);
+            ui.text_input(1, &mut buffer, "", Some(150.0));
+        }
+        state.end_frame();
+        // Frame 2: type a character while focused.
+        let mut input2 = InputState::default();
+        input2.text_input = "c".to_string();
+        state.begin_frame(&input2, &theme);
+        let changed = {
+            let mut list = DrawList::new();
+            let mut ui = UiContext::interactive(&mut list, &input2, &mut state, &theme);
+            ui.text_input(1, &mut buffer, "", Some(150.0))
+        };
+        state.end_frame();
+        assert!(changed, "typing should report a change");
+        assert_eq!(buffer.len(), 3);
+        assert!(buffer.contains('c'));
+    }
+
+    #[test]
+    fn verbs_auto_advance_cursor() {
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        state.begin_frame(&input, &theme); // seeds item_gap = theme.spacing
+        let mut list = DrawList::new();
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        let c0 = ui.cursor();
+        ui.text_button("A", Some(100.0), Some(30.0));
+        let c1 = ui.cursor();
+        assert!(approx(c1[1], c0[1] + 30.0 + theme.spacing));
+        ui.text_button("B", Some(100.0), Some(30.0));
+        let c2 = ui.cursor();
+        assert!(approx(c2[1], c1[1] + 30.0 + theme.spacing));
+        // Horizontal cursor unchanged by a vertical stack.
+        assert!(approx(c2[0], c0[0]));
+    }
+
+    #[test]
+    fn text_verb_advances_by_font_size() {
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        state.begin_frame(&input, &theme);
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            ui.font_size(24.0);
+            let c0 = ui.cursor();
+            ui.text("hello");
+            let c1 = ui.cursor();
+            assert!(approx(c1[1], c0[1] + 24.0 + theme.spacing));
+        }
+        assert_eq!(list.texts.len(), 1);
+    }
+
+    #[test]
+    fn default_field_width_uses_window_then_fallback() {
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        // No window: fallback 200.
+        assert!(approx(ui.default_field_width(), 200.0));
+        ui.push();
+        ui.window_begin(360.0, 100.0, false, false);
+        assert!(approx(ui.default_field_width(), 360.0));
+        ui.pop();
+        assert!(approx(ui.default_field_width(), 200.0));
     }
 }

@@ -52,7 +52,7 @@ pub use projection::{world_to_screen, world_to_screen_na};
 pub use layer::{Layer, LayerKind, LayerStack};
 pub use render::{NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
 pub use theme::Theme;
-pub use ui_context::{AlignH, AlignV, FontSpec, UiContext};
+pub use ui_context::{AlignH, AlignV, FontSpec, UiContext, UiState};
 pub use widgets::*;
 
 /// Input state passed to UI for interaction.

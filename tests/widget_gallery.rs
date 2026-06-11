@@ -16,8 +16,8 @@ use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DrawList, Dropdown, DropdownState, FocusState,
     ImageButton, ImageFit, InputState, LayerStack, ProgressBar, ScrollState, ScrollView, Slider,
     Table, TableCell, TableColumn, Tabs,
-    TextAlign, TextBlock, TextInput, Theme, TooltipContent, TooltipLayer, UiRenderer,
-    SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
+    TextAlign, TextBlock, TextInput, Theme, TooltipContent, TooltipLayer, UiContext, UiRenderer,
+    UiState, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
 };
 
 const W: u32 = 800;
@@ -373,6 +373,29 @@ fn render_widget_gallery() {
                 .bold()
                 .italic(),
         );
+
+        // ---- Interactive verbs (UiContext) ------------------------------
+        // The crate-side stateful façade: each verb places + localizes the raw
+        // widget and auto-advances a vertical cursor. Rendered at rest (the
+        // static InputState isn't interacting), so this just eyeballs layout +
+        // crispness of the verb stack.
+        flow.section(list, "Interactive verbs (UiContext)");
+        {
+            let r = flow.cell(list, "Stacked verbs", 200.0, 168.0);
+            let mut vstate = UiState::new();
+            vstate.begin_frame(&input, &theme);
+            let mut buf = String::from("editable");
+            {
+                let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                ui.translate(r.x, r.y);
+                ui.text("text() label");
+                ui.text_button("text_button()", Some(200.0), None);
+                let _ = ui.slider(0, 0.6, 0.0, 1.0, Some(200.0));
+                let _ = ui.checkbox("checkbox()", true);
+                let _ = ui.text_input(1, &mut buf, "type…", Some(200.0));
+            }
+            vstate.end_frame();
+        }
 
         // ---- Widgets ----------------------------------------------------
         flow.section(list, "Widgets");
