@@ -1039,23 +1039,17 @@ impl DrawList {
             self.text_rotation_warned = true;
         }
 
-        // Transform origin.
-        let origin = m.transform_point([block.x, block.y]);
-        block.x = origin[0];
-        block.y = origin[1];
-
-        // Apply uniform-ish scale: geometric mean of the two basis lengths,
-        // which equals sqrt(|det|). This handles non-uniform axis-aligned
-        // scale gracefully (picks the average zoom instead of dropping a
-        // dimension).
-        let scale = m.uniform_scale();
-        if scale > 0.0 && (scale - 1.0).abs() > 1e-6 {
-            block.font_size *= scale;
-            block.line_height *= scale;
-            block.max_width *= scale;
+        // When span mode is active, derive the display content from the
+        // concatenated span texts so the shape cache and cursor-position calls
+        // below all operate on the same string.
+        if !block.spans.is_empty() {
+            block.content = block.spans.iter().map(|s| s.text.as_str()).collect();
         }
 
-        // Apply tint to text color.
+        // Apply tint to the block colour and to per-span colour/underline
+        // overrides. Tint is colour-only, so we do it before the position
+        // transform (order w.r.t. position doesn't matter here, but doing it
+        // early lets the underline quads below use the already-tinted colour).
         let tint = self.current_tint();
         if tint != [1.0, 1.0, 1.0, 1.0] {
             // glyphon::Color is RGBA8; multiply per-channel via the public accessors.
@@ -1073,6 +1067,68 @@ impl DrawList {
                 (nb * 255.0).round() as u8,
                 (na * 255.0).round() as u8,
             );
+            // Tint per-span colour and underline overrides with the same factor.
+            for span in &mut block.spans {
+                if let Some(c) = &mut span.color {
+                    c[0] = (c[0] * tint[0]).clamp(0.0, 1.0);
+                    c[1] = (c[1] * tint[1]).clamp(0.0, 1.0);
+                    c[2] = (c[2] * tint[2]).clamp(0.0, 1.0);
+                    c[3] = (c[3] * tint[3]).clamp(0.0, 1.0);
+                }
+                if let Some(c) = &mut span.underline {
+                    c[0] = (c[0] * tint[0]).clamp(0.0, 1.0);
+                    c[1] = (c[1] * tint[1]).clamp(0.0, 1.0);
+                    c[2] = (c[2] * tint[2]).clamp(0.0, 1.0);
+                    c[3] = (c[3] * tint[3]).clamp(0.0, 1.0);
+                }
+            }
+        }
+
+        // Emit underline rects for spans that have `underline` set, BEFORE
+        // transforming block.x/block.y. We use the original (pre-transform,
+        // pre-scale) font_size and position, so that `self.quad()` can apply
+        // the active transform uniformly — matching exactly what the text
+        // pipeline does. Soup geometry draws before text glyphs, so the
+        // underlines naturally appear beneath the MSDF rendering.
+        if block.spans.iter().any(|s| s.underline.is_some()) {
+            let positions =
+                self.text_cursor_positions(&block.content, block.font_size, Some(block.max_width));
+            let underline_y = block.y + block.font_size * 0.9;
+            let thickness = (block.font_size * 0.07).max(1.0);
+            let mut span_byte = 0usize;
+            for span in &block.spans {
+                if let Some(ul_color) = span.underline {
+                    let x_start = span_cursor_x(&positions, span_byte);
+                    let end_byte = span_byte + span.text.len();
+                    let x_end = span_cursor_x(&positions, end_byte);
+                    if x_end > x_start {
+                        self.quad(
+                            block.x + x_start,
+                            underline_y,
+                            x_end - x_start,
+                            thickness,
+                            ul_color,
+                        );
+                    }
+                }
+                span_byte += span.text.len();
+            }
+        }
+
+        // Transform origin.
+        let origin = m.transform_point([block.x, block.y]);
+        block.x = origin[0];
+        block.y = origin[1];
+
+        // Apply uniform-ish scale: geometric mean of the two basis lengths,
+        // which equals sqrt(|det|). This handles non-uniform axis-aligned
+        // scale gracefully (picks the average zoom instead of dropping a
+        // dimension).
+        let scale = m.uniform_scale();
+        if scale > 0.0 && (scale - 1.0).abs() > 1e-6 {
+            block.font_size *= scale;
+            block.line_height *= scale;
+            block.max_width *= scale;
         }
 
         if let Some(clip) = self.current_clip() {
@@ -1194,6 +1250,18 @@ impl DrawList {
             clip: self.current_clip(),
         });
     }
+}
+
+/// Return the x-pixel offset of the cursor at `byte_pos` in the positions
+/// table returned by [`DrawList::text_cursor_positions`]. Falls back to `0.0`
+/// if the byte position is not present (shouldn't happen for well-formed span
+/// data, but the function is cheap enough to not warrant a panic).
+fn span_cursor_x(positions: &[(usize, f32)], byte_pos: usize) -> f32 {
+    positions
+        .iter()
+        .find(|(b, _)| *b == byte_pos)
+        .map(|(_, x)| *x)
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]

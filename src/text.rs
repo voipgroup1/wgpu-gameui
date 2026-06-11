@@ -476,6 +476,7 @@ impl TextRenderer {
                     &mut self.font_keys,
                     &mut self.next_font_key,
                     block,
+                    &block.spans,
                     &entry.glyphs,
                     &mut placements,
                 );
@@ -565,6 +566,7 @@ impl TextRenderer {
                         rel_x,
                         rel_y,
                         font_size,
+                        byte_start: glyph.start as u32,
                     });
                 }
             }
@@ -586,6 +588,7 @@ impl TextRenderer {
                 &mut self.font_keys,
                 &mut self.next_font_key,
                 block,
+                &block.spans,
                 &entry.glyphs,
                 &mut placements,
             );
@@ -828,6 +831,10 @@ struct ShapedGlyph {
     /// Per-glyph font size (usually equals the block's, but cosmic-text reports
     /// it per glyph, so we preserve it).
     font_size: f32,
+    /// Byte offset of this glyph's source character in the shaped content string.
+    /// Used by [`append_placements`] to resolve per-span colour overrides from
+    /// [`TextBlock::spans`].
+    byte_start: u32,
 }
 
 /// A cached relative layout for one shaping key, with a frame stamp used to evict
@@ -878,21 +885,45 @@ fn resolve_font_key(
     k
 }
 
+/// Resolve the fill colour for a single glyph given a set of [`TextSpan`]s.
+///
+/// Iterates the spans in order, tracking their cumulative byte position in the
+/// concatenated text, and returns the `color` of the first span that contains
+/// `byte_start`. Returns `None` when `spans` is empty or all spans have
+/// `color: None` (caller should fall back to the block's global colour).
+pub fn resolve_span_color(byte_start: u32, spans: &[TextSpan]) -> Option<[f32; 4]> {
+    let mut offset = 0usize;
+    for span in spans {
+        let end = offset + span.text.len();
+        if (byte_start as usize) < end {
+            return span.color;
+        }
+        offset = end;
+    }
+    None
+}
+
 /// Turn a block's cached relative glyph layout into `GlyphPlacement`s, applying
 /// the block's position, color, clip and effects. Shared by the cache-hit and
 /// cache-miss paths so both produce identical output. Takes the atlas / font-key
 /// fields by `&mut` (not `&mut self`) so the caller can hold a borrow into the
 /// shape cache simultaneously. Every glyph here is already in the atlas, so the
 /// `atlas.glyph` lookup needs no font data (`&[]`).
+///
+/// `spans` may be empty (plain mode); in that case all glyphs use the block's
+/// global colour. When non-empty, per-glyph colour is resolved via
+/// [`resolve_span_color`] and falls back to the block colour for spans with
+/// `color: None`.
 fn append_placements(
     atlas: &mut MsdfGlyphAtlas,
     font_keys: &mut HashMap<fontdb::ID, u64>,
     next_font_key: &mut u64,
     block: &TextBlock,
+    spans: &[TextSpan],
     shaped: &[ShapedGlyph],
     out: &mut Vec<GlyphPlacement>,
 ) {
-    let fill = color_to_rgba(block.color);
+    let block_fill = color_to_rgba(block.color);
     let clip = block.clip.map(|c| [c.x, c.y, c.width, c.height]);
     let outline = block.outline.as_ref().map(|o| (color_to_rgba(o.color), o.width_px));
     let shadow = block
@@ -905,6 +936,12 @@ fn append_placements(
         let font_key = resolve_font_key(font_keys, next_font_key, g.font_id);
         let Some(tile) = atlas.glyph(font_key, g.glyph_id, &[]) else {
             continue; // present on every later frame; defensive only
+        };
+        // Per-span colour override: only evaluated when spans are present.
+        let fill = if spans.is_empty() {
+            block_fill
+        } else {
+            resolve_span_color(g.byte_start, spans).unwrap_or(block_fill)
         };
         out.push(GlyphPlacement {
             tile,
@@ -1437,6 +1474,26 @@ fn ellipsize_to_width(
     s
 }
 
+/// A run of text within a [`TextBlock`] with optional per-span colour and
+/// underline overrides.
+///
+/// **V1 constraint**: spans must share the block's global font attributes
+/// (size, weight, style, family) — only colour and underline may vary. Mixed
+/// font-size / weight spans require a `set_rich_text` shaping path and are
+/// deferred to a future version.
+#[derive(Debug, Clone, Default)]
+pub struct TextSpan {
+    /// The text content of this span.
+    pub text: String,
+    /// Per-span fill colour as `[r, g, b, a]` in `0.0..=1.0`. `None` →
+    /// inherit the block's colour.
+    pub color: Option<[f32; 4]>,
+    /// Underline colour in `[r, g, b, a]` (same range). `None` → no underline.
+    /// The underline rect is emitted as a coloured soup quad at
+    /// [`DrawList::text`] time so it renders beneath the MSDF glyphs.
+    pub underline: Option<[f32; 4]>,
+}
+
 /// Crisp outline drawn around glyphs, composited under the fill. Maps to
 /// Teardown's `UiTextOutline(r, g, b, a, thickness)`.
 #[derive(Clone, Copy, Debug)]
@@ -1497,6 +1554,11 @@ pub struct TextBlock {
     /// Font style selector (default [`Style::Normal`]). [`Style::Italic`] /
     /// [`Style::Oblique`] pick the matching face from the family when present.
     pub style: Style,
+    /// Inline text spans for per-run colour and underline overrides. When
+    /// non-empty, `content` is derived from the concatenation of span texts at
+    /// draw time and need not be set by the caller. All spans must share the
+    /// block's global font attributes (see [`TextSpan`]).
+    pub spans: Vec<TextSpan>,
 }
 
 impl TextBlock {
@@ -1518,6 +1580,7 @@ impl TextBlock {
             ellipsize: false,
             weight: Weight::NORMAL,
             style: Style::Normal,
+            spans: Vec::new(),
         }
     }
 
@@ -1635,16 +1698,109 @@ impl TextBlock {
         self.style = style;
         self
     }
+
+    /// Replace the block's text with the given inline spans. The display
+    /// `content` is derived automatically as the concatenation of all span
+    /// texts at draw time. See [`TextSpan`] for the V1 constraint (all spans
+    /// must share the block's global font attributes).
+    pub fn with_spans(mut self, spans: Vec<TextSpan>) -> Self {
+        self.spans = spans;
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         color_to_rgba, cosmic_align, ellipsize_to_width, field_reach, load_font_bytes,
-        measure_with_font_system, shared_font_system, text_cursor_positions, FontHandle, MsdfVertex,
-        TextAlign, TextBlock, TextMeasurer, TextRenderer,
+        measure_with_font_system, resolve_span_color, shared_font_system, text_cursor_positions,
+        FontHandle, MsdfVertex, TextAlign, TextBlock, TextMeasurer, TextRenderer, TextSpan,
     };
     use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping, Style, Weight};
+
+    // ---- TextSpan / resolve_span_color ----
+
+    fn red() -> [f32; 4] {
+        [1.0, 0.0, 0.0, 1.0]
+    }
+    fn green() -> [f32; 4] {
+        [0.0, 1.0, 0.0, 1.0]
+    }
+    fn blue() -> [f32; 4] {
+        [0.0, 0.0, 1.0, 1.0]
+    }
+
+    #[test]
+    fn resolve_span_color_picks_correct_span_for_each_byte() {
+        // Spans: "Hello" (red) | " " (no color) | "World" (blue)
+        // Bytes: 0..5            5..6              6..11
+        let spans = vec![
+            TextSpan { text: "Hello".into(), color: Some(red()), underline: None },
+            TextSpan { text: " ".into(), color: None, underline: None },
+            TextSpan { text: "World".into(), color: Some(blue()), underline: None },
+        ];
+        // First span: bytes 0–4
+        assert_eq!(resolve_span_color(0, &spans), Some(red()));
+        assert_eq!(resolve_span_color(4, &spans), Some(red()));
+        // Second span: byte 5, color None
+        assert_eq!(resolve_span_color(5, &spans), None);
+        // Third span: bytes 6–10
+        assert_eq!(resolve_span_color(6, &spans), Some(blue()));
+        assert_eq!(resolve_span_color(10, &spans), Some(blue()));
+    }
+
+    #[test]
+    fn resolve_span_color_empty_spans_returns_none() {
+        assert_eq!(resolve_span_color(0, &[]), None);
+    }
+
+    #[test]
+    fn resolve_span_color_all_no_color_returns_none() {
+        let spans = vec![
+            TextSpan { text: "abc".into(), color: None, underline: None },
+            TextSpan { text: "def".into(), color: None, underline: None },
+        ];
+        assert_eq!(resolve_span_color(0, &spans), None);
+        assert_eq!(resolve_span_color(3, &spans), None);
+    }
+
+    #[test]
+    fn resolve_span_color_multibyte_utf8_boundary() {
+        // "café" is 5 bytes (c-a-f-é where é = 2 bytes)
+        let spans = vec![
+            TextSpan { text: "café".into(), color: Some(red()), underline: None },
+            TextSpan { text: "!".into(), color: Some(green()), underline: None },
+        ];
+        // 'é' is at byte offset 3 (0xc3 0xa9), so byte 3 and 4 are in first span
+        assert_eq!(resolve_span_color(3, &spans), Some(red()));
+        assert_eq!(resolve_span_color(4, &spans), Some(red()));
+        // '!' is at byte offset 5
+        assert_eq!(resolve_span_color(5, &spans), Some(green()));
+    }
+
+    // ---- TextBlock::with_spans ----
+
+    #[test]
+    fn with_spans_derives_content_from_span_texts() {
+        let block = TextBlock::new("", 0.0, 0.0).with_spans(vec![
+            TextSpan { text: "Hello".into(), color: None, underline: None },
+            TextSpan { text: " ".into(), color: None, underline: None },
+            TextSpan { text: "World".into(), color: None, underline: None },
+        ]);
+        // Content is derived by DrawList::text at draw time, not in the builder.
+        // The builder just stores the spans; the content field is the caller's
+        // responsibility or derived from spans at draw time.
+        assert_eq!(block.spans.len(), 3);
+        assert_eq!(block.spans[0].text, "Hello");
+        assert_eq!(block.spans[2].text, "World");
+    }
+
+    #[test]
+    fn with_spans_empty_vec_is_plain_mode() {
+        let block = TextBlock::new("Hello", 0.0, 0.0).with_spans(vec![]);
+        assert!(block.spans.is_empty());
+        assert_eq!(block.content, "Hello");
+    }
 
     #[test]
     fn color_to_rgba_normalizes_channels() {

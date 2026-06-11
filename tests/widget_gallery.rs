@@ -16,8 +16,8 @@ use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DrawContext, DrawList, Dropdown, DropdownState,
     FocusState, ImageButton, ImageFit, InputState, LayerStack, ProgressBar, ScrollState,
     ScrollView, Slider, Table, TableCell, TableColumn, Tabs,
-    TextAlign, TextBlock, TextInput, Theme, TooltipContent, TooltipLayer, UiContext, UiRenderer,
-    UiState, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
+    TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer, UiContext,
+    UiRenderer, UiState, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
 };
 
 /// Convenience: build a DrawContext for a single draw call in the gallery.
@@ -382,6 +382,39 @@ fn render_widget_gallery() {
                 .with_color(220, 225, 235)
                 .bold()
                 .italic(),
+        );
+
+        // ---- Span-coloured text ----------------------------------------
+        flow.section(list, "Span colour + underline");
+
+        let r = flow.cell(list, "Colour spans", 200.0, 24.0);
+        list.text(
+            TextBlock::new("", r.x, r.y)
+                .with_size(20.0)
+                .with_color(255, 255, 255)
+                .with_spans(vec![
+                    TextSpan { text: "Red".into(), color: Some([1.0, 0.2, 0.2, 1.0]), underline: None },
+                    TextSpan { text: " · ".into(), color: Some([0.8, 0.8, 0.8, 1.0]), underline: None },
+                    TextSpan { text: "Green".into(), color: Some([0.2, 1.0, 0.4, 1.0]), underline: None },
+                    TextSpan { text: " · ".into(), color: Some([0.8, 0.8, 0.8, 1.0]), underline: None },
+                    TextSpan { text: "Blue".into(), color: Some([0.3, 0.6, 1.0, 1.0]), underline: None },
+                ]),
+        );
+
+        let r = flow.cell(list, "Underline", 200.0, 28.0);
+        list.text(
+            TextBlock::new("", r.x, r.y)
+                .with_size(20.0)
+                .with_color(220, 225, 235)
+                .with_spans(vec![
+                    TextSpan { text: "normal ".into(), color: None, underline: None },
+                    TextSpan {
+                        text: "underlined".into(),
+                        color: Some([1.0, 0.9, 0.3, 1.0]),
+                        underline: Some([1.0, 0.8, 0.0, 1.0]),
+                    },
+                    TextSpan { text: " end".into(), color: None, underline: None },
+                ]),
         );
 
         // ---- Interactive verbs (UiContext) ------------------------------
