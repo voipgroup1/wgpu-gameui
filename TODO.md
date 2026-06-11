@@ -230,9 +230,11 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 ## Theming / Styling
 
-- [ ] **P0 — DPI / scale factor** propagated through renderer; affects
+- [x] **P0 — DPI / scale factor** propagated through renderer; affects
       glyphon resolution, vertex output, layout. Teardown's `UiScale` exists
-      (~1.2k mod calls).
+      (~1.2k mod calls). `UiRenderer::render`/`render_layers` take a
+      `scale_factor`; the ortho is built from the logical size while the
+      framebuffer stays physical (MSDF text self-sharpens via `fwidth`).
 - [x] **P1 — Multiple fonts / sizes / weights** (see font system above) —
       per-`TextBlock` family/size/weight/style, `Theme.font`, and the
       `UiContext` font stack all land this.
@@ -249,15 +251,19 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 ## Game / Teardown-Specific
 
-- [ ] **P0 — Lua-binding-friendly facade** (`UiContext` with state stack)
+- [x] **P0 — Lua-binding-friendly facade** (`UiContext` with state stack)
       that backs `UiText`/`UiTextButton`/`UiImageBox`/`UiSlider`/etc. as
-      stateful immediate-mode calls. *Partial:* `UiContext` (push/pop,
+      stateful immediate-mode calls. `UiContext` (push/pop,
       translate/rotate/scale, align/center, color/color_filter, place_rect,
-      quad/rounded_rect/text) landed in `src/ui_context.rs`. Still missing:
-      stateful widget verbs (UiText/UiTextButton/UiSlider/UiImageBox), font
-      stack, sound hooks.
-- [ ] **P0 — World-space UI** (`UiWorldToPixel`/`UiWorldToScreen`) for
+      quad/rounded_rect/text_block) plus the font stack landed earlier; the
+      interactive mode (`UiContext::interactive`/`interactive_layers` +
+      caller-owned `UiState`) now provides the auto-advancing stateful verbs
+      `text`/`text_button`/`slider`/`checkbox`/`image_box`/`text_input`.
+      Remaining: UI sound hooks (tracked separately below).
+- [x] **P0 — World-space UI** (`UiWorldToPixel`/`UiWorldToScreen`) for
       in-world labels, damage numbers, health bars over NPCs.
+      `projection::world_to_screen`/`world_to_screen_na` project a world
+      point to UI pixel space (None behind the camera).
 - [ ] **P1 — UI sound hooks.** `UiSound`/`UiSoundLoop` and button
       hover/press sounds.
 - [ ] **P1 — Mod-friendly registration** of custom widgets/styles
