@@ -39,6 +39,7 @@ pub use text::{
 pub use glyphon::{Style, Weight};
 
 pub mod affine;
+mod click_tracker;
 mod drag_tracker;
 pub mod layer;
 pub mod layout;
@@ -49,6 +50,7 @@ mod ui_context;
 mod widgets;
 
 pub use affine::Affine2;
+pub use click_tracker::{ClickTracker, DEFAULT_DOUBLE_CLICK_THRESHOLD, DEFAULT_HOLD_THRESHOLD};
 pub use drag_tracker::{DragTracker, DEFAULT_DRAG_THRESHOLD};
 pub use projection::{world_to_screen, world_to_screen_na};
 pub use layer::{Layer, LayerKind, LayerStack};
@@ -65,6 +67,18 @@ pub struct InputState {
     pub mouse_down: bool,
     pub mouse_clicked: bool,
     pub mouse_released: bool,
+    /// True on the frame of a double-click (two presses of the primary button
+    /// within the double-click threshold). Computed by [`ClickTracker::update`];
+    /// a per-frame edge event (cleared by `end_frame`, zeroed by `consumed()`).
+    /// `mouse_clicked` is also true on that same frame (the double-click press
+    /// is still a click), so widgets that don't care about double-click don't
+    /// need to change.
+    pub mouse_double_clicked: bool,
+    /// True while the primary button has been held past the hold threshold.
+    /// Computed by [`ClickTracker::update`]. Latches `true` until release; the
+    /// tracker re-asserts it each frame via `update`, so `end_frame` may safely
+    /// clear it.
+    pub mouse_held: bool,
     // ---- Right mouse button (context menus, alternate actions) ----
     /// Right button is currently held.
     pub mouse_right_down: bool,
@@ -147,6 +161,9 @@ impl InputState {
     pub fn end_frame(&mut self) {
         self.mouse_clicked = false;
         self.mouse_released = false;
+        // Click-tracker outputs; the tracker re-asserts them each update call.
+        self.mouse_double_clicked = false;
+        self.mouse_held = false;
         self.mouse_right_clicked = false;
         self.mouse_right_released = false;
         self.mouse_middle_clicked = false;
@@ -199,6 +216,8 @@ impl InputState {
             scroll_consumed: true,
             mouse_clicked: false,
             mouse_released: false,
+            mouse_double_clicked: false,
+            mouse_held: false,
             mouse_right_clicked: false,
             mouse_right_released: false,
             mouse_middle_clicked: false,

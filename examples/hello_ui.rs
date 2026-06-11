@@ -7,12 +7,13 @@
 //! text. Renders all of it through the single `UiRenderer::render` call.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    DragTracker, DrawContext, Dropdown, DropdownState, FocusState, FontHandle, InputState,
-    LayerStack, ScrollState, ScrollView, TextAlign, TextBlock, TextInput, Theme, UiContext,
-    UiRenderer,
+    ClickTracker, DragTracker, DrawContext, Dropdown, DropdownState, FocusState, FontHandle,
+    InputState, LayerStack, ScrollState, ScrollView, TextAlign, TextBlock, TextInput, Theme,
+    UiContext, UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -117,6 +118,10 @@ struct App {
     drag_box: Rect,
     /// True while the demo box is the thing being dragged (press started on it).
     dragging_box: bool,
+    /// Double-click and hold detection feeding `input.mouse_double_clicked`/`mouse_held`.
+    clicks: ClickTracker,
+    /// App start time, for wall-clock timestamps fed to `ClickTracker::update`.
+    start: Instant,
 }
 
 impl ApplicationHandler for App {
@@ -348,10 +353,11 @@ impl ApplicationHandler for App {
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
 
-                // Classify the pointer gesture for this frame (writes
-                // `is_dragging`/`drag_delta` onto `self.input`) before any layer
-                // derives its own input view from it.
+                // Classify the pointer gesture for this frame before any layer
+                // derives its own input view.
+                let t = self.start.elapsed().as_secs_f64();
                 self.drag.update(&mut self.input);
+                self.clicks.update(&mut self.input, t);
 
                 // Build a LayerStack so we can demo modal layers.
                 let mut layers = LayerStack::new();
@@ -719,6 +725,36 @@ impl ApplicationHandler for App {
                     );
                 }
 
+                // ---------- Double-click / hold demo (ClickTracker) ----------
+                {
+                    let demo_rect = Rect::new(340.0, 430.0, 150.0, 56.0);
+                    let on_btn = !base_input.mouse_consumed
+                        && demo_rect.contains(base_input.mouse_x, base_input.mouse_y);
+                    let color = if on_btn && base_input.mouse_held {
+                        [0.85, 0.30, 0.30, 1.0] // red = held
+                    } else if on_btn && base_input.mouse_double_clicked {
+                        [0.40, 0.80, 0.40, 1.0] // green = double-click
+                    } else if on_btn {
+                        [0.40, 0.55, 0.80, 1.0] // hover
+                    } else {
+                        [0.26, 0.38, 0.60, 1.0] // idle
+                    };
+                    let label = if on_btn && base_input.mouse_held {
+                        "HELD"
+                    } else if on_btn && base_input.mouse_double_clicked {
+                        "DOUBLE!"
+                    } else {
+                        "dbl/hold"
+                    };
+                    let list = layers.base_mut();
+                    list.rounded_rect(demo_rect, 8.0, color);
+                    list.text(
+                        TextBlock::new(label, demo_rect.x + 18.0, demo_rect.y + 18.0)
+                            .with_size(16.0)
+                            .with_color(230, 235, 245),
+                    );
+                }
+
                 let mut encoder =
                     gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("hello_ui encoder"),
@@ -779,6 +815,8 @@ fn main() {
         drag: DragTracker::new(),
         drag_box: Rect::new(340.0, 360.0, 150.0, 56.0),
         dragging_box: false,
+        clicks: ClickTracker::new(),
+        start: Instant::now(),
     };
     event_loop.run_app(&mut app).expect("run app");
 }

@@ -208,7 +208,15 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       are cleared by `end_frame` and zeroed by `consumed()`; held-state (`down`)
       passes through. Example wires `MouseButton::Right` and `MouseButton::Middle`
       from the winit event. 5 tests. (`src/lib.rs`)
-- [ ] **P1 — Double-click and click-and-hold distinction** (timestamps).
+- [x] **P1 — Double-click and click-and-hold distinction** (timestamps). Caller-
+      owned `ClickTracker` (same pattern as `DragTracker`): `update(&mut
+      InputState, time_secs: f64)` writes `InputState::mouse_double_clicked`
+      (second press within `double_click_threshold`, default 450 ms; window
+      resets after a double so a rapid third click starts fresh) and
+      `InputState::mouse_held` (latches after `hold_threshold`, default 500 ms,
+      and stays true until release). Both fields cleared by `end_frame` and
+      zeroed by `consumed()`. 14 tests; example gains a "dbl/hold" demo button.
+      (`src/click_tracker.rs`)
 - [x] **P1 — Drag detection on `InputState`** (`is_dragging`, `drag_delta`)
       so widgets stop reinventing it. `InputState` gained `is_dragging: bool`
       and `drag_delta: [f32; 2]`; a caller-owned [`DragTracker`] (mirrors
