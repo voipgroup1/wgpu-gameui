@@ -29,7 +29,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 
 use wgpu_gameui::layout::{Anchor, Positioned, Rect, Size, VStack};
 use wgpu_gameui::{
-    Button, DrawList, FontSystemHandle, InputState, TextBlock, Theme, UiRenderer,
+    Button, DrawContext, DrawList, FocusState, FontSystemHandle, InputState, TextBlock, Theme,
+    UiRenderer,
 };
 
 const W: u32 = 1920;
@@ -162,8 +163,10 @@ fn cols_for(count: usize) -> usize {
 /// Fill `list` with `count` chrome buttons in a grid.
 fn build_buttons(list: &mut DrawList, count: usize, theme: &Theme, input: &InputState) {
     let cols = cols_for(count);
+    let mut focus = FocusState::new();
+    let mut ctx = DrawContext::new(list, &mut focus, theme, input, W as f32, H as f32);
     for i in 0..count {
-        Button::new("OK").draw(grid_rect(i, cols), list, theme, input);
+        Button::new("OK").draw(grid_rect(i, cols), &mut ctx);
     }
 }
 

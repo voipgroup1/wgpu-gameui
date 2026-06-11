@@ -20,7 +20,7 @@ use crate::layout::Rect;
 use crate::text::TextBlock;
 use crate::{InputState, Theme};
 
-use super::DrawList;
+use super::{DrawContext, DrawList};
 
 /// Resolved interaction state of a button, shared by the chrome/overlay helpers.
 pub(crate) struct ButtonVisual {
@@ -145,10 +145,13 @@ impl Button {
     }
 
     /// Draw the button at `rect` and return true if clicked this frame.
-    pub fn draw(&self, rect: Rect, list: &mut DrawList, theme: &Theme, input: &InputState) -> bool {
+    pub fn draw(&self, rect: Rect, ctx: &mut DrawContext) -> bool {
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return false;
         }
+        let list = &mut *ctx.draw_list;
+        let theme = ctx.theme;
+        let input = ctx.input;
 
         let hovered = self.enabled && rect.contains(input.mouse_x, input.mouse_y);
         let pressed = hovered && input.mouse_down;
@@ -172,16 +175,14 @@ impl Button {
     /// Draw a chrome button at a layout-computed rect. Returns true if clicked.
     ///
     /// Convenience for the common case; equivalent to
-    /// `Button::new(label).enabled(enabled).draw(rect, …)`.
+    /// `Button::new(label).enabled(enabled).draw(rect, ctx)`.
     pub fn draw_at(
         label: &str,
         rect: Rect,
         enabled: bool,
-        list: &mut DrawList,
-        theme: &Theme,
-        input: &InputState,
+        ctx: &mut DrawContext,
     ) -> bool {
-        Button::new(label).enabled(enabled).draw(rect, list, theme, input)
+        Button::new(label).enabled(enabled).draw(rect, ctx)
     }
 
     /// Draw a nine-slice textured button at a layout-computed rect. Returns true if clicked.
@@ -189,11 +190,12 @@ impl Button {
         label: &str,
         rect: Rect,
         enabled: bool,
-        list: &mut DrawList,
-        theme: &Theme,
-        input: &InputState,
+        ctx: &mut DrawContext,
         texture_key: &str,
     ) -> bool {
+        let list = &mut *ctx.draw_list;
+        let theme = ctx.theme;
+        let input = ctx.input;
         let hovered = enabled && rect.contains(input.mouse_x, input.mouse_y);
         let pressed = hovered && input.mouse_down;
         let clicked = hovered && input.mouse_clicked;
@@ -217,6 +219,7 @@ impl Button {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FocusState;
 
     fn input_at(x: f32, y: f32, down: bool, clicked: bool) -> InputState {
         InputState {
@@ -232,52 +235,67 @@ mod tests {
         Rect::new(10.0, 10.0, 100.0, 32.0)
     }
 
+    fn with_ctx<'a>(
+        list: &'a mut DrawList,
+        focus: &'a mut FocusState,
+        theme: &'a Theme,
+        input: &'a InputState,
+    ) -> DrawContext<'a> {
+        DrawContext::new(list, focus, theme, input, 800.0, 600.0)
+    }
+
     #[test]
     fn click_inside_returns_true() {
         let mut list = DrawList::new();
+        let mut focus = FocusState::new();
         let theme = Theme::default();
         let input = input_at(50.0, 25.0, true, true);
-        assert!(Button::new("Go").draw(rect(), &mut list, &theme, &input));
+        assert!(Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)));
     }
 
     #[test]
     fn click_outside_returns_false() {
         let mut list = DrawList::new();
+        let mut focus = FocusState::new();
         let theme = Theme::default();
         let input = input_at(500.0, 500.0, true, true);
-        assert!(!Button::new("Go").draw(rect(), &mut list, &theme, &input));
+        assert!(!Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)));
     }
 
     #[test]
     fn disabled_never_clicks() {
         let mut list = DrawList::new();
+        let mut focus = FocusState::new();
         let theme = Theme::default();
         let input = input_at(50.0, 25.0, true, true);
         assert!(!Button::new("Go")
             .enabled(false)
-            .draw(rect(), &mut list, &theme, &input));
+            .draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)));
     }
 
     #[test]
     fn zero_rect_draws_nothing_and_no_click() {
         let mut list = DrawList::new();
+        let mut focus = FocusState::new();
         let theme = Theme::default();
         let input = input_at(0.0, 0.0, true, true);
-        assert!(!Button::new("Go").draw(Rect::new(0.0, 0.0, 0.0, 32.0), &mut list, &theme, &input));
+        assert!(!Button::new("Go").draw(
+            Rect::new(0.0, 0.0, 0.0, 32.0),
+            &mut with_ctx(&mut list, &mut focus, &theme, &input),
+        ));
     }
 
     #[test]
     fn bare_omits_chrome_geometry() {
         let theme = Theme::default();
         let input = input_at(0.0, 0.0, false, false);
+        let mut focus = FocusState::new();
         let mut chrome = DrawList::new();
-        Button::new("Go").draw(rect(), &mut chrome, &theme, &input);
+        Button::new("Go").draw(rect(), &mut with_ctx(&mut chrome, &mut focus, &theme, &input));
         let mut bare = DrawList::new();
         Button::new("Go")
             .bare()
-            .draw(rect(), &mut bare, &theme, &input);
-        // Chrome records one instanced rounded-rect (background + border) that
-        // the bare idle variant omits entirely (no chrome, no overlay when idle).
+            .draw(rect(), &mut with_ctx(&mut bare, &mut focus, &theme, &input));
         assert_eq!(chrome.chrome_instances.len(), 1, "chrome draws one instance");
         assert!(bare.chrome_instances.is_empty(), "bare draws no chrome");
         assert!(
@@ -289,14 +307,15 @@ mod tests {
     #[test]
     fn bare_hover_adds_overlay() {
         let theme = Theme::default();
+        let mut focus = FocusState::new();
         let mut idle = DrawList::new();
         Button::new("Go")
             .bare()
-            .draw(rect(), &mut idle, &theme, &input_at(0.0, 0.0, false, false));
+            .draw(rect(), &mut with_ctx(&mut idle, &mut focus, &theme, &input_at(0.0, 0.0, false, false)));
         let mut hot = DrawList::new();
         Button::new("Go")
             .bare()
-            .draw(rect(), &mut hot, &theme, &input_at(50.0, 25.0, false, false));
+            .draw(rect(), &mut with_ctx(&mut hot, &mut focus, &theme, &input_at(50.0, 25.0, false, false)));
         assert!(
             hot.chrome_instances.len() > idle.chrome_instances.len(),
             "bare hover should add an overlay quad (instanced)"
@@ -307,10 +326,11 @@ mod tests {
     fn draw_at_matches_builder() {
         let theme = Theme::default();
         let input = input_at(50.0, 25.0, true, true);
+        let mut focus = FocusState::new();
         let mut a = DrawList::new();
-        let ra = Button::draw_at("Go", rect(), true, &mut a, &theme, &input);
+        let ra = Button::draw_at("Go", rect(), true, &mut with_ctx(&mut a, &mut focus, &theme, &input));
         let mut b = DrawList::new();
-        let rb = Button::new("Go").draw(rect(), &mut b, &theme, &input);
+        let rb = Button::new("Go").draw(rect(), &mut with_ctx(&mut b, &mut focus, &theme, &input));
         assert_eq!(ra, rb);
         assert_eq!(a.vertices.len(), b.vertices.len());
     }

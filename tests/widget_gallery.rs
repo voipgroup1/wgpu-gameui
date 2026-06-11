@@ -20,6 +20,16 @@ use wgpu_gameui::{
     UiState, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
 };
 
+/// Convenience: build a DrawContext for a single draw call in the gallery.
+fn ctx<'a>(
+    list: &'a mut DrawList,
+    focus: &'a mut FocusState,
+    theme: &'a Theme,
+    input: &'a InputState,
+) -> DrawContext<'a> {
+    DrawContext::new(list, focus, theme, input, W as f32, 600.0)
+}
+
 const W: u32 = 800;
 const LABEL_H: f32 = 16.0;
 const LABEL_SIZE: f32 = 11.0;
@@ -401,13 +411,13 @@ fn render_widget_gallery() {
         flow.section(list, "Widgets");
 
         let r = flow.cell(list, "Button", 100.0, 32.0);
-        Button::draw_at("Button", r, true, list, &theme, &input);
+        Button::draw_at("Button", r, true, &mut ctx(list, &mut focus, &theme, &input));
 
         let r = flow.cell(list, "Button (bare)", 100.0, 32.0);
-        Button::new("Bare").bare().draw(r, list, &theme, &input);
+        Button::new("Bare").bare().draw(r, &mut ctx(list, &mut focus, &theme, &input));
 
         let r = flow.cell(list, "Button (disabled)", 110.0, 32.0);
-        Button::draw_at("Disabled", r, false, list, &theme, &input);
+        Button::draw_at("Disabled", r, false, &mut ctx(list, &mut focus, &theme, &input));
 
         let cb = Checkbox::new();
         let r = flow.cell(list, "Checkbox", 120.0, 20.0);
@@ -529,7 +539,7 @@ fn render_widget_gallery() {
 
         for i in 0..6 {
             let r = flow.cell(list, "", 70.0, 30.0);
-            Button::new(format!("#{i}")).draw(r, list, &theme, &input);
+            Button::new(format!("#{i}")).draw(r, &mut ctx(list, &mut focus, &theme, &input));
         }
 
         // Rotated chrome: `chrome_rect` can't express a rotation as a single

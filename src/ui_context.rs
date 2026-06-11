@@ -15,8 +15,8 @@ use crate::layout::Rect;
 use crate::text::{FontHandle, TextBlock};
 use crate::theme::Theme;
 use crate::widgets::{
-    Button, Checkbox, DragCapture, DragId, DropdownState, FocusId, FocusState, ScrollState, Slider,
-    TextInput,
+    Button, Checkbox, DragCapture, DragId, DrawContext, DropdownState, FocusId, FocusState,
+    ScrollState, Slider, TextInput,
 };
 use crate::widgets::DrawList;
 use crate::InputState;
@@ -729,7 +729,9 @@ impl<'a> UiContext<'a> {
         let (local, local_input) = Self::localize(inv, world, input);
         let clicked = {
             let list = self.backend.list_mut();
-            Button::draw_at(label, local, true, list, theme, &local_input)
+            let state = self.state.as_mut().expect("text_button requires interactive state");
+            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0);
+            Button::draw_at(label, local, true, &mut ctx)
         };
         self.advance(height);
         clicked

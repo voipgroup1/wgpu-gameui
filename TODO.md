@@ -30,10 +30,12 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [x] **P0 — Clip / scissor stack.** `push_clip(rect)`/`pop_clip()` with draw
       commands grouped per clip stack. `Table::draw_cell` text is currently
       *not actually clipped* by `content_rect`.
-- [ ] **P1 — Unify widget API around `DrawContext` + `Rect`.** Today some
-      widgets are structs with `draw`/`draw_at`, some are unit structs with
-      assoc fns, some are free functions. `DrawContext` exists in
-      `src/widgets/mod.rs` but is unused.
+- [x] **P1 — Unify widget API around `DrawContext` + `Rect`.** `Dropdown::draw`
+      and `Button::draw`/`draw_at`/`draw_nine_slice` now take `&mut DrawContext`
+      instead of individual `(&mut DrawList, &Theme, &InputState)` params.
+      `DrawContext::register_focus(id)` auto-scopes to the active layer.
+      Remaining widgets (Checkbox, Slider, Tabs, TextInput, etc.) still take
+      individual params — deferred to follow-up passes.
 - [x] **P1 — Replace `String` keys in draw commands with interned `IconId`/
       `SpriteId`/`u32` handles** produced by the atlas. (Both still accept
       string-keyed helpers for ergonomics; `icon_sprite`/`nine_slice_id` are the
