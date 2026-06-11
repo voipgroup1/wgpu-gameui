@@ -41,12 +41,14 @@ pub use glyphon::{Style, Weight};
 pub mod affine;
 pub mod layer;
 pub mod layout;
+pub mod projection;
 pub mod render;
 mod theme;
 mod ui_context;
 mod widgets;
 
 pub use affine::Affine2;
+pub use projection::{world_to_screen, world_to_screen_na};
 pub use layer::{Layer, LayerKind, LayerStack};
 pub use render::{NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
 pub use theme::Theme;
