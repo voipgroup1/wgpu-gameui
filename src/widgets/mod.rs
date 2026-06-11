@@ -19,7 +19,9 @@ pub use button::Button;
 pub use checkbox::{Checkbox, CHECKBOX_CHECKED_ICON, CHECKBOX_ICON};
 pub use drag::{DragCapture, DragId};
 pub(crate) use draw_list::ColorCmd;
-pub use draw_list::{ChromeInstance, DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex};
+pub use draw_list::{
+    ChromeInstance, CircleInstance, DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex,
+};
 pub use image::{Image, ImageAlign, ImageFit};
 pub use image_button::ImageButton;
 pub use panel::{label, label_at, label_centered_at, title, title_at, Panel};

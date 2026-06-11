@@ -4,7 +4,9 @@
 // also bind the atlas (group 1):
 //   - `vs_color`/`fs_color`: colored quads (DrawList vertices); supports per-vertex
 //     scissor via the (clip, clip_enabled) attributes.
-//   - `vs_chrome`/`fs_chrome`: instanced SDF rounded-rect button chrome.
+//   - `vs_chrome`/`fs_chrome`: instanced SDF rounded-rect chrome (button +
+//     rect/rounded-rect fills and outlines).
+//   - `vs_circle`/`fs_circle`: instanced SDF circle (filled disc + ring outline).
 //   - `vs_icon`/`fs_icon`: instanced textured quads (icons, sprites, images);
 //     corners baked per-instance, bilinearly interpolated, atlas × tint.
 //   - `vs_nine_slice`/`fs_nine_slice`: instanced nine-slice panels; the fragment
@@ -133,6 +135,88 @@ fn fs_chrome(in: ChromeVsOut) -> @location(0) vec4<f32> {
         discard;
     }
     return vec4<f32>(color.rgb, alpha);
+}
+
+// ---- Instanced circle path (SDF disc / ring) -----------------------------
+//
+// One unit-quad base mesh, one instance per circle/circle-outline. The vertex
+// shader expands the quad over the circle's bounding box (center ± extent) and
+// the fragment computes a signed distance from the center, giving a smooth AA
+// filled disc (thickness <= 0) or a ring centered on the radius path
+// (thickness > 0). Replaces re-tessellating a 16-64-segment fan into the vertex
+// soup every frame. Adapted from citybuilder's sdf_circle.wgsl.
+
+struct CircleVsIn {
+    // Base mesh: unit-quad corner in [0,1]^2.
+    @location(0) corner: vec2<f32>,
+    // Per-instance:
+    @location(1) center: vec4<f32>,  // cx, cy, radius, thickness (post-transform world space)
+    @location(2) color: vec4<f32>,
+    @location(3) clip: vec4<f32>,    // clip rect x, y, w, h
+    @location(4) params: vec4<f32>,  // clip_enabled, _pad, _pad, _pad
+};
+
+struct CircleVsOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) clip: vec4<f32>,
+    @location(2) params: vec4<f32>,  // clip_enabled, radius, thickness, _pad
+    @location(3) frag_pos: vec2<f32>,
+    @location(4) center: vec2<f32>,
+};
+
+@vertex
+fn vs_circle(in: CircleVsIn) -> CircleVsOut {
+    var out: CircleVsOut;
+    let center = in.center.xy;
+    let radius = in.center.z;
+    let thickness = in.center.w;
+    // Bounding half-extent covers the outline band plus an AA margin.
+    let extent = radius + max(thickness, 0.0) * 0.5 + 2.0;
+    let world = center + (in.corner * 2.0 - vec2<f32>(1.0)) * extent;
+    out.clip_position = uniforms.view_proj * vec4<f32>(world, 0.0, 1.0);
+    out.color = in.color;
+    out.clip = in.clip;
+    out.params = vec4<f32>(in.params.x, radius, thickness, 0.0);
+    out.frag_pos = world;
+    out.center = center;
+    return out;
+}
+
+@fragment
+fn fs_circle(in: CircleVsOut) -> @location(0) vec4<f32> {
+    // Per-pixel scissor (same convention as fs_color / fs_chrome).
+    if (in.params.x > 0.5) {
+        let p = in.frag_pos;
+        if (p.x < in.clip.x || p.x > in.clip.x + in.clip.z
+            || p.y < in.clip.y || p.y > in.clip.y + in.clip.w) {
+            discard;
+        }
+    }
+
+    let radius = in.params.y;
+    let thickness = in.params.z;
+    // Signed distance to the circle edge (negative inside).
+    let dist = length(in.frag_pos - in.center) - radius;
+    let aa = max(fwidth(dist), 1e-4);
+
+    var alpha: f32;
+    if (thickness <= 0.0) {
+        // Filled disc: coverage inside the edge.
+        alpha = 1.0 - smoothstep(-aa, aa, dist);
+    } else {
+        // Ring centered on the radius path, spanning ±thickness/2.
+        let half = thickness * 0.5;
+        let outer = 1.0 - smoothstep(-aa, aa, dist - half);
+        let inner = 1.0 - smoothstep(-aa, aa, dist + half);
+        alpha = clamp(outer - inner, 0.0, 1.0);
+    }
+
+    let a = alpha * in.color.a;
+    if (a <= 0.0) {
+        discard;
+    }
+    return vec4<f32>(in.color.rgb, a);
 }
 
 // ---- Atlas bindings (shared by the icon + nine-slice paths) --------------

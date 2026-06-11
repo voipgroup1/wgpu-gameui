@@ -297,8 +297,8 @@ mod tests {
             .bare()
             .draw(rect(), &mut hot, &theme, &input_at(50.0, 25.0, false, false));
         assert!(
-            hot.vertices.len() > idle.vertices.len(),
-            "bare hover should add an overlay quad"
+            hot.chrome_instances.len() > idle.chrome_instances.len(),
+            "bare hover should add an overlay quad (instanced)"
         );
     }
 

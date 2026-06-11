@@ -739,16 +739,15 @@ mod tests {
         );
 
         // The corner quad should sit at (viewport.x + width - bar, y + height - bar)
-        // = (100 - 6, 100 - 6) = (94, 94). `quad` emits its top-left vertex
-        // at exactly that position. We just need to find any vertex with that
-        // exact coordinate.
+        // = (100 - 6, 100 - 6) = (94, 94). `quad` now records a chrome instance
+        // whose rect top-left is exactly that position.
         let bar = 6.0_f32;
         let cx = viewport.x + viewport.width - bar;
         let cy = viewport.y + viewport.height - bar;
         let found = list
-            .vertices
+            .chrome_instances
             .iter()
-            .any(|v| (v.position[0] - cx).abs() < 1e-3 && (v.position[1] - cy).abs() < 1e-3);
+            .any(|i| (i.rect[0] - cx).abs() < 1e-3 && (i.rect[1] - cy).abs() < 1e-3);
         assert!(found, "expected a quad at corner ({}, {})", cx, cy);
     }
 
@@ -770,10 +769,15 @@ mod tests {
             &mut input,
             |l, _vp| {
                 // Quad at (0, 100) — should appear in world at (0, 50) due to
-                // -50 vertical scroll.
+                // -50 vertical scroll. Translate-only, so it records a chrome
+                // instance with the translated rect.
                 l.quad(0.0, 100.0, 10.0, 10.0, [1.0; 4]);
             },
         );
-        assert_eq!(list.vertices[0].position, [0.0, 50.0]);
+        let found = list
+            .chrome_instances
+            .iter()
+            .any(|i| i.rect == [0.0, 50.0, 10.0, 10.0]);
+        assert!(found, "content quad should be translated to world (0, 50)");
     }
 }

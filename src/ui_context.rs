@@ -661,8 +661,13 @@ mod tests {
             ui.center();
             ui.quad(20.0, 20.0, [1.0, 1.0, 1.0, 1.0]);
         }
-        // First vertex should be at (100 - 10, 100 - 10) = (90, 90).
-        assert_eq!(list.vertices[0].position, [90.0, 90.0]);
+        // A translate-only quad records one chrome instance; its world rect
+        // origin should be at (100 - 10, 100 - 10) = (90, 90).
+        assert_eq!(list.chrome_instances.len(), 1);
+        assert_eq!(
+            [list.chrome_instances[0].rect[0], list.chrome_instances[0].rect[1]],
+            [90.0, 90.0]
+        );
     }
 
     #[test]
@@ -676,14 +681,19 @@ mod tests {
             ui.center();
             ui.rect_outline(20.0, 20.0, 2.0, [1.0, 1.0, 1.0, 1.0]);
         }
-        assert!(!list.vertices.is_empty(), "outline emitted geometry");
-        assert_eq!(list.vertices[0].position, [90.0, 90.0]);
+        // A translate-only outline records one chrome (stroke) instance; its
+        // world rect origin is the box top-left (90, 90).
+        assert_eq!(list.chrome_instances.len(), 1);
+        assert_eq!(
+            [list.chrome_instances[0].rect[0], list.chrome_instances[0].rect[1]],
+            [90.0, 90.0]
+        );
     }
 
     #[test]
     fn circle_via_context_centers_under_center_middle() {
-        // center-middle: the circle's center sits at the origin, so the fan's
-        // hub vertex (first vertex of the first triangle) is at the origin.
+        // center-middle: the circle's center sits at the origin. A translate-only
+        // circle records one SDF instance whose center is at the origin.
         let mut list = DrawList::new();
         {
             let mut ui = UiContext::new(&mut list);
@@ -691,8 +701,11 @@ mod tests {
             ui.center();
             ui.circle(10.0, [1.0, 1.0, 1.0, 1.0]);
         }
-        assert!(!list.vertices.is_empty(), "circle emitted geometry");
-        assert_eq!(list.vertices[0].position, [50.0, 60.0]);
+        assert_eq!(list.circle_instances.len(), 1);
+        assert_eq!(
+            [list.circle_instances[0].center[0], list.circle_instances[0].center[1]],
+            [50.0, 60.0]
+        );
     }
 
     #[test]
@@ -705,7 +718,11 @@ mod tests {
             ui.translate(50.0, 60.0);
             ui.circle(10.0, [1.0, 1.0, 1.0, 1.0]);
         }
-        assert_eq!(list.vertices[0].position, [60.0, 70.0]);
+        assert_eq!(list.circle_instances.len(), 1);
+        assert_eq!(
+            [list.circle_instances[0].center[0], list.circle_instances[0].center[1]],
+            [60.0, 70.0]
+        );
     }
 
     #[test]
@@ -822,10 +839,10 @@ mod tests {
             ui.modal_end();
             ui.quad(5.0, 5.0, [1.0; 4]); // base again
         }
-        // Base list got 2 quads (8 verts), modal got 1 quad (4 verts).
-        assert_eq!(layers.base().vertices.len(), 8);
+        // Translate-only quads record chrome instances: base got 2, modal got 1.
+        assert_eq!(layers.base().chrome_instances.len(), 2);
         assert_eq!(layers.layers().len(), 1);
-        assert_eq!(layers.layers()[0].list.vertices.len(), 4);
+        assert_eq!(layers.layers()[0].list.chrome_instances.len(), 1);
     }
 
     #[test]

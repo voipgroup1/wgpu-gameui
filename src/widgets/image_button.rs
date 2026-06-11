@@ -254,8 +254,8 @@ mod tests {
             .bare()
             .draw(rect(), &mut hot, &theme, &input_at(50.0, 50.0, false, false));
         assert!(
-            hot.vertices.len() > idle.vertices.len(),
-            "hover overlay should add a quad"
+            hot.chrome_instances.len() > idle.chrome_instances.len(),
+            "hover overlay should add a quad (instanced)"
         );
     }
 
@@ -272,8 +272,8 @@ mod tests {
             .enabled(false)
             .draw(rect(), &mut disabled, &theme, &input_at(0.0, 0.0, false, false));
         assert!(
-            disabled.vertices.len() > enabled.vertices.len(),
-            "disabled dim overlay should add a quad"
+            disabled.chrome_instances.len() > enabled.chrome_instances.len(),
+            "disabled dim overlay should add a quad (instanced)"
         );
     }
 

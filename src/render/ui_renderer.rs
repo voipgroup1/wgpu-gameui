@@ -10,7 +10,10 @@ use crate::layer::LayerStack;
 use crate::render::atlas::{SpriteAtlas, SpriteId};
 use crate::render::image_cache::{decode_rgba8, ImageCache, ImageEntry, ImageError};
 use crate::text::FontSystemHandle;
-use crate::widgets::{ChromeInstance, ColorCmd, DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex};
+use crate::widgets::{
+    ChromeInstance, CircleInstance, ColorCmd, DrawList, IconDraw, NineSliceDraw, NineSliceId,
+    Vertex,
+};
 use crate::TextRenderer;
 
 const SHADER: &str = include_str!("ui.wgsl");
@@ -85,6 +88,15 @@ const CHROME_INSTANCE_ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_ar
     5 => Float32x4, // params (radius, thickness, clip_enabled, _pad)
 ];
 
+/// Per-instance circle attributes — matches [`CircleInstance`] / `vs_circle`
+/// (location 0 is the base-mesh corner).
+const CIRCLE_INSTANCE_ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    1 => Float32x4, // center (cx, cy, radius, thickness)
+    2 => Float32x4, // color
+    3 => Float32x4, // clip
+    4 => Float32x4, // params (clip_enabled, _, _, _)
+];
+
 /// Unit-quad corners (TL, TR, BR, BL) for the chrome base mesh.
 const CHROME_BASE_VERTS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
 /// Two triangles for the unit quad above.
@@ -139,6 +151,7 @@ pub struct UiRenderer {
     color_pipeline: wgpu::RenderPipeline,
     icon_pipeline: wgpu::RenderPipeline,
     chrome_pipeline: wgpu::RenderPipeline,
+    circle_pipeline: wgpu::RenderPipeline,
     nine_slice_pipeline: wgpu::RenderPipeline,
 
     // Uniforms (shared by both pipelines via group(0))
@@ -185,6 +198,12 @@ pub struct UiRenderer {
     chrome_inst_buffer: wgpu::Buffer,
     chrome_inst_capacity: u64,
     chrome_inst_offset: u64,
+
+    // Instanced circles: reuses the chrome unit-quad base mesh + a growing
+    // per-frame instance buffer (bump offset, reset in `prepare_frame`).
+    circle_inst_buffer: wgpu::Buffer,
+    circle_inst_capacity: u64,
+    circle_inst_offset: u64,
 
     // Instanced nine-slice: reuses the chrome unit-quad base mesh + a growing
     // per-frame instance buffer (bump offset, reset in `prepare_frame`).
@@ -380,6 +399,46 @@ impl UiRenderer {
             cache: None,
         });
 
+        // Circle (instanced SDF disc/ring) pipeline. Same shape as chrome —
+        // ortho uniform (group 0), no texture, unit-quad base + instances — but
+        // its fragment computes a circle SDF instead of a rounded-rect one.
+        let circle_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ui circle pipeline"),
+            layout: Some(&chrome_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_circle"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &CHROME_BASE_ATTRIBS,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<CircleInstance>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &CIRCLE_INSTANCE_ATTRIBS,
+                    },
+                ],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_circle"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         // Nine-slice (instanced) pipeline. Shares the ortho uniform (group 0)
         // AND the atlas texture (group 1, like the textured path). Two vertex
         // buffers: the chrome unit-quad base mesh + per-instance records.
@@ -487,10 +546,19 @@ impl UiRenderer {
             mapped_at_creation: false,
         });
 
+        let circle_inst_capacity = (1024 * std::mem::size_of::<CircleInstance>()) as u64;
+        let circle_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui circle inst buffer"),
+            size: circle_inst_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             color_pipeline,
             icon_pipeline,
             chrome_pipeline,
+            circle_pipeline,
             nine_slice_pipeline,
             uniform_buffer,
             uniform_bind_group,
@@ -517,6 +585,9 @@ impl UiRenderer {
             chrome_inst_buffer,
             chrome_inst_capacity,
             chrome_inst_offset: 0,
+            circle_inst_buffer,
+            circle_inst_capacity,
+            circle_inst_offset: 0,
             nine_inst_buffer,
             nine_inst_capacity,
             nine_inst_offset: 0,
@@ -773,6 +844,7 @@ impl UiRenderer {
         self.color_ibo_offset = 0;
         self.icon_inst_offset = 0;
         self.chrome_inst_offset = 0;
+        self.circle_inst_offset = 0;
         self.nine_inst_offset = 0;
         self.text_renderer.begin_frame();
         self.flush_atlas(device, queue);
@@ -1025,9 +1097,25 @@ impl UiRenderer {
         off
     }
 
+    /// Same grow semantics as [`ensure_chrome_capacity`], for circle instances.
+    fn ensure_circle_capacity(&mut self, device: &wgpu::Device, count: usize) -> u64 {
+        let off = self.circle_inst_offset;
+        let needed = off + (count * std::mem::size_of::<CircleInstance>()) as u64;
+        if needed > self.circle_inst_capacity {
+            self.circle_inst_capacity = needed.next_power_of_two();
+            self.circle_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ui circle inst buffer"),
+                size: self.circle_inst_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        off
+    }
+
     /// Render the colored stage as an ordered interleave of soup index runs and
-    /// instanced chrome runs (see [`ColorCmd`]). Soup + instances are each
-    /// uploaded once at their frame bump offsets, then a single render pass
+    /// instanced chrome / circle runs (see [`ColorCmd`]). Soup + instances are
+    /// each uploaded once at their frame bump offsets, then a single render pass
     /// issues the draws in submission order so layering is preserved.
     fn draw_color_interleaved(
         &mut self,
@@ -1040,6 +1128,7 @@ impl UiRenderer {
         let verts = &draw_list.vertices;
         let indices = &draw_list.indices;
         let instances = &draw_list.chrome_instances;
+        let circles = &draw_list.circle_instances;
 
         // Upload the whole soup once. Soup indices are absolute, so binding the
         // full sliced vbo/ibo with base_vertex 0 lets each `Soup` sub-range draw
@@ -1061,6 +1150,17 @@ impl UiRenderer {
             queue.write_buffer(&self.chrome_inst_buffer, off, bytemuck::cast_slice(instances));
             self.chrome_inst_offset =
                 off + (instances.len() * std::mem::size_of::<ChromeInstance>()) as u64;
+            off
+        } else {
+            0
+        };
+
+        // Upload all circle instances once.
+        let circle_off = if !circles.is_empty() {
+            let off = self.ensure_circle_capacity(device, circles.len());
+            queue.write_buffer(&self.circle_inst_buffer, off, bytemuck::cast_slice(circles));
+            self.circle_inst_offset =
+                off + (circles.len() * std::mem::size_of::<CircleInstance>()) as u64;
             off
         } else {
             0
@@ -1097,6 +1197,16 @@ impl UiRenderer {
                     pass.set_pipeline(&self.chrome_pipeline);
                     pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
                     pass.set_vertex_buffer(1, self.chrome_inst_buffer.slice(inst_off..));
+                    pass.set_index_buffer(
+                        self.chrome_base_ibo.slice(..),
+                        wgpu::IndexFormat::Uint16,
+                    );
+                    pass.draw_indexed(0..CHROME_BASE_INDICES.len() as u32, 0, instances.clone());
+                }
+                ColorCmd::Circle { instances } => {
+                    pass.set_pipeline(&self.circle_pipeline);
+                    pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
+                    pass.set_vertex_buffer(1, self.circle_inst_buffer.slice(circle_off..));
                     pass.set_index_buffer(
                         self.chrome_base_ibo.slice(..),
                         wgpu::IndexFormat::Uint16,

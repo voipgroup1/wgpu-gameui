@@ -220,6 +220,25 @@ fn render_widget_gallery() {
             [0.70, 0.30, 0.40, 1.0],
         );
 
+        // Rect outline routes through the SDF chrome instance (transparent fill,
+        // border-only band) when translate-only.
+        let r = flow.cell(list, "Rect outline", 120.0, 44.0);
+        list.rect_outline(r, 2.0, [0.55, 0.75, 0.95, 1.0]);
+
+        // Rotated rounded rect: a non-translate transform falls back to the soup
+        // tessellator, proving the rounded-rect primitive still draws correctly
+        // off-axis (instanced fast path is translate-only).
+        let r = flow.cell(list, "Rounded rect (rotated)", 120.0, 44.0);
+        list.push_transform();
+        list.translate(r.x + r.width / 2.0, r.y + r.height / 2.0);
+        list.rotate(0.18);
+        list.rounded_rect(
+            Rect::new(-r.width / 2.0, -r.height / 2.0, r.width, r.height),
+            8.0,
+            [0.25, 0.40, 0.65, 1.0],
+        );
+        list.pop_transform();
+
         let r = flow.cell(list, "Nine-slice", 64.0, 44.0);
         list.nine_slice_id(nine_slice_id, r.x, r.y, r.width, r.height, [1.0; 4]);
 

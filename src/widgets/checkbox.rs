@@ -218,8 +218,10 @@ mod tests {
         // The core bug: a checkbox must never be blank without atlas assets.
         let mut list = DrawList::new();
         Checkbox::new().draw(false, "", rect(), &mut list, &theme(), &input_at(-1.0, -1.0));
+        // Box fill + outline are translate-only rounded rects, so they record
+        // chrome instances rather than soup geometry.
         assert!(
-            !list.vertices.is_empty(),
+            !list.chrome_instances.is_empty(),
             "vector unchecked box must emit geometry (box fill + outline)"
         );
         assert!(list.icons.is_empty(), "vector path must not queue any icon");

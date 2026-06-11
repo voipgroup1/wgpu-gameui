@@ -85,6 +85,28 @@ pub struct ChromeInstance {
     pub params: [f32; 4],
 }
 
+/// A single instanced circle (filled disc or ring outline) for the SDF circle
+/// pipeline.
+///
+/// Field layout matches the per-instance vertex attributes in `ui.wgsl`
+/// (`vs_circle`), so a `&[CircleInstance]` uploads straight to the instance
+/// buffer. The fragment computes the disc/ring from a signed distance, so a
+/// smooth anti-aliased circle of any size is one base mesh + one small record
+/// instead of a re-tessellated 16-64-segment fan every frame.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CircleInstance {
+    /// `[center_x, center_y, radius, thickness]` (transform already baked in).
+    /// `thickness <= 0` is a filled disc; `> 0` is a ring centered on `radius`.
+    pub center: [f32; 4],
+    /// Color, tint already applied.
+    pub color: [f32; 4],
+    /// Clip rect `[x, y, w, h]` (ignored unless `params[0] > 0.5`).
+    pub clip: [f32; 4],
+    /// `[clip_enabled, _pad, _pad, _pad]`.
+    pub params: [f32; 4],
+}
+
 /// One entry in a [`DrawList`]'s ordered color-stage command stream.
 ///
 /// The colored-quad stage is no longer a single soup draw: chrome rects are
@@ -100,6 +122,8 @@ pub(crate) enum ColorCmd {
     Soup { indices: std::ops::Range<u32> },
     /// Draw chrome instances `start..end` (into `chrome_instances`).
     Chrome { instances: std::ops::Range<u32> },
+    /// Draw circle instances `start..end` (into `circle_instances`).
+    Circle { instances: std::ops::Range<u32> },
 }
 
 /// Opaque handle to a registered nine-slice resource.
@@ -136,9 +160,13 @@ pub struct DrawList {
     pub texts: Vec<TextBlock>,
     pub icons: Vec<IconDraw>,
     pub nine_slices: Vec<NineSliceDraw>,
-    /// Instanced chrome rects (button backgrounds/borders). Drawn by the chrome
-    /// pipeline; interleaved with soup geometry via [`DrawList::color_cmds`].
+    /// Instanced chrome rects (button backgrounds/borders, plus rect/rounded-rect
+    /// fills and outlines). Drawn by the chrome pipeline; interleaved with soup
+    /// geometry via [`DrawList::color_cmds`].
     pub chrome_instances: Vec<ChromeInstance>,
+    /// Instanced circles (filled discs + ring outlines). Drawn by the circle
+    /// SDF pipeline; interleaved with soup/chrome via [`DrawList::color_cmds`].
+    pub circle_instances: Vec<CircleInstance>,
     /// Ordered color-stage command stream (soup runs interleaved with chrome
     /// instance runs). Empty unless [`DrawList::chrome_rect`] was used, in which
     /// case the renderer falls back to a single soup draw.
@@ -164,6 +192,7 @@ impl Default for DrawList {
             icons: Vec::new(),
             nine_slices: Vec::new(),
             chrome_instances: Vec::new(),
+            circle_instances: Vec::new(),
             color_cmds: Vec::new(),
             soup_committed_indices: 0,
             text_measurer: TextMeasurer::default(),
@@ -201,6 +230,7 @@ impl DrawList {
             icons: Vec::new(),
             nine_slices: Vec::new(),
             chrome_instances: Vec::new(),
+            circle_instances: Vec::new(),
             color_cmds: Vec::new(),
             soup_committed_indices: 0,
             text_measurer: TextMeasurer::with_font_system(font_system),
@@ -218,6 +248,7 @@ impl DrawList {
         self.icons.clear();
         self.nine_slices.clear();
         self.chrome_instances.clear();
+        self.circle_instances.clear();
         self.color_cmds.clear();
         self.soup_committed_indices = 0;
         self.clip_stack.clear();
@@ -421,8 +452,29 @@ impl DrawList {
         self.indices.extend_from_slice(&[base, base + 1, base + 2]);
     }
 
-    /// Add a rectangle (2 triangles, 4 vertices, 6 indices).
+    /// Add a filled rectangle.
+    ///
+    /// Fast path (translation-only transform): records a single fill-only SDF
+    /// chrome instance (radius 0) instead of two soup triangles — so thousands of
+    /// rects collapse to small per-instance records the renderer rasterizes,
+    /// with no per-frame soup re-tessellation/re-upload. Under any rotation/scale/
+    /// shear it falls back to soup geometry ([`DrawList::quad_soup`]) so the rect
+    /// still transforms correctly.
     pub fn quad(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        if self.current_transform().is_translate_only() {
+            self.fill_rect_instance(Rect::new(x, y, width, height), 0.0, color);
+        } else {
+            self.quad_soup(x, y, width, height, color);
+        }
+    }
+
+    /// Tessellate a filled rectangle into the vertex soup (2 triangles, 4
+    /// vertices). The fallback path for [`DrawList::quad`] under non-translation
+    /// transforms, and the building block for the other soup primitives.
+    fn quad_soup(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
         let x0 = x;
         let y0 = y;
         let x1 = x + width;
@@ -477,6 +529,14 @@ impl DrawList {
     pub fn rounded_rect(&mut self, rect: Rect, radius: f32, color: [f32; 4]) {
         if radius <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
             self.quad(rect.x, rect.y, rect.width, rect.height, color);
+            return;
+        }
+
+        // Fast path: one fill-only SDF instance (the shader clamps the radius and
+        // rasterizes anti-aliased corners) instead of 5 strip quads + 4×8 corner
+        // triangles into the soup. Falls back to tessellation under rotation/scale.
+        if self.current_transform().is_translate_only() {
+            self.fill_rect_instance(rect, radius, color);
             return;
         }
 
@@ -605,6 +665,12 @@ impl DrawList {
         if thickness <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
             return;
         }
+        // Fast path: one outline-only SDF instance (radius 0, transparent fill)
+        // instead of four edge quads. Falls back to soup under rotation/scale.
+        if self.current_transform().is_translate_only() {
+            self.stroke_rect_instance(rect, 0.0, thickness, color);
+            return;
+        }
         // Clamp so an over-thick border degenerates to a filled rect instead of
         // overlapping itself / inverting the inner strips.
         let t = thickness.min(rect.width * 0.5).min(rect.height * 0.5);
@@ -641,6 +707,14 @@ impl DrawList {
         }
         if radius <= 0.0 {
             self.rect_outline(rect, thickness, color);
+            return;
+        }
+
+        // Fast path: one outline-only SDF instance (rounded, transparent fill)
+        // instead of two edge quads + four corner arcs. The shader clamps radius
+        // and thickness. Falls back to soup tessellation under rotation/scale.
+        if self.current_transform().is_translate_only() {
+            self.stroke_rect_instance(rect, radius, thickness, color);
             return;
         }
 
@@ -753,10 +827,26 @@ impl DrawList {
             return;
         }
 
-        // Fast path: one instance. Close out any soup recorded since the last
-        // command so draw order (soup → this chrome) is preserved.
+        // Fast path: one instance carrying both fill and border.
+        self.push_chrome_instance(rect, radius, thickness, bg, border);
+    }
+
+    /// Record one SDF chrome instance (fill + border) for a translation-only
+    /// rect, preserving draw order: any soup appended since the last command is
+    /// flushed into a `Soup` command first, then this instance extends (or
+    /// starts) the trailing `Chrome` run. The caller must already have checked
+    /// `is_translate_only()`.
+    fn push_chrome_instance(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        thickness: f32,
+        bg: [f32; 4],
+        border: [f32; 4],
+    ) {
         self.flush_soup();
 
+        let m = self.current_transform();
         let (clip, clip_enabled) = match self.current_clip() {
             Some(c) => ([c.x, c.y, c.width, c.height], 1.0),
             None => ([0.0; 4], 0.0),
@@ -771,8 +861,6 @@ impl DrawList {
         let idx = self.chrome_instances.len() as u32;
         self.chrome_instances.push(inst);
 
-        // Extend the trailing chrome run if this instance is contiguous with it,
-        // otherwise start a new run.
         match self.color_cmds.last_mut() {
             Some(ColorCmd::Chrome { instances }) if instances.end == idx => {
                 instances.end = idx + 1;
@@ -780,6 +868,59 @@ impl DrawList {
             _ => self
                 .color_cmds
                 .push(ColorCmd::Chrome { instances: idx..idx + 1 }),
+        }
+    }
+
+    /// Record a fill-only SDF rect instance (border == fill so the anti-aliased
+    /// edge stays the fill color, no border ring). Backs the translation-only
+    /// fast path of [`DrawList::quad`] / [`DrawList::rounded_rect`].
+    fn fill_rect_instance(&mut self, rect: Rect, radius: f32, color: [f32; 4]) {
+        self.push_chrome_instance(rect, radius, 0.0, color, color);
+    }
+
+    /// Record an outline-only SDF rect instance (transparent fill so only the
+    /// border band renders). Backs the translation-only fast path of
+    /// [`DrawList::rect_outline`] / [`DrawList::rounded_rect_outline`].
+    fn stroke_rect_instance(&mut self, rect: Rect, radius: f32, thickness: f32, color: [f32; 4]) {
+        let transparent = [color[0], color[1], color[2], 0.0];
+        self.push_chrome_instance(rect, radius, thickness, transparent, color);
+    }
+
+    /// Record one SDF circle instance for a translation-only circle. Same
+    /// ordering contract as [`DrawList::push_chrome_instance`] but into the
+    /// circle instance buffer / `Circle` runs. `thickness <= 0` is a filled
+    /// disc; `> 0` is a ring centered on `radius`. The caller must already have
+    /// checked `is_translate_only()`.
+    fn push_circle_instance(
+        &mut self,
+        center: (f32, f32),
+        radius: f32,
+        thickness: f32,
+        color: [f32; 4],
+    ) {
+        self.flush_soup();
+
+        let m = self.current_transform();
+        let (clip, clip_enabled) = match self.current_clip() {
+            Some(c) => ([c.x, c.y, c.width, c.height], 1.0),
+            None => ([0.0; 4], 0.0),
+        };
+        let inst = CircleInstance {
+            center: [center.0 + m.tx, center.1 + m.ty, radius, thickness],
+            color: self.apply_tint(color),
+            clip,
+            params: [clip_enabled, 0.0, 0.0, 0.0],
+        };
+        let idx = self.circle_instances.len() as u32;
+        self.circle_instances.push(inst);
+
+        match self.color_cmds.last_mut() {
+            Some(ColorCmd::Circle { instances }) if instances.end == idx => {
+                instances.end = idx + 1;
+            }
+            _ => self
+                .color_cmds
+                .push(ColorCmd::Circle { instances: idx..idx + 1 }),
         }
     }
 
@@ -838,6 +979,12 @@ impl DrawList {
         if radius <= 0.0 {
             return;
         }
+        // Fast path: one SDF disc instance (smooth at any radius) instead of a
+        // 16-64-segment fan. Falls back to the fan under rotation/scale.
+        if self.current_transform().is_translate_only() {
+            self.push_circle_instance(center, radius, 0.0, color);
+            return;
+        }
         let segs = Self::circle_segments(radius);
         for i in 0..segs {
             let a0 = std::f32::consts::TAU * i as f32 / segs as f32;
@@ -859,6 +1006,12 @@ impl DrawList {
         color: [f32; 4],
     ) {
         if radius <= 0.0 || thickness <= 0.0 {
+            return;
+        }
+        // Fast path: one SDF ring instance instead of a stroked-arc band.
+        // Falls back to the band tessellation under rotation/scale.
+        if self.current_transform().is_translate_only() {
+            self.push_circle_instance(center, radius, thickness, color);
             return;
         }
         let half = thickness * 0.5;
@@ -1055,28 +1208,40 @@ mod tests {
     }
 
     #[test]
-    fn rounded_rect_emits_plausible_geometry() {
+    fn rounded_rect_emits_chrome_instance() {
+        // Translate-only rounded fills record one SDF chrome instance (radius in
+        // params[0], thickness 0 = fill), not tessellated soup.
         let mut list = DrawList::new();
         list.rounded_rect(Rect::new(0.0, 0.0, 100.0, 40.0), 6.0, [1.0, 1.0, 1.0, 1.0]);
 
-        assert!(list.vertices.len() > 12);
-        assert!(list.indices.len() > 18);
+        assert!(list.vertices.is_empty());
+        assert_eq!(list.chrome_instances.len(), 1);
+        let inst = list.chrome_instances[0];
+        assert_eq!(inst.rect, [0.0, 0.0, 100.0, 40.0]);
+        assert!(approx(inst.params[0], 6.0)); // radius
+        assert!(approx(inst.params[1], 0.0)); // thickness (fill)
     }
 
     #[test]
-    fn rect_outline_emits_four_edge_quads() {
+    fn rect_outline_emits_stroke_instance() {
         let mut list = DrawList::new();
         list.rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 2.0, [1.0; 4]);
-        // Four quads = 16 vertices, 24 indices.
-        assert_eq!(list.vertices.len(), 16);
-        assert_eq!(list.indices.len(), 24);
+        assert!(list.vertices.is_empty());
+        assert_eq!(list.chrome_instances.len(), 1);
+        let inst = list.chrome_instances[0];
+        assert!(approx(inst.params[0], 0.0)); // radius (square corners)
+        assert!(approx(inst.params[1], 2.0)); // thickness
+        assert!(approx(inst.bg[3], 0.0)); // transparent fill: only the border band draws
     }
 
     #[test]
     fn rect_outline_degenerates_to_two_quads_when_thick() {
-        // Thickness >= half height: inner strip collapses, only top+bottom drawn.
+        // Under rotation the outline falls back to the soup tessellator, where a
+        // thickness >= half height collapses the inner strip to top+bottom only.
         let mut list = DrawList::new();
+        list.rotate(std::f32::consts::FRAC_PI_4);
         list.rect_outline(Rect::new(0.0, 0.0, 100.0, 10.0), 50.0, [1.0; 4]);
+        assert!(list.chrome_instances.is_empty());
         assert_eq!(list.vertices.len(), 8); // two quads
     }
 
@@ -1085,15 +1250,19 @@ mod tests {
         let mut list = DrawList::new();
         list.rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 0.0, [1.0; 4]);
         assert!(list.vertices.is_empty());
+        assert!(list.chrome_instances.is_empty());
     }
 
     #[test]
-    fn rounded_rect_outline_emits_geometry() {
+    fn rounded_rect_outline_emits_stroke_instance() {
         let mut list = DrawList::new();
         list.rounded_rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 8.0, 2.0, [1.0; 4]);
-        // 4 edge quads + 4 corner arcs (8 segments × 2 tris each).
-        assert!(list.vertices.len() > 12);
-        assert!(list.indices.len() > 18);
+        assert!(list.vertices.is_empty());
+        assert_eq!(list.chrome_instances.len(), 1);
+        let inst = list.chrome_instances[0];
+        assert!(approx(inst.params[0], 8.0)); // radius
+        assert!(approx(inst.params[1], 2.0)); // thickness
+        assert!(approx(inst.bg[3], 0.0)); // transparent fill
     }
 
     #[test]
@@ -1102,29 +1271,46 @@ mod tests {
         rounded.rounded_rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 0.0, 2.0, [1.0; 4]);
         let mut plain = DrawList::new();
         plain.rect_outline(Rect::new(0.0, 0.0, 100.0, 40.0), 2.0, [1.0; 4]);
-        assert_eq!(rounded.vertices.len(), plain.vertices.len());
+        // Both produce an identical square-cornered stroke instance.
+        assert_eq!(rounded.chrome_instances.len(), 1);
+        assert_eq!(rounded.chrome_instances, plain.chrome_instances);
     }
 
     #[test]
-    fn circle_emits_fan_within_radius() {
+    fn circle_emits_instance() {
+        // Translate-only circle fills record one SDF circle instance.
         let mut list = DrawList::new();
+        list.circle((50.0, 50.0), 20.0, [1.0; 4]);
+        assert!(list.vertices.is_empty());
+        assert_eq!(list.circle_instances.len(), 1);
+        let inst = list.circle_instances[0];
+        assert_eq!(inst.center, [50.0, 50.0, 20.0, 0.0]); // cx, cy, radius, thickness(fill)
+    }
+
+    #[test]
+    fn circle_emits_fan_within_radius_under_rotation() {
+        // Under rotation the circle falls back to the soup fan. Centered at the
+        // origin (rotation's fixed point) so the within-radius check still holds.
+        let mut list = DrawList::new();
+        list.rotate(std::f32::consts::FRAC_PI_4);
         let r = 20.0;
-        list.circle((50.0, 50.0), r, [1.0; 4]);
+        list.circle((0.0, 0.0), r, [1.0; 4]);
+        assert!(list.circle_instances.is_empty());
         assert!(!list.vertices.is_empty());
-        // Every vertex lies within (or on) the circle of radius r about center.
         for v in &list.vertices {
-            let dx = v.position[0] - 50.0;
-            let dy = v.position[1] - 50.0;
-            assert!((dx * dx + dy * dy).sqrt() <= r + 1e-3);
+            let d = (v.position[0] * v.position[0] + v.position[1] * v.position[1]).sqrt();
+            assert!(d <= r + 1e-3);
         }
     }
 
     #[test]
-    fn circle_outline_band_spans_radius() {
+    fn circle_outline_band_spans_radius_under_rotation() {
         let mut list = DrawList::new();
+        list.rotate(std::f32::consts::FRAC_PI_4);
         let (r, t) = (20.0, 4.0);
         list.circle_outline((0.0, 0.0), r, t, [1.0; 4]);
         // Vertices sit on the inner or outer ring: distance in [r - t/2, r + t/2].
+        assert!(list.circle_instances.is_empty());
         let lo = r - t * 0.5 - 1e-3;
         let hi = r + t * 0.5 + 1e-3;
         for v in &list.vertices {
@@ -1134,22 +1320,30 @@ mod tests {
     }
 
     #[test]
+    fn circle_outline_emits_instance() {
+        let mut list = DrawList::new();
+        list.circle_outline((0.0, 0.0), 20.0, 4.0, [1.0; 4]);
+        assert_eq!(list.circle_instances.len(), 1);
+        let inst = list.circle_instances[0];
+        assert_eq!(inst.center, [0.0, 0.0, 20.0, 4.0]); // thickness carries the band width
+    }
+
+    #[test]
     fn circle_zero_radius_draws_nothing() {
         let mut list = DrawList::new();
         list.circle((0.0, 0.0), 0.0, [1.0; 4]);
         list.circle_outline((0.0, 0.0), 0.0, 2.0, [1.0; 4]);
         assert!(list.vertices.is_empty());
+        assert!(list.circle_instances.is_empty());
     }
 
     #[test]
     fn outline_primitives_respect_transform() {
-        // Outlines are built from quad()/triangle(), so the active transform must
-        // carry through just like other primitives.
+        // Translate-only outlines bake the translated rect into the instance.
         let mut list = DrawList::new();
         list.translate(100.0, 50.0);
         list.rect_outline(Rect::new(0.0, 0.0, 10.0, 10.0), 2.0, [1.0; 4]);
-        // First vertex of the top strip: local (0,0) -> world (100,50).
-        assert_eq!(list.vertices[0].position, [100.0, 50.0]);
+        assert_eq!(list.chrome_instances[0].rect, [100.0, 50.0, 10.0, 10.0]);
     }
 
     #[test]
@@ -1208,19 +1402,20 @@ mod tests {
         let clip = Rect::new(10.0, 20.0, 30.0, 40.0);
 
         list.push_clip(clip);
+        // Translate-only quads record chrome instances carrying the active clip.
         list.quad(0.0, 0.0, 100.0, 100.0, [1.0, 1.0, 1.0, 1.0]);
         list.text(crate::text::TextBlock::new("clipped", 0.0, 0.0));
         list.icon("icon", 0.0, 0.0, 10.0, 10.0);
         list.pop_clip();
         list.quad(0.0, 0.0, 10.0, 10.0, [1.0, 1.0, 1.0, 1.0]);
 
-        assert_eq!(list.vertices[0].clip_enabled, 1.0);
-        assert_eq!(list.vertices[0].clip, [10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(list.chrome_instances[0].params[2], 1.0); // clip_enabled
+        assert_eq!(list.chrome_instances[0].clip, [10.0, 20.0, 30.0, 40.0]);
         assert_eq!(list.texts[0].clip, Some(Rect::new(10.0, 20.0, 30.0, 40.0)));
         assert_eq!(list.icons[0].clip, Some(clip));
         assert_eq!(list.icons[0].icon_key, "icon");
         assert_eq!(list.icons[0].tint, [1.0, 1.0, 1.0, 1.0]);
-        assert_eq!(list.vertices[4].clip_enabled, 0.0);
+        assert_eq!(list.chrome_instances[1].params[2], 0.0); // clip disabled
     }
 
     #[test]
@@ -1254,11 +1449,12 @@ mod tests {
 
     #[test]
     fn quad_under_translate() {
+        // Translate-only quads bake the translated rect into a chrome instance.
         let mut list = DrawList::new();
         list.translate(100.0, 50.0);
         list.quad(0.0, 0.0, 10.0, 20.0, [1.0; 4]);
-        assert_eq!(list.vertices[0].position, [100.0, 50.0]);
-        assert_eq!(list.vertices[2].position, [110.0, 70.0]);
+        assert!(list.vertices.is_empty());
+        assert_eq!(list.chrome_instances[0].rect, [100.0, 50.0, 10.0, 20.0]);
     }
 
     #[test]
@@ -1303,11 +1499,12 @@ mod tests {
         let mut list = DrawList::new();
         list.set_tint([0.5, 0.5, 0.5, 1.0]);
         list.quad(0.0, 0.0, 10.0, 10.0, [0.4, 0.6, 0.8, 1.0]);
-        let v = list.vertices[0];
-        assert!(approx(v.color[0], 0.2));
-        assert!(approx(v.color[1], 0.3));
-        assert!(approx(v.color[2], 0.4));
-        assert!(approx(v.color[3], 1.0));
+        // Tint is baked into the chrome instance's bg color (fill: border == bg).
+        let inst = list.chrome_instances[0];
+        assert!(approx(inst.bg[0], 0.2));
+        assert!(approx(inst.bg[1], 0.3));
+        assert!(approx(inst.bg[2], 0.4));
+        assert!(approx(inst.bg[3], 1.0));
     }
 
     #[test]
@@ -1428,10 +1625,11 @@ mod tests {
     #[test]
     fn chrome_rect_interleaves_with_soup_in_order() {
         let mut list = DrawList::new();
-        // soup, chrome, soup, chrome
-        list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]); // 6 indices
+        // soup, chrome, soup, chrome. `line` stays in the soup (it is not
+        // instanced), so it produces genuine Soup runs to interleave with chrome.
+        list.line([0.0, 0.0], [10.0, 0.0], 2.0, [1.0; 4]); // 6 indices
         list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
-        list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]); // 6 more indices
+        list.line([0.0, 0.0], [10.0, 0.0], 2.0, [1.0; 4]); // 6 more indices
         list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
         assert_eq!(
             list.color_cmds,
@@ -1452,8 +1650,8 @@ mod tests {
     fn chrome_rect_trailing_soup_left_uncommitted() {
         let mut list = DrawList::new();
         list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
-        list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]); // soup after chrome
-        // The trailing quad is NOT in a command; the renderer draws
+        list.line([0.0, 0.0], [10.0, 0.0], 2.0, [1.0; 4]); // soup after chrome
+        // The trailing line is NOT in a command; the renderer draws
         // indices[committed..total] as the trailing run.
         assert_eq!(
             list.color_cmds,
