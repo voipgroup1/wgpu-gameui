@@ -168,7 +168,7 @@ impl UiState {
     /// Per-frame teardown: resolve focus navigation against the widgets
     /// registered this frame. Call after building the frame's verbs.
     pub fn end_frame(&mut self) {
-        self.focus.end_frame();
+        self.focus.end_frame(None);
     }
 }
 

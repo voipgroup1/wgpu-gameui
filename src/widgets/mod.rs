@@ -41,20 +41,32 @@ use crate::{InputState, Theme};
 
 /// Context for drawing UI elements.
 ///
-/// Bundles commonly-passed drawing parameters to reduce function argument counts.
-/// Use this when passing drawing resources through multiple UI layers.
+/// Bundles the per-frame resources a widget needs: mutable draw list + focus
+/// state, plus read-only theme, input, and screen dimensions. Callers construct
+/// one per frame (or per layer dispatch) and pass it to every widget; Rust's
+/// borrow checker tracks each field independently when they come from separate
+/// originals, so `ctx.draw_list` and `ctx.focus` can be `.`-accessed freely.
+///
+/// When drawing into a modal/popup layer, set [`active_layer`](Self::active_layer)
+/// to that layer's index so focus registration is automatically scoped.
 pub struct DrawContext<'a> {
     pub draw_list: &'a mut DrawList,
+    pub focus: &'a mut FocusState,
     pub theme: &'a Theme,
     pub input: &'a InputState,
     pub screen_width: f32,
     pub screen_height: f32,
+    /// When drawing into a specific layer (modal/popup), set this to the
+    /// layer index so [`register_focus`](Self::register_focus) automatically
+    /// scopes the focusable to that layer's Tab ring.
+    pub active_layer: Option<usize>,
 }
 
 impl<'a> DrawContext<'a> {
-    /// Create a new draw context.
+    /// Create a new draw context with all required per-frame resources.
     pub fn new(
         draw_list: &'a mut DrawList,
+        focus: &'a mut FocusState,
         theme: &'a Theme,
         input: &'a InputState,
         screen_width: f32,
@@ -62,10 +74,22 @@ impl<'a> DrawContext<'a> {
     ) -> Self {
         Self {
             draw_list,
+            focus,
             theme,
             input,
             screen_width,
             screen_height,
+            active_layer: None,
+        }
+    }
+
+    /// Register `id` as focusable in the active layer (or base if no layer).
+    /// Convenience that delegates to [`FocusState::register`] or
+    /// [`FocusState::register_layer`] based on [`active_layer`](Self::active_layer).
+    pub fn register_focus(&mut self, id: FocusId) {
+        match self.active_layer {
+            Some(layer) => self.focus.register_layer(id, layer),
+            None => self.focus.register(id),
         }
     }
 }

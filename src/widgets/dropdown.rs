@@ -21,17 +21,22 @@
 //!
 //! ```ignore
 //! let mut dropdowns = DropdownState::new();
+//! let mut focus = FocusState::new();
 //! // --- per frame ---
 //! dropdowns.begin_frame(&raw_input);
+//! focus.begin_frame(&raw_input);
 //! let popup = dropdowns.push_open_layer(&mut layers);   // from LAST frame's geometry
 //! let base_input = layers.input_for_base(&raw_input);   // blocks clicks under the open list
 //! // draw base widgets, including the dropdown button:
-//! Dropdown::new(&items, sel).draw(MY_ID, rect, &mut dropdowns, layers.base_mut(), theme, &base_input);
+//! let mut ctx = DrawContext::new(layers.base_mut(), &mut focus, &theme, &base_input, w, h);
+//! Dropdown::new(&items, sel).draw(MY_ID, rect, &mut dropdowns, &mut ctx);
+//! drop(ctx); // release the borrow on layers.base_mut()
 //! // after the base scope:
-//! if let Some((id, idx)) = dropdowns.draw_open_layer(&mut layers, popup, theme, &raw_input) {
+//! if let Some((id, idx)) = dropdowns.draw_open_layer(&mut layers, popup, &theme, &raw_input) {
 //!     if id == MY_ID { sel = idx; }
 //! }
 //! dropdowns.end_frame();
+//! focus.end_frame(None);
 //! ```
 //!
 //! ## Timing
@@ -44,7 +49,7 @@ use crate::layout::Rect;
 use crate::text::TextBlock;
 use crate::{InputState, LayerStack, Theme};
 
-use super::DrawList;
+use super::{DrawContext, DrawList};
 
 /// Stable identity for a dropdown within one UI surface. Any scheme that is
 /// unique per dropdown per frame works (a hash, an enum discriminant, a loop
@@ -100,10 +105,16 @@ pub struct DropdownState {
     next_geom: Option<OpenGeom>,
     /// Vertical scroll offset of the open list (pixels), for long lists.
     scroll_offset: f32,
+    /// Keyboard-hovered item index within the open list (defaults to `selected`
+    /// when the dropdown opens).
+    highlighted: usize,
     // ---- per-frame input edges, captured in begin_frame (mirrors FocusState) ----
     escape: bool,
     mouse_clicked: bool,
     click_claimed: bool,
+    key_up: bool,
+    key_down: bool,
+    enter: bool,
 }
 
 impl DropdownState {
@@ -113,13 +124,16 @@ impl DropdownState {
     }
 
     /// Begin a frame: promote the geometry collected last frame into the
-    /// view used this frame, and capture this frame's Esc/click edges. Call
-    /// once per frame, before [`push_open_layer`](Self::push_open_layer).
+    /// view used this frame, and capture this frame's Esc/keyboard/click edges.
+    /// Call once per frame, before [`push_open_layer`](Self::push_open_layer).
     pub fn begin_frame(&mut self, input: &InputState) {
         self.geom = self.next_geom.take();
         self.escape = input.key_escape;
         self.mouse_clicked = input.mouse_clicked;
         self.click_claimed = false;
+        self.key_up = input.key_up;
+        self.key_down = input.key_down;
+        self.enter = input.enter_pressed;
     }
 
     /// True when `id` is the open dropdown.
@@ -138,6 +152,7 @@ impl DropdownState {
         self.geom = None;
         self.next_geom = None;
         self.scroll_offset = 0.0;
+        self.highlighted = 0;
     }
 
     /// The floating list rect for `geom` — directly below the button, as wide
@@ -175,8 +190,10 @@ impl DropdownState {
     /// Draw the open list into the popup layer pushed by
     /// [`push_open_layer`](Self::push_open_layer) and resolve clicks on it. Call
     /// once per frame, after the base widgets are drawn. Returns
-    /// `Some((id, index))` when an option was clicked (the dropdown closes), and
-    /// `None` otherwise. `popup` is the index returned by `push_open_layer`.
+    /// `Some((id, index))` when an option was clicked or Enter-pressed (the
+    /// dropdown closes), and `None` otherwise. `popup` is the index returned by
+    /// `push_open_layer`; when `None` but a dropdown is open (same-frame open),
+    /// this method pushes a popup layer on the fly.
     pub fn draw_open_layer(
         &mut self,
         layers: &mut LayerStack,
@@ -184,9 +201,21 @@ impl DropdownState {
         theme: &Theme,
         input: &InputState,
     ) -> Option<(DropdownId, usize)> {
-        let idx = popup?;
         let geom = self.geom.clone()?;
         let list_rect = Self::list_rect(&geom);
+
+        // For same-frame open, `push_open_layer` didn't run yet — push a popup
+        // now so we have a DrawList to draw into. It won't block input this
+        // frame (that requires being pushed before input_for_base), but the
+        // visual list appears immediately.
+        let idx = match popup {
+            Some(i) => i,
+            None => {
+                let i = layers.push_popup(list_rect);
+                layers.pop_layer();
+                i
+            }
+        };
 
         // Input as the popup layer sees it (consumed if a higher layer covers
         // the cursor — e.g. a modal above the dropdown).
@@ -203,6 +232,33 @@ impl DropdownState {
         }
         self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
         let scroll = self.scroll_offset;
+
+        // ---- Keyboard navigation ----
+        // Arrow keys move the highlight. This uses the raw input (not
+        // layer-dispatched) because keyboard events aren't positional.
+        if !geom.items.is_empty() {
+            if input.key_up {
+                self.highlighted = self.highlighted.saturating_sub(1);
+                // Scroll to keep highlighted in view.
+                let top = self.highlighted as f32 * geom.item_h;
+                let bottom = top + geom.item_h;
+                if top < self.scroll_offset {
+                    self.scroll_offset = top;
+                } else if bottom > self.scroll_offset + list_rect.height {
+                    self.scroll_offset = bottom - list_rect.height;
+                }
+            }
+            if input.key_down {
+                self.highlighted = (self.highlighted + 1).min(geom.items.len() - 1);
+                let top = self.highlighted as f32 * geom.item_h;
+                let bottom = top + geom.item_h;
+                if top < self.scroll_offset {
+                    self.scroll_offset = top;
+                } else if bottom > self.scroll_offset + list_rect.height {
+                    self.scroll_offset = bottom - list_rect.height;
+                }
+            }
+        }
 
         let (sel_r, sel_g, sel_b) = rgb(theme.background);
         let (txt_r, txt_g, txt_b) = rgb(theme.text);
@@ -229,9 +285,24 @@ impl DropdownState {
                     && li.mouse_y < iy + geom.item_h
                     && !li.mouse_consumed;
                 let is_selected = i == geom.selected;
+                let is_highlighted = self.highlighted == i;
                 if is_selected {
                     l.quad(list_rect.x, iy, list_rect.width, geom.item_h, theme.accent);
+                } else if is_highlighted {
+                    // Keyboard highlight: a brighter/stronger hover.
+                    l.quad(
+                        list_rect.x,
+                        iy,
+                        list_rect.width,
+                        geom.item_h,
+                        theme.button_hover,
+                    );
                 } else if hovered {
+                    // Mouse hover only when keyboard isn't already highlighting
+                    // a different item (to avoid fighting the user).
+                    if !input.key_up && !input.key_down {
+                        self.highlighted = i;
+                    }
                     l.quad(
                         list_rect.x,
                         iy,
@@ -261,7 +332,7 @@ impl DropdownState {
         }
 
         // Resolve a click on the list.
-        let mut result = None;
+        let mut result: Option<(DropdownId, usize)> = None;
         if li.mouse_clicked && list_rect.contains(li.mouse_x, li.mouse_y) {
             // A click anywhere inside the popup is "claimed" so end_frame's
             // click-elsewhere blur doesn't also fire.
@@ -270,6 +341,16 @@ impl DropdownState {
             let row = (rel / geom.item_h).floor();
             if row >= 0.0 && (row as usize) < geom.items.len() {
                 result = Some((geom.id, row as usize));
+                self.close();
+            }
+        }
+        // Enter on the highlighted item selects it.
+        if input.enter_pressed && !geom.items.is_empty() {
+            let row = self.highlighted;
+            if row < geom.items.len() {
+                result = Some((geom.id, row));
+                // Claim the click so end_frame doesn't also close us.
+                self.click_claimed = true;
                 self.close();
             }
         }
@@ -346,12 +427,21 @@ impl<'a> Dropdown<'a> {
         id: DropdownId,
         rect: Rect,
         state: &mut DropdownState,
-        list: &mut DrawList,
-        theme: &Theme,
-        input: &InputState,
+        ctx: &mut DrawContext,
     ) -> DropdownOutput {
+        // Register as focusable for Tab nav (scoped to active layer).
+        ctx.register_focus(id);
+
+        let list = &mut *ctx.draw_list;
+        let theme = ctx.theme;
+        let input = ctx.input;
+
         let hovered = input.is_hovered(rect.x, rect.y, rect.width, rect.height);
         let clicked = hovered && input.mouse_clicked;
+
+        // Activate on click, Space, or Enter when focused.
+        let focused = ctx.focus.is_focused(id);
+        let keyboard_activate = focused && (input.enter_pressed || input.key_space);
 
         // Clicking the button toggles this dropdown (single owner: opening one
         // implicitly leaves any other to be closed by its own end_frame).
@@ -360,7 +450,32 @@ impl<'a> Dropdown<'a> {
                 state.close();
             } else {
                 state.open = Some(id);
-                state.scroll_offset = 0.0;
+                state.highlighted = self.selected;
+                state.scroll_offset = (self.selected as f32 * ITEM_HEIGHT)
+                    .max(0.0);
+                state.click_claimed = true;
+            }
+        } else if keyboard_activate {
+            // Keyboard open — same-frame open by setting geom immediately.
+            if state.is_open(id) {
+                state.close();
+            } else {
+                state.open = Some(id);
+                state.highlighted = self.selected;
+                state.scroll_offset = (self.selected as f32 * ITEM_HEIGHT)
+                    .max(0.0);
+                let geom = OpenGeom {
+                    id,
+                    button_rect: rect,
+                    items: self.items.iter().map(|s| s.to_string()).collect(),
+                    selected: self.selected,
+                    width: rect.width,
+                    item_h: ITEM_HEIGHT,
+                    max_visible: self.max_visible,
+                };
+                state.geom = Some(geom.clone());
+                state.next_geom = Some(geom);
+                // Claim the click too, to avoid end_frame closing us.
                 state.click_claimed = true;
             }
         }
@@ -436,6 +551,7 @@ fn draw_chevron(list: &mut DrawList, rect: Rect, theme: &Theme, open: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FocusState;
 
     fn input(clicked: bool, escape: bool, mouse: (f32, f32)) -> InputState {
         InputState {
@@ -457,12 +573,15 @@ mod tests {
 
     /// Drive one full frame: begin, draw both buttons, end. Returns nothing —
     /// inspect `state` afterwards.
-    fn frame(state: &mut DropdownState, theme: &Theme, inp: &InputState) {
+    fn frame(state: &mut DropdownState, focus: &mut FocusState, theme: &Theme, inp: &InputState) {
+        focus.begin_frame(inp);
         state.begin_frame(inp);
         let mut list = DrawList::new();
-        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), state, &mut list, theme, inp);
-        Dropdown::new(&ITEMS, 0).draw(2, rect_b(), state, &mut list, theme, inp);
+        let mut ctx = DrawContext::new(&mut list, focus, theme, inp, 800.0, 600.0);
+        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), state, &mut ctx);
+        Dropdown::new(&ITEMS, 0).draw(2, rect_b(), state, &mut ctx);
         state.end_frame();
+        focus.end_frame(None);
     }
 
     #[test]
@@ -476,11 +595,12 @@ mod tests {
     fn clicking_button_toggles_open() {
         let theme = Theme::default();
         let mut s = DropdownState::new();
+        let mut focus = FocusState::new();
         // Click inside button A.
-        frame(&mut s, &theme, &input(true, false, (20.0, 20.0)));
+        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0)));
         assert!(s.is_open(1));
         // Click it again → closes.
-        frame(&mut s, &theme, &input(true, false, (20.0, 20.0)));
+        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0)));
         assert!(!s.is_open(1));
         assert_eq!(s.open(), None);
     }
@@ -489,9 +609,10 @@ mod tests {
     fn single_owner_opening_b_replaces_a() {
         let theme = Theme::default();
         let mut s = DropdownState::new();
-        frame(&mut s, &theme, &input(true, false, (20.0, 20.0))); // open A
+        let mut focus = FocusState::new();
+        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0))); // open A
         assert!(s.is_open(1));
-        frame(&mut s, &theme, &input(true, false, (20.0, 90.0))); // click B
+        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 90.0))); // click B
         assert!(s.is_open(2));
         assert!(!s.is_open(1));
     }
@@ -500,9 +621,10 @@ mod tests {
     fn escape_closes() {
         let theme = Theme::default();
         let mut s = DropdownState::new();
-        frame(&mut s, &theme, &input(true, false, (20.0, 20.0))); // open A
+        let mut focus = FocusState::new();
+        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0))); // open A
         assert!(s.is_open(1));
-        frame(&mut s, &theme, &input(false, true, (20.0, 20.0))); // Esc
+        frame(&mut s, &mut focus, &theme, &input(false, true, (20.0, 20.0))); // Esc
         assert!(!s.is_open(1));
     }
 
@@ -510,10 +632,11 @@ mod tests {
     fn click_elsewhere_closes() {
         let theme = Theme::default();
         let mut s = DropdownState::new();
-        frame(&mut s, &theme, &input(true, false, (20.0, 20.0))); // open A
+        let mut focus = FocusState::new();
+        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0))); // open A
         assert!(s.is_open(1));
         // Click far from any button → unclaimed → end_frame closes.
-        frame(&mut s, &theme, &input(true, false, (500.0, 500.0)));
+        frame(&mut s, &mut focus, &theme, &input(true, false, (500.0, 500.0)));
         assert!(!s.is_open(1));
     }
 
@@ -521,8 +644,9 @@ mod tests {
     fn no_click_keeps_open() {
         let theme = Theme::default();
         let mut s = DropdownState::new();
-        frame(&mut s, &theme, &input(true, false, (20.0, 20.0))); // open A
-        frame(&mut s, &theme, &input(false, false, (0.0, 0.0))); // idle
+        let mut focus = FocusState::new();
+        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0))); // open A
+        frame(&mut s, &mut focus, &theme, &input(false, false, (0.0, 0.0))); // idle
         assert!(s.is_open(1));
     }
 
@@ -530,32 +654,166 @@ mod tests {
     fn open_list_appears_next_frame_and_selecting_returns_index() {
         let theme = Theme::default();
         let mut s = DropdownState::new();
+        let mut focus = FocusState::new();
         let mut layers = LayerStack::new();
 
         // Frame 1: open A. At frame-top there's no geometry yet, so no popup.
+        focus.begin_frame(&input(true, false, (20.0, 20.0)));
         s.begin_frame(&input(true, false, (20.0, 20.0)));
         let popup = s.push_open_layer(&mut layers);
         assert_eq!(popup, None, "freshly-opened list has no layer this frame");
         let mut list = DrawList::new();
-        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut list, &theme, &input(true, false, (20.0, 20.0)));
-        let pick = s.draw_open_layer(&mut layers, popup, &theme, &input(true, false, (20.0, 20.0)));
+        let input_open = input(true, false, (20.0, 20.0));
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &input_open, 800.0, 600.0);
+        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
+        drop(ctx);
+        let pick = s.draw_open_layer(&mut layers, popup, &theme, &input_open);
         assert_eq!(pick, None);
         s.end_frame();
+        focus.end_frame(None);
         assert!(s.is_open(1));
 
         // Frame 2: geometry promoted → popup pushed; click the 2nd row ("Green").
         layers.clear();
         // List sits at y = 10 + 28 + 2 = 40; row 1 spans [68, 96).
         let click_row1 = input(true, false, (20.0, 80.0));
+        focus.begin_frame(&click_row1);
         s.begin_frame(&click_row1);
         let popup = s.push_open_layer(&mut layers);
         assert!(popup.is_some(), "open list has a layer on the next frame");
         let mut list = DrawList::new();
+        let input_idle = input(false, false, (20.0, 80.0));
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &input_idle, 800.0, 600.0);
         // Button isn't clicked this frame (cursor is over the list, not the button).
-        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut list, &theme, &input(false, false, (20.0, 80.0)));
+        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
+        drop(ctx);
         let pick = s.draw_open_layer(&mut layers, popup, &theme, &click_row1);
         assert_eq!(pick, Some((1, 1)), "clicking row 1 returns (id=1, index=1)");
         s.end_frame();
+        focus.end_frame(None);
         assert!(!s.is_open(1), "selecting an option closes the dropdown");
+    }
+
+    /// Input helper that sets arrow-up or arrow-down.
+    fn input_keys(up: bool, down: bool, enter: bool) -> InputState {
+        InputState {
+            key_up: up,
+            key_down: down,
+            enter_pressed: enter,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn arrow_down_moves_highlighted_in_open_list() {
+        let theme = Theme::default();
+        let mut s = DropdownState::new();
+        let mut focus = FocusState::new();
+        let inp = input(true, false, (20.0, 20.0));
+        focus.begin_frame(&inp);
+        s.begin_frame(&inp);
+        let mut list = DrawList::new();
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &inp, 800.0, 600.0);
+        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
+        drop(ctx);
+        s.end_frame();
+        focus.end_frame(None);
+        assert!(s.is_open(1));
+
+        // Frame 2: arrow down twice.
+        let kbd = input_keys(false, true, false);
+        focus.begin_frame(&kbd);
+        s.begin_frame(&kbd);
+        let mut layers = LayerStack::new();
+        let popup = s.push_open_layer(&mut layers);
+        // draw_open_layer processes arrow-down from input
+        let _ = s.draw_open_layer(&mut layers, popup, &theme, &kbd);
+        assert_eq!(s.highlighted, 1, "arrow down moves to index 1");
+
+        let kbd2 = input_keys(false, true, false);
+        let _ = s.draw_open_layer(&mut layers, popup, &theme, &kbd2);
+        assert_eq!(s.highlighted, 2, "arrow down moves to index 2");
+        s.end_frame();
+    }
+
+    #[test]
+    fn arrow_up_moves_highlighted() {
+        let theme = Theme::default();
+        let mut s = DropdownState::new();
+        let mut focus = FocusState::new();
+        let inp = input(true, false, (20.0, 20.0));
+        focus.begin_frame(&inp);
+        s.begin_frame(&inp);
+        let mut list = DrawList::new();
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &inp, 800.0, 600.0);
+        Dropdown::new(&ITEMS, 2).draw(1, rect_a(), &mut s, &mut ctx); // selected = 2 → highlighted starts at 2
+        drop(ctx);
+        s.end_frame();
+        focus.end_frame(None);
+        assert!(s.is_open(1));
+        assert_eq!(s.highlighted, 2);
+
+        // Frame 2: arrow up.
+        let kbd = input_keys(true, false, false);
+        focus.begin_frame(&kbd);
+        s.begin_frame(&kbd);
+        let mut layers = LayerStack::new();
+        let popup = s.push_open_layer(&mut layers);
+        let _ = s.draw_open_layer(&mut layers, popup, &theme, &kbd);
+        assert_eq!(s.highlighted, 1, "arrow up moves to index 1");
+        s.end_frame();
+    }
+
+    #[test]
+    fn enter_selects_highlighted_item() {
+        let theme = Theme::default();
+        let mut s = DropdownState::new();
+        let mut focus = FocusState::new();
+        let inp = input(true, false, (20.0, 20.0));
+        focus.begin_frame(&inp);
+        s.begin_frame(&inp);
+        let mut list = DrawList::new();
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &inp, 800.0, 600.0);
+        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
+        drop(ctx);
+        s.end_frame();
+        focus.end_frame(None);
+        assert!(s.is_open(1));
+
+        // Frame 2: draw button (not clicked) + arrow down.
+        let kbd = InputState {
+            key_down: true,
+            enter_pressed: false,
+            ..Default::default()
+        };
+        focus.begin_frame(&kbd);
+        s.begin_frame(&kbd);
+        let mut layers = LayerStack::new();
+        let popup = s.push_open_layer(&mut layers);
+        let mut list = DrawList::new();
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &kbd, 800.0, 600.0);
+        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
+        drop(ctx);
+        let _ = s.draw_open_layer(&mut layers, popup, &theme, &kbd);
+        assert_eq!(s.highlighted, 1);
+        s.end_frame();
+        focus.end_frame(None);
+
+        // Frame 3: draw button (not clicked) + Enter selects highlighted (index 1).
+        let enter = InputState {
+            enter_pressed: true,
+            ..Default::default()
+        };
+        focus.begin_frame(&enter);
+        s.begin_frame(&enter);
+        let popup = s.push_open_layer(&mut layers);
+        let mut list = DrawList::new();
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &enter, 800.0, 600.0);
+        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
+        drop(ctx);
+        let result = s.draw_open_layer(&mut layers, popup, &theme, &enter);
+        assert_eq!(result, Some((1, 1)), "Enter selects highlighted item");
+        s.end_frame();
+        assert!(!s.is_open(1), "selecting closes the dropdown");
     }
 }

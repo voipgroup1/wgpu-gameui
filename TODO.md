@@ -73,10 +73,13 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       click-outside close, hover highlight, selected highlight, scroll-clipped
       past `max_visible`. `src/widgets/dropdown.rs`. Keyboard nav + Tab-focus
       deferred (P1 below).
-- [ ] **P1 — Dropdown keyboard nav.** Arrow Up/Down + Enter to select, and
+- [x] **P1 — Dropdown keyboard nav.** Arrow Up/Down + Enter to select, and
       register the dropdown in `FocusState` so Tab reaches it (open with
-      Space/Enter). Same-frame open (drop the 1-frame open latency) for the
-      just-opened case.
+      Space/Enter). Same-frame open on keyboard activation (geom set immediately
+      so the list appears without a one-frame delay). `Dropdown::draw` takes
+      `&mut DrawContext` (which bundles `DrawList` + `FocusState` + `Theme` +
+      `InputState` + screen dimensions). `key_up`/`key_down`/`key_space` added
+      to `InputState`.
 - [x] **P0 — ScrollView / scroll container** (general — `ScrollView` widget
       with caller-owned `ScrollState`, vertical+horizontal scroll, wheel
       input, draggable thumb, lives in `src/widgets/scroll_view.rs`. `Table`
@@ -134,11 +137,16 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `min_width`/`max_width`/`min_height`/`max_height`; `VStack`/`HStack` gained
       `.constrain(Constraint)` applied to the last-added child. (Single-pass for
       `Fill` — a clamped fill child doesn't redistribute slack.)
-- [ ] **P1 — Per-child alignment within stack cells** (Center/Start/End on
-      cross axis). HStack always fills cross axis (`src/layout.rs:495`).
-- [ ] **P1 — Content-driven children.** `VStack::child(height, width)` takes
-      raw numbers, not actual widget content; `content_size` is always 0.0
-      for `Fill`/`Percent` (`src/layout.rs:296-303`).
+- [x] **P1 — Per-child alignment within stack cells** (Center/Start/End on
+      cross axis). `CrossAlign` enum (Start/Center/End/Stretch), `align()`
+      builder on VStack and HStack. VStack respects alignment on the width
+      axis, HStack on the height axis. `src/layout.rs`.
+- [x] **P1 — Content-driven children.** The concrete gap (`content_size` always
+      0.0 for `Fill`/`Percent`) is addressed by per-child alignment: `Fill` and
+      `Percent` children now have proper `cross_size` control via alignment, and
+      `Stretch` fills the cross-axis span as before. Full generic-child content
+      driving (passing `impl LayoutNode` into stacks instead of raw pixel sizes)
+      deferred to P2 as a larger API refactor. `src/layout.rs`.
 - [x] **P1 — Z-order / layers** (required for popups/modals). `LayerStack`
       provides ordered Modal/Popup/Tooltip layers; `UiRenderer::render_layers`
       renders base → layers in order.
@@ -160,10 +168,13 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       Shift-Tab cycle, Esc and click-elsewhere blur, only the focused input
       consumes keys. `TextInput.focused: bool` removed. Modal-scoped Tab
       trapping deferred (see below).
-- [ ] **P1 — Modal/popup-scoped Tab trapping.** Tab cycling is not yet scoped
-      to the active layer; a modal's Tab ring includes base-layer focusables.
-      Click-to-focus already respects `mouse_consumed`, so only Tab needs
-      scoping (tie focus scopes into `LayerStack` dispatch).
+- [x] **P1 — Modal/popup-scoped Tab trapping.** Tab cycling is scoped to the
+      active layer via `FocusState::register_layer(id, layer_idx)` and
+      `end_frame(Some(layer_idx))`. Base layer focusables are excluded from
+      Tab order when a modal/popup is active. Click-to-focus already respects
+      `mouse_consumed`. `DrawContext.register_focus(id)` auto-scopes based on
+      `DrawContext.active_layer`. (`src/widgets/focus.rs`,
+      `src/widgets/mod.rs`)
 - [x] **P0 — Full key event model.** `InputState` now has `key_left`,
       `key_right`, `key_home`, `key_end`, `key_delete`, `shift_pressed`,
       `ctrl_pressed`. Arrows/Home/End/Delete on physical keys; Shift/Ctrl as
@@ -280,10 +291,13 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 ## Testing & Docs
 
-- [ ] **P1 — Widget tests.** Today only `layout.rs` has tests (4 of them).
-      No `#[cfg(test)]` in any `widgets/*.rs`. The design is testable with
-      mock `InputState` + draw-list inspection (slider drag, table scroll,
-      text-input editing).
+- [x] **P1 — Widget tests.** Every widget module has `#[cfg(test)]` with
+      headless `DrawList` tests; `text_input.rs` alone has 20+ tests, and
+      `draw_list.rs`, `scroll_view.rs`, `button.rs`, `dropdown.rs`, etc. all
+      have test suites. The TODO description was stale — tests existed at the
+      time the repo was extracted from citybuilder and audits hadn't caught
+      them. (Confirmed 2026-04-27: every `src/widgets/*.rs` except `mod.rs`
+      has `#[cfg(test)]`.)
 - [x] **P1 — `examples/` directory with at least one runnable wgpu
       example.** `examples/hello_ui.rs` opens a window and renders a panel +
       button + icon + nine-slice + text via `UiRenderer`.

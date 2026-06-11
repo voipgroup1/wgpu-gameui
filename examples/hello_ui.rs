@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    Dropdown, DropdownState, FocusState, FontHandle, InputState, LayerStack, ScrollState,
-    ScrollView, TextAlign, TextBlock, TextInput, Theme, UiContext, UiRenderer,
+    DrawContext, Dropdown, DropdownState, FocusState, FontHandle, InputState, LayerStack,
+    ScrollState, ScrollView, TextAlign, TextBlock, TextInput, Theme, UiContext, UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -476,7 +476,7 @@ impl ApplicationHandler for App {
                         &base_input,
                     );
 
-                    self.state.focus.end_frame();
+                    self.state.focus.end_frame(None);
                 }
 
                 // ---------- Dropdown demo ----------
@@ -489,13 +489,19 @@ impl ApplicationHandler for App {
                             .with_color(180, 190, 210),
                     );
                     let dd_rect = Rect::new(340.0, 300.0, 150.0, 28.0);
+                    let mut ctx = DrawContext::new(
+                        list,
+                        &mut self.state.focus,
+                        &self.theme,
+                        &base_input,
+                        gpu.config.width as f32,
+                        gpu.config.height as f32,
+                    );
                     Dropdown::new(&DROPDOWN_ITEMS, self.state.dropdown_sel).draw(
                         DROPDOWN_ID,
                         dd_rect,
                         &mut self.state.dropdowns,
-                        list,
-                        &self.theme,
-                        &base_input,
+                        &mut ctx,
                     );
                 }
 

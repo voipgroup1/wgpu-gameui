@@ -909,7 +909,7 @@ mod tests {
         focus.begin_frame(&input);
         a.draw(0, &mut focus, &mut list, &theme, &input);
         b.draw(1, &mut focus, &mut list, &theme, &input);
-        focus.end_frame();
+        focus.end_frame(None);
         assert!(focus.is_focused(0));
         assert!(!focus.is_focused(1));
 
@@ -918,7 +918,7 @@ mod tests {
         focus.begin_frame(&input);
         a.draw(0, &mut focus, &mut list, &theme, &input);
         b.draw(1, &mut focus, &mut list, &theme, &input);
-        focus.end_frame();
+        focus.end_frame(None);
         assert!(!focus.is_focused(0));
         assert!(focus.is_focused(1));
 
@@ -927,7 +927,7 @@ mod tests {
         focus.begin_frame(&input);
         a.draw(0, &mut focus, &mut list, &theme, &input);
         b.draw(1, &mut focus, &mut list, &theme, &input);
-        focus.end_frame();
+        focus.end_frame(None);
         assert!(!focus.is_focused(0));
         assert!(!focus.is_focused(1));
         assert_eq!(focus.focused(), None);

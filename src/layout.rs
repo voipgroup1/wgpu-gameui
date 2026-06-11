@@ -384,6 +384,25 @@ impl<T: LayoutNode> LayoutNode for Positioned<T> {
     }
 }
 
+/// Alignment of a child on the cross axis (perpendicular to the stack direction).
+///
+/// Defaults to [`Stretch`](CrossAlign::Stretch), which fills the full cross-axis
+/// span — the existing behavior. `Start`/`Center`/`End` pin the child at its
+/// natural [`StackChild::cross_size`] instead, leaving the leftover space on
+/// the other side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CrossAlign {
+    /// Align to the start of the cross axis (top for VStack, left for HStack).
+    Start,
+    /// Center on the cross axis.
+    Center,
+    /// Align to the end of the cross axis (bottom for VStack, right for HStack).
+    End,
+    /// Fill the full cross-axis span (default).
+    #[default]
+    Stretch,
+}
+
 /// Vertical stack - children arranged top to bottom.
 pub struct VStack {
     pub spacing: f32,
@@ -405,6 +424,8 @@ pub struct StackChild {
     pub cross_size: f32,   // Size perpendicular to stack axis
     /// Clamp applied to the resolved main-axis size of this child.
     pub constraint: Constraint,
+    /// Alignment on the cross axis (defaults to [`CrossAlign::Stretch`]).
+    pub align: CrossAlign,
 }
 
 impl VStack {
@@ -428,6 +449,7 @@ impl VStack {
             content_size: height,
             cross_size: width,
             constraint: Constraint::default(),
+            align: CrossAlign::Stretch,
         });
         self
     }
@@ -439,6 +461,7 @@ impl VStack {
             content_size: 0.0,
             cross_size: width,
             constraint: Constraint::default(),
+            align: CrossAlign::Stretch,
         });
         self
     }
@@ -450,6 +473,7 @@ impl VStack {
             content_size: 0.0,
             cross_size: width,
             constraint: Constraint::default(),
+            align: CrossAlign::Stretch,
         });
         self
     }
@@ -464,6 +488,24 @@ impl VStack {
     pub fn constrain(mut self, constraint: Constraint) -> Self {
         if let Some(last) = self.children.last_mut() {
             last.constraint = constraint;
+        }
+        self
+    }
+
+    /// Set the cross-axis alignment for the most recently added child.
+    ///
+    /// By default every child stretches to fill the full width ([`CrossAlign::Stretch`]).
+    /// Call this after a `child*` builder to pin the child at its `cross_size`
+    /// instead:
+    ///
+    /// ```ignore
+    /// VStack::new(8.0)
+    ///     .child(30.0, 80.0).align(CrossAlign::Center)
+    ///     .child_fill(60.0)
+    /// ```
+    pub fn align(mut self, align: CrossAlign) -> Self {
+        if let Some(last) = self.children.last_mut() {
+            last.align = align;
         }
         self
     }
@@ -528,7 +570,21 @@ impl LayoutNode for VStack {
             };
             let height = child.constraint.apply(base_height);
 
-            rects.push(Rect::new(bounds.x + self.padding, y, inner_width, height));
+            // Resolve cross-axis alignment (VStack cross axis = width).
+            let (cx, cwidth) = match child.align {
+                CrossAlign::Stretch => (bounds.x + self.padding, inner_width),
+                CrossAlign::Start => (bounds.x + self.padding, child.cross_size.min(inner_width)),
+                CrossAlign::Center => {
+                    let w = child.cross_size.min(inner_width);
+                    (bounds.x + self.padding + (inner_width - w) * 0.5, w)
+                }
+                CrossAlign::End => {
+                    let w = child.cross_size.min(inner_width);
+                    (bounds.x + self.padding + inner_width - w, w)
+                }
+            };
+
+            rects.push(Rect::new(cx, y, cwidth, height));
             y += height;
         }
 
@@ -557,6 +613,7 @@ impl HStack {
             content_size: width,
             cross_size: height,
             constraint: Constraint::default(),
+            align: CrossAlign::Stretch,
         });
         self
     }
@@ -568,6 +625,7 @@ impl HStack {
             content_size: 0.0,
             cross_size: height,
             constraint: Constraint::default(),
+            align: CrossAlign::Stretch,
         });
         self
     }
@@ -579,6 +637,7 @@ impl HStack {
             content_size: 0.0,
             cross_size: height,
             constraint: Constraint::default(),
+            align: CrossAlign::Stretch,
         });
         self
     }
@@ -593,6 +652,24 @@ impl HStack {
     pub fn constrain(mut self, constraint: Constraint) -> Self {
         if let Some(last) = self.children.last_mut() {
             last.constraint = constraint;
+        }
+        self
+    }
+
+    /// Set the cross-axis alignment for the most recently added child.
+    ///
+    /// By default every child stretches to fill the full height ([`CrossAlign::Stretch`]).
+    /// Call this after a `child*` builder to pin the child at its `cross_size`
+    /// instead:
+    ///
+    /// ```ignore
+    /// HStack::new(8.0)
+    ///     .child(80.0, 30.0).align(CrossAlign::Center)
+    ///     .child_fill(60.0)
+    /// ```
+    pub fn align(mut self, align: CrossAlign) -> Self {
+        if let Some(last) = self.children.last_mut() {
+            last.align = align;
         }
         self
     }
@@ -657,7 +734,21 @@ impl LayoutNode for HStack {
             };
             let width = child.constraint.apply(base_width);
 
-            rects.push(Rect::new(x, bounds.y + self.padding, width, inner_height));
+            // Resolve cross-axis alignment (HStack cross axis = height).
+            let (cy, cheight) = match child.align {
+                CrossAlign::Stretch => (bounds.y + self.padding, inner_height),
+                CrossAlign::Start => (bounds.y + self.padding, child.cross_size.min(inner_height)),
+                CrossAlign::Center => {
+                    let h = child.cross_size.min(inner_height);
+                    (bounds.y + self.padding + (inner_height - h) * 0.5, h)
+                }
+                CrossAlign::End => {
+                    let h = child.cross_size.min(inner_height);
+                    (bounds.y + self.padding + inner_height - h, h)
+                }
+            };
+
+            rects.push(Rect::new(x, cy, width, cheight));
             x += width;
         }
 
@@ -908,5 +999,127 @@ mod tests {
         //
         //     new_floor
         // }
+    }
+
+    // ---- Per-child cross-axis alignment ----
+
+    #[test]
+    fn vstack_align_stretch_fills_inner_width() {
+        // Stretch (default) is the same as the old behavior: child fills full width.
+        let stack = VStack::new(0.0)
+            .child(30.0, 40.0) // cross_size=40, but Stretch ignores it
+            .child(20.0, 40.0);
+        let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
+        assert_eq!(result.rects[1].x, 10.0);
+        assert_eq!(result.rects[1].width, 100.0);
+        assert_eq!(result.rects[2].x, 10.0);
+        assert_eq!(result.rects[2].width, 100.0);
+    }
+
+    #[test]
+    fn vstack_align_start_pins_left() {
+        let stack = VStack::new(0.0)
+            .child(30.0, 40.0).align(CrossAlign::Start);
+        let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
+        assert_eq!(result.rects[1].x, 10.0, "start aligns to left edge");
+        assert_eq!(result.rects[1].width, 40.0, "start uses cross_size, not inner_width");
+    }
+
+    #[test]
+    fn vstack_align_center_centers_horizontally() {
+        let stack = VStack::new(0.0)
+            .child(30.0, 40.0).align(CrossAlign::Center);
+        let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
+        // inner_width = 100 (no padding), center = 10 + (100 - 40) / 2 = 40
+        assert_eq!(result.rects[1].x, 40.0);
+        assert_eq!(result.rects[1].width, 40.0);
+    }
+
+    #[test]
+    fn vstack_align_end_pins_right() {
+        let stack = VStack::new(0.0)
+            .child(30.0, 40.0).align(CrossAlign::End);
+        let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
+        // inner_width = 100, end = 10 + 100 - 40 = 70
+        assert_eq!(result.rects[1].x, 70.0);
+        assert_eq!(result.rects[1].width, 40.0);
+    }
+
+    #[test]
+    fn vstack_align_respects_padding() {
+        let stack = VStack::new(0.0).with_padding(10.0)
+            .child(30.0, 40.0).align(CrossAlign::Center);
+        let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
+        // inner_width = 100 - 20 = 80, center x = 10 + 10 + (80 - 40) / 2 = 40
+        assert_eq!(result.rects[1].x, 40.0);
+        assert_eq!(result.rects[1].width, 40.0);
+    }
+
+    #[test]
+    fn vstack_align_clamps_cross_size_to_inner_width() {
+        // cross_size larger than inner_width should be clamped.
+        let stack = VStack::new(0.0)
+            .child(30.0, 200.0).align(CrossAlign::Start);
+        let result = stack.layout(Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert_eq!(result.rects[1].width, 100.0, "clamped to inner_width");
+    }
+
+    #[test]
+    fn hstack_align_start_pins_top() {
+        let stack = HStack::new(0.0)
+            .child(30.0, 20.0).align(CrossAlign::Start);
+        let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
+        assert_eq!(result.rects[1].y, 10.0, "start aligns to top edge");
+        assert_eq!(result.rects[1].height, 20.0, "start uses cross_size, not inner_height");
+    }
+
+    #[test]
+    fn hstack_align_center_centers_vertically() {
+        let stack = HStack::new(0.0)
+            .child(30.0, 20.0).align(CrossAlign::Center);
+        let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
+        // inner_height = 100, center y = 10 + (100 - 20) / 2 = 50
+        assert_eq!(result.rects[1].y, 50.0);
+        assert_eq!(result.rects[1].height, 20.0);
+    }
+
+    #[test]
+    fn hstack_align_end_pins_bottom() {
+        let stack = HStack::new(0.0)
+            .child(30.0, 20.0).align(CrossAlign::End);
+        let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
+        // inner_height = 100, end y = 10 + 100 - 20 = 90
+        assert_eq!(result.rects[1].y, 90.0);
+        assert_eq!(result.rects[1].height, 20.0);
+    }
+
+    #[test]
+    fn hstack_multiple_children_mixed_alignment() {
+        // Two children, each with different cross-axis alignment.
+        let stack = HStack::new(10.0).with_padding(5.0)
+            .child(40.0, 30.0).align(CrossAlign::Start)   // pinned to top
+            .child(40.0, 30.0).align(CrossAlign::End);     // pinned to bottom
+        let result = stack.layout(Rect::new(0.0, 0.0, 200.0, 100.0));
+        // inner_height = 100 - 10 = 90
+        assert_eq!(result.rects[1].height, 30.0, "start child uses cross_size");
+        assert_eq!(result.rects[1].y, 5.0, "start child at top edge");
+        assert_eq!(result.rects[2].height, 30.0, "end child uses cross_size");
+        assert_eq!(result.rects[2].y, 65.0, "end child at bottom edge (5 + 90 - 30)");
+    }
+
+    #[test]
+    fn vstack_mixed_alignment_in_stack() {
+        // Two fixed children with different alignments + one fill child.
+        let stack = VStack::new(4.0).with_padding(4.0)
+            .child(20.0, 50.0).align(CrossAlign::Center)
+            .child_fill(60.0)   // default Stretch
+            .child(20.0, 40.0).align(CrossAlign::End);
+        let result = stack.layout(Rect::new(0.0, 0.0, 120.0, 200.0));
+        // inner_width = 120 - 8 = 112
+        assert_eq!(result.rects[1].width, 50.0, "center child uses cross_size");
+        assert_eq!(result.rects[1].x, 4.0 + (112.0 - 50.0) * 0.5, "center child x");
+        assert_eq!(result.rects[2].width, 112.0, "fill child stretches full width");
+        assert_eq!(result.rects[3].width, 40.0, "end child uses cross_size");
+        assert_eq!(result.rects[3].x, 4.0 + 112.0 - 40.0, "end child at right edge");
     }
 }

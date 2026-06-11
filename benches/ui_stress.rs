@@ -27,7 +27,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use wgpu_gameui::layout::Rect;
+use wgpu_gameui::layout::{Anchor, Positioned, Rect, Size, VStack};
 use wgpu_gameui::{
     Button, DrawList, FontSystemHandle, InputState, TextBlock, Theme, UiRenderer,
 };
@@ -396,6 +396,45 @@ fn bench_primitives_render(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark for the layout system: building and laying out a 10k-child stack.
+///
+/// CPU-only — no GPU needed. Builds a VStack tree once, then measures the
+/// `layout()` call at growing sizes.
+fn bench_layout(c: &mut Criterion) {
+    let counts: &[usize] = &[100, 1_000, 10_000, 50_000];
+
+    let mut group = c.benchmark_group("layout_resolve");
+    for &count in counts {
+        // Build the tree once: a single VStack with N children.
+        let mut stack = VStack::new(2.0).with_padding(4.0);
+        for i in 0..count {
+            // Mix: mostly Fixed, every 10th is Fill, every 23rd is Fit-ish.
+            if i % 10 == 0 {
+                stack = stack.child_fill(60.0);
+            } else if i % 23 == 0 {
+                stack = stack.child_percent(0.05, 60.0);
+            } else {
+                stack = stack.child(20.0, 60.0);
+            }
+        }
+        // Wrap in a Positioned so it's a full LayoutNode tree.
+        let tree = Positioned::new(
+            Anchor::TopLeft { offset: (0.0, 0.0) },
+            Size::fixed(600.0, (count as f32 * 22.0).max(200.0)),
+            stack,
+        );
+
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
+            b.iter(|| {
+                let result = tree.layout_screen(1920.0, 1080.0);
+                std::hint::black_box(&result);
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_drawlist_build,
@@ -404,6 +443,7 @@ criterion_group!(
     bench_nine_slice,
     bench_icons,
     bench_primitives_build,
-    bench_primitives_render
+    bench_primitives_render,
+    bench_layout
 );
 criterion_main!(benches);

@@ -98,6 +98,12 @@ pub struct InputState {
     pub key_tab: bool,
     /// Escape key was pressed this frame. Blurs the focused widget.
     pub key_escape: bool,
+    /// Space key was pressed this frame.
+    pub key_space: bool,
+    /// Arrow Up was pressed this frame.
+    pub key_up: bool,
+    /// Arrow Down was pressed this frame.
+    pub key_down: bool,
     /// Shift key is currently held.
     pub shift_pressed: bool,
     /// Ctrl (or Cmd on macOS) key is currently held.
@@ -129,6 +135,9 @@ impl InputState {
         self.key_delete = false;
         self.key_tab = false;
         self.key_escape = false;
+        self.key_space = false;
+        self.key_up = false;
+        self.key_down = false;
         // shift_pressed and ctrl_pressed are held-state, cleared by the
         // windowing layer on key-up; they persist across frames.
     }
@@ -164,6 +173,9 @@ impl InputState {
             key_delete: false,
             key_tab: false,
             key_escape: false,
+            key_space: false,
+            key_up: false,
+            key_down: false,
             // shift/ctrl are modifier state, not events — preserve them
             // so modals that have text inputs still see modifier keys.
             ..self.clone()

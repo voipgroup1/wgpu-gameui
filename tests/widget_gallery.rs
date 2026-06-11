@@ -13,9 +13,9 @@
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    Button, Checkbox, ColumnWidth, DragCapture, DrawList, Dropdown, DropdownState, FocusState,
-    ImageButton, ImageFit, InputState, LayerStack, ProgressBar, ScrollState, ScrollView, Slider,
-    Table, TableCell, TableColumn, Tabs,
+    Button, Checkbox, ColumnWidth, DragCapture, DrawContext, DrawList, Dropdown, DropdownState,
+    FocusState, ImageButton, ImageFit, InputState, LayerStack, ProgressBar, ScrollState,
+    ScrollView, Slider, Table, TableCell, TableColumn, Tabs,
     TextAlign, TextBlock, TextInput, Theme, TooltipContent, TooltipLayer, UiContext, UiRenderer,
     UiState, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
 };
@@ -440,7 +440,12 @@ fn render_widget_gallery() {
         // renders above whatever cells sit below it.
         let r = flow.cell(list, "Dropdown (open)", 160.0, 28.0);
         dropdowns.open_for_test(DROPDOWN_ID, r, &DROPDOWN_ITEMS, 2);
-        Dropdown::new(&DROPDOWN_ITEMS, 2).draw(DROPDOWN_ID, r, &mut dropdowns, list, &theme, &input);
+        Dropdown::new(&DROPDOWN_ITEMS, 2).draw(
+            DROPDOWN_ID,
+            r,
+            &mut dropdowns,
+            &mut DrawContext::new(list, &mut focus, &theme, &input, W as f32, 600.0),
+        );
 
         let r = flow.cell(list, "Scroll view", 180.0, 100.0);
         list.rounded_rect(r, 4.0, [0.06, 0.07, 0.10, 1.0]);
