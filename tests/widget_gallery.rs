@@ -421,10 +421,10 @@ fn render_widget_gallery() {
 
         let cb = Checkbox::new();
         let r = flow.cell(list, "Checkbox", 120.0, 20.0);
-        cb.draw(false, "Off", r, list, &theme, &input);
+        cb.draw(false, "Off", r, &mut ctx(list, &mut focus, &theme, &input));
 
         let r = flow.cell(list, "Checkbox (checked)", 120.0, 20.0);
-        cb.draw(true, "On", r, list, &theme, &input);
+        cb.draw(true, "On", r, &mut ctx(list, &mut focus, &theme, &input));
 
         let r = flow.cell(list, "Progress bar", 150.0, 20.0);
         ProgressBar::new(0.65).draw(r, list, &theme);

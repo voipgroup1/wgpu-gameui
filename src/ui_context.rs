@@ -789,7 +789,9 @@ impl<'a> UiContext<'a> {
         let (local, local_input) = Self::localize(inv, world, input);
         let toggled = {
             let list = self.backend.list_mut();
-            Checkbox::new().draw(checked, label, local, list, theme, &local_input)
+            let state = self.state.as_mut().expect("checkbox requires interactive state");
+            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0);
+            Checkbox::new().draw(checked, label, local, &mut ctx)
         };
         self.advance(height);
         if toggled {

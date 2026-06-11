@@ -2,9 +2,9 @@
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::{InputState, SpriteId, Theme};
+use crate::{SpriteId, Theme};
 
-use super::DrawList;
+use super::{DrawContext, DrawList};
 
 /// Icon keys for checkbox textures. Only used by the string-keyed
 /// [`Checkbox::with_icon_keys`] path; the default rendering is vector-drawn and
@@ -41,7 +41,7 @@ enum BoxStyle {
 /// # Example
 /// ```ignore
 /// // Vector (no assets needed):
-/// if Checkbox::new().draw(checked, "Enabled", rect, &mut list, &theme, &input) {
+/// if Checkbox::new().draw(checked, "Enabled", rect, &mut ctx) {
 ///     checked = !checked;
 /// }
 /// ```
@@ -97,10 +97,11 @@ impl Checkbox {
         checked: bool,
         label: &str,
         rect: Rect,
-        list: &mut DrawList,
-        theme: &Theme,
-        input: &InputState,
+        ctx: &mut DrawContext,
     ) -> bool {
+        let list = &mut *ctx.draw_list;
+        let theme = ctx.theme;
+        let input = ctx.input;
         // Honor layer capture (`mouse_consumed`) so a checkbox under a
         // modal/popup doesn't react to clicks meant for the overlay.
         let hovered = rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
@@ -187,9 +188,29 @@ fn contrast_color(bg: [f32; 4]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FocusState, InputState};
 
     fn theme() -> Theme {
         Theme::default()
+    }
+
+    /// Draw a checkbox into a fresh `DrawContext` and return the populated draw
+    /// list (for geometry assertions) plus the click result.
+    fn draw_cb(
+        cb: &Checkbox,
+        checked: bool,
+        label: &str,
+        rect: Rect,
+        input: &InputState,
+    ) -> (DrawList, bool) {
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        let theme = theme();
+        let clicked = {
+            let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, input, 800.0, 600.0);
+            cb.draw(checked, label, rect, &mut ctx)
+        };
+        (list, clicked)
     }
 
     fn input_at(x: f32, y: f32) -> InputState {
@@ -217,8 +238,7 @@ mod tests {
     #[test]
     fn vector_unchecked_emits_geometry() {
         // The core bug: a checkbox must never be blank without atlas assets.
-        let mut list = DrawList::new();
-        Checkbox::new().draw(false, "", rect(), &mut list, &theme(), &input_at(-1.0, -1.0));
+        let (list, _) = draw_cb(&Checkbox::new(), false, "", rect(), &input_at(-1.0, -1.0));
         // Box fill + outline are translate-only rounded rects, so they record
         // chrome instances rather than soup geometry.
         assert!(
@@ -239,8 +259,7 @@ mod tests {
         let mut fill_only = DrawList::new();
         fill_only.rounded_rect(Rect::new(0.0, 0.0, size, size), radius, th.accent);
 
-        let mut checked = DrawList::new();
-        Checkbox::new().draw(true, "", rect(), &mut checked, &th, &input_at(-1.0, -1.0));
+        let (checked, _) = draw_cb(&Checkbox::new(), true, "", rect(), &input_at(-1.0, -1.0));
 
         // Checked = same fill + a checkmark polyline, so strictly more geometry.
         assert!(
@@ -251,33 +270,28 @@ mod tests {
 
     #[test]
     fn click_inside_toggles() {
-        let mut list = DrawList::new();
-        let clicked = Checkbox::new().draw(false, "Label", rect(), &mut list, &theme(), &click_at(5.0, 10.0));
+        let (_, clicked) = draw_cb(&Checkbox::new(), false, "Label", rect(), &click_at(5.0, 10.0));
         assert!(clicked, "a click inside the rect should report a toggle");
     }
 
     #[test]
     fn click_outside_does_not_toggle() {
-        let mut list = DrawList::new();
-        let clicked = Checkbox::new().draw(false, "Label", rect(), &mut list, &theme(), &click_at(500.0, 500.0));
+        let (_, clicked) = draw_cb(&Checkbox::new(), false, "Label", rect(), &click_at(500.0, 500.0));
         assert!(!clicked);
     }
 
     #[test]
     fn consumed_mouse_does_not_toggle() {
-        let mut list = DrawList::new();
         let mut input = click_at(5.0, 10.0);
         input.mouse_consumed = true; // a higher layer took this click
-        let clicked = Checkbox::new().draw(false, "Label", rect(), &mut list, &theme(), &input);
+        let (_, clicked) = draw_cb(&Checkbox::new(), false, "Label", rect(), &input);
         assert!(!clicked);
     }
 
     #[test]
     fn icon_keys_path_queues_icon_not_vector() {
-        let mut list = DrawList::new();
-        Checkbox::new()
-            .with_icon_keys(CHECKBOX_ICON, CHECKBOX_CHECKED_ICON)
-            .draw(true, "", rect(), &mut list, &theme(), &input_at(-1.0, -1.0));
+        let cb = Checkbox::new().with_icon_keys(CHECKBOX_ICON, CHECKBOX_CHECKED_ICON);
+        let (list, _) = draw_cb(&cb, true, "", rect(), &input_at(-1.0, -1.0));
         assert_eq!(list.icons.len(), 1, "icon-key path queues exactly one icon");
         assert_eq!(list.icons[0].icon_key, CHECKBOX_CHECKED_ICON);
     }
