@@ -431,7 +431,7 @@ fn render_widget_gallery() {
 
         let r = flow.cell(list, "Slider", 160.0, 24.0);
         let mut capture = DragCapture::default();
-        Slider::new(0.0, 100.0).draw(40.0, 0, &mut capture, r, list, &theme, &input);
+        Slider::new(0.0, 100.0).draw(40.0, 0, &mut capture, r, &mut ctx(list, &mut focus, &theme, &input));
 
         let r = flow.cell(list, "Tabs", 240.0, 30.0);
         Tabs::new(&["Tab A", "Tab B", "Tab C"]).draw(r, 0, list, &theme, &input);

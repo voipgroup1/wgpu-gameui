@@ -752,17 +752,20 @@ impl<'a> UiContext<'a> {
         let inv = self.backend.list_mut().current_transform().inverse();
         let (local, local_input) = Self::localize(inv, world, input);
         let new_value = {
-            // Disjoint field borrows: `self.backend` (list) and `self.state` (drag).
+            // Disjoint field borrows: `self.backend` (list) and `self.state`'s
+            // `drag`/`focus` fields (the slider needs the drag arbiter; the
+            // DrawContext carries focus even though the slider registers none).
             let list = self.backend.list_mut();
-            let capture = match self.state.as_mut() {
-                Some(s) => &mut s.drag,
+            let state = match self.state.as_mut() {
+                Some(s) => s,
                 None => {
                     debug_assert!(false, "UiContext::slider requires interactive state");
                     return value;
                 }
             };
+            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0);
             Slider::new(min, max)
-                .draw(value, id, capture, local, list, theme, &local_input)
+                .draw(value, id, &mut state.drag, local, &mut ctx)
                 .value
         };
         self.advance(height);

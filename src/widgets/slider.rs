@@ -1,10 +1,9 @@
 //! Slider widget - a horizontal bar with a draggable scrubber.
 
 use crate::layout::Rect;
-use crate::{InputState, Theme};
 use crate::text::TextBlock;
 
-use super::{DragCapture, DragId, DrawList};
+use super::{DragCapture, DragId, DrawContext};
 
 /// Icon key for the scrubber texture (must be loaded into the icon atlas).
 pub const SLIDER_SCRUBBER_ICON: &str = "textures/ui/scrubber.png";
@@ -36,7 +35,7 @@ pub struct SliderOutput {
 /// ```ignore
 /// // `capture` is a caller-owned `DragCapture`, persisted across frames.
 /// let output = Slider::new(0.0, 100.0)
-///     .draw(value, 0, &mut capture, rect, &mut draw_list, &theme, &input);
+///     .draw(value, 0, &mut capture, rect, &mut ctx);
 /// if output.changed {
 ///     value = output.value;
 /// }
@@ -82,10 +81,11 @@ impl Slider {
         id: DragId,
         capture: &mut DragCapture,
         rect: Rect,
-        list: &mut DrawList,
-        theme: &Theme,
-        input: &InputState,
+        ctx: &mut DrawContext,
     ) -> SliderOutput {
+        let list = &mut *ctx.draw_list;
+        let theme = ctx.theme;
+        let input = ctx.input;
         let scrubber_size = rect.height.min(20.0);
         let value_text_width = if self.show_value { 40.0 } else { 0.0 };
 
@@ -188,9 +188,28 @@ impl Slider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DrawList, FocusState, InputState, Theme};
 
     fn theme() -> Theme {
         Theme::default()
+    }
+
+    /// Draw a slider into a throwaway `DrawContext` and return its output. The
+    /// slider draws no focusable, and no slider test inspects the draw list, so
+    /// a fresh list/focus per call keeps the call sites terse.
+    fn draw_slider(
+        slider: &Slider,
+        value: f32,
+        id: DragId,
+        cap: &mut DragCapture,
+        rect: Rect,
+        input: &InputState,
+    ) -> SliderOutput {
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        let theme = theme();
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, input, 800.0, 600.0);
+        slider.draw(value, id, cap, rect, &mut ctx)
     }
 
     /// Mouse pressed (down + clicked this frame) at (x, y).
@@ -232,11 +251,10 @@ mod tests {
     fn click_in_track_starts_drag_and_sets_value() {
         let slider = Slider::new(0.0, 100.0);
         let mut cap = DragCapture::new();
-        let mut list = DrawList::new();
         // Press near the right of the track (interior; the right edge is
         // exclusive) -> value above the starting 50.
         let input = press_at(85.0, 10.0);
-        let out = slider.draw(50.0, 0, &mut cap, rect(), &mut list, &theme(), &input);
+        let out = draw_slider(&slider, 50.0, 0, &mut cap, rect(), &input);
         assert!(out.dragging, "click inside the track should begin a drag");
         assert!(cap.is_active(0));
         assert!(out.value > 50.0, "dragging to the right edge raises the value");
@@ -246,14 +264,13 @@ mod tests {
     fn release_ends_drag() {
         let slider = Slider::new(0.0, 100.0);
         let mut cap = DragCapture::new();
-        let mut list = DrawList::new();
 
         let down = press_at(50.0, 10.0);
-        slider.draw(50.0, 0, &mut cap, rect(), &mut list, &theme(), &down);
+        draw_slider(&slider, 50.0, 0, &mut cap, rect(), &down);
         assert!(cap.is_active(0));
 
         let up = release_at(50.0, 10.0);
-        let out = slider.draw(50.0, 0, &mut cap, rect(), &mut list, &theme(), &up);
+        let out = draw_slider(&slider, 50.0, 0, &mut cap, rect(), &up);
         assert!(!out.dragging);
         assert!(cap.is_free(), "mouse-up frees the capture");
     }
@@ -265,21 +282,20 @@ mod tests {
         // capture, only the first to claim it reacts.
         let slider = Slider::new(0.0, 100.0);
         let mut cap = DragCapture::new();
-        let mut list = DrawList::new();
         let r = rect();
 
         // Frame 1: press. A is drawn first and claims the drag.
         let down = press_at(20.0, 10.0);
-        let a1 = slider.draw(10.0, 0, &mut cap, r, &mut list, &theme(), &down);
-        let b1 = slider.draw(90.0, 1, &mut cap, r, &mut list, &theme(), &down);
+        let a1 = draw_slider(&slider, 10.0, 0, &mut cap, r, &down);
+        let b1 = draw_slider(&slider, 90.0, 1, &mut cap, r, &down);
         assert!(a1.dragging, "first slider claims the drag");
         assert!(!b1.dragging, "second slider must not also grab the same press");
         assert!(cap.is_active(0));
 
         // Frame 2: mouse moves while held. Only A tracks it.
         let mov = hold_at(80.0, 10.0);
-        let a2 = slider.draw(a1.value, 0, &mut cap, r, &mut list, &theme(), &mov);
-        let b2 = slider.draw(90.0, 1, &mut cap, r, &mut list, &theme(), &mov);
+        let a2 = draw_slider(&slider, a1.value, 0, &mut cap, r, &mov);
+        let b2 = draw_slider(&slider, 90.0, 1, &mut cap, r, &mov);
         assert!(a2.dragging);
         assert!(!b2.dragging);
         assert!(!b2.changed, "non-owning slider's value is untouched");
@@ -289,24 +305,21 @@ mod tests {
     fn drag_continues_across_frames_until_release() {
         let slider = Slider::new(0.0, 100.0);
         let mut cap = DragCapture::new();
-        let mut list = DrawList::new();
         let r = rect();
 
         let down = press_at(50.0, 10.0);
-        let mut value = slider
-            .draw(50.0, 0, &mut cap, r, &mut list, &theme(), &down)
-            .value;
+        let mut value = draw_slider(&slider, 50.0, 0, &mut cap, r, &down).value;
 
         // Mouse leaves the track rect vertically but stays held: owner keeps
         // tracking because capture, not hit-testing, gates an in-progress drag.
         let mov = hold_at(95.0, 500.0);
-        let out = slider.draw(value, 0, &mut cap, r, &mut list, &theme(), &mov);
+        let out = draw_slider(&slider, value, 0, &mut cap, r, &mov);
         assert!(out.dragging, "held drag continues even when cursor leaves the rect");
         value = out.value;
         assert!(value > 50.0);
 
         let up = release_at(95.0, 500.0);
-        let out = slider.draw(value, 0, &mut cap, r, &mut list, &theme(), &up);
+        let out = draw_slider(&slider, value, 0, &mut cap, r, &up);
         assert!(!out.dragging);
         assert!(cap.is_free());
     }
@@ -315,10 +328,9 @@ mod tests {
     fn consumed_mouse_does_not_start_drag() {
         let slider = Slider::new(0.0, 100.0);
         let mut cap = DragCapture::new();
-        let mut list = DrawList::new();
         let mut input = press_at(50.0, 10.0);
         input.mouse_consumed = true; // a higher layer already took this click
-        let out = slider.draw(50.0, 0, &mut cap, rect(), &mut list, &theme(), &input);
+        let out = draw_slider(&slider, 50.0, 0, &mut cap, rect(), &input);
         assert!(!out.dragging);
         assert!(cap.is_free());
     }
