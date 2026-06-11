@@ -34,16 +34,23 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       and `Button::draw`/`draw_at`/`draw_nine_slice` now take `&mut DrawContext`
       instead of individual `(&mut DrawList, &Theme, &InputState)` params.
       `DrawContext::register_focus(id)` auto-scopes to the active layer.
-      Remaining widgets (Checkbox, Slider, Tabs, TextInput, etc.) still take
-      individual params — deferred to follow-up passes.
+      Checkbox, Slider, and TextInput now take `&mut DrawContext` too. Remaining
+      non-interactive widgets (Tabs, ProgressBar, ScrollView, Table, Tooltip,
+      ImageButton) still take individual params — deferred to follow-up passes.
 - [x] **P1 — Replace `String` keys in draw commands with interned `IconId`/
       `SpriteId`/`u32` handles** produced by the atlas. (Both still accept
       string-keyed helpers for ergonomics; `icon_sprite`/`nine_slice_id` are the
       allocation-free path.)
 - [ ] **P1 — Don't `unwrap()` glyphon errors in `TextRenderer::prepare`/
       `render`** (`src/text.rs:103,130`). Bubble as a typed `UiError`.
-- [ ] **P1 — Cache glyphon `Buffer`s by content+size hash or pool them.**
-      Currently a fresh buffer is built per `TextBlock` per frame.
+- [x] **P1 — Cache glyphon `Buffer`s by content+size hash or pool them.**
+      Done better than pooling buffers: `TextRenderer::build_vertices` caches the
+      *shaped glyph layout* (relative positions) keyed by
+      `(content, font_size, line_height, max_width, family, align, ellipsize,
+      weight, style)`. A hit skips `Buffer::new`/`set_text`/`shape_until_scroll`
+      and takes no `FontSystem` lock (the MSDF atlas never evicts, so cached
+      glyphs are always present). Working-set eviction past `SHAPE_CACHE_MAX`
+      (8192); `clear_shape_cache()` for font hot-loads. (`src/text.rs`)
 
 ---
 
