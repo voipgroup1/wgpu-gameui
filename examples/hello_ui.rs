@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    FocusState, FontHandle, InputState, LayerStack, ScrollState, ScrollView, TextAlign, TextBlock,
-    TextInput, Theme, UiContext, UiRenderer,
+    Dropdown, DropdownState, FocusState, FontHandle, InputState, LayerStack, ScrollState,
+    ScrollView, TextAlign, TextBlock, TextInput, Theme, UiContext, UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -82,6 +82,10 @@ struct Gpu {
 /// Focus ids for the two text inputs — any stable, unique `u64` works.
 const TEXT_ID_A: u64 = 0;
 const TEXT_ID_B: u64 = 1;
+/// Focus-independent id for the dropdown.
+const DROPDOWN_ID: u64 = 2;
+
+const DROPDOWN_ITEMS: [&str; 5] = ["Fire", "Water", "Earth", "Air", "Aether"];
 
 #[derive(Default)]
 struct UiState {
@@ -93,6 +97,11 @@ struct UiState {
     /// Single keyboard-focus owner shared by both text inputs. Tab / Shift-Tab
     /// cycle between them; clicking elsewhere or pressing Esc blurs.
     focus: FocusState,
+    /// Single open-dropdown owner. Click to open, click an option / outside /
+    /// Esc to close.
+    dropdowns: DropdownState,
+    /// Currently selected dropdown option index.
+    dropdown_sel: usize,
 }
 
 struct App {
@@ -325,6 +334,12 @@ impl ApplicationHandler for App {
                     None
                 };
 
+                // Establish the open dropdown's popup layer at frame-top (from
+                // last frame's geometry) so `input_for_base` blocks clicks to
+                // widgets under the open list — same as the modal above.
+                self.state.dropdowns.begin_frame(&self.input);
+                let dropdown_popup = self.state.dropdowns.push_open_layer(&mut layers);
+
                 // Resolve input for the base layer. When a modal is open this
                 // sets `mouse_consumed = true` so base widgets can't fire.
                 let mut base_input = layers.input_for_base(&self.input);
@@ -464,6 +479,26 @@ impl ApplicationHandler for App {
                     self.state.focus.end_frame();
                 }
 
+                // ---------- Dropdown demo ----------
+                // The button draws inline here; the open option list is drawn
+                // after the base scope (into the popup pushed at frame-top).
+                {
+                    list.text(
+                        TextBlock::new("Dropdown:", 340.0, 280.0)
+                            .with_size(12.0)
+                            .with_color(180, 190, 210),
+                    );
+                    let dd_rect = Rect::new(340.0, 300.0, 150.0, 28.0);
+                    Dropdown::new(&DROPDOWN_ITEMS, self.state.dropdown_sel).draw(
+                        DROPDOWN_ID,
+                        dd_rect,
+                        &mut self.state.dropdowns,
+                        list,
+                        &self.theme,
+                        &base_input,
+                    );
+                }
+
                 // ---------- Image + custom font + alignment demo ----------
                 // Decoded image drawn at full size, then the same image cropped
                 // to its top-left quarter (UV [0,0,0.5,0.5]) stretched to match.
@@ -557,6 +592,20 @@ impl ApplicationHandler for App {
                     }
                     layers.pop_layer();
                 }
+
+                // Deferred dropdown list (Popup layer above the base content).
+                // Picking an option updates the selection and closes the menu.
+                if let Some((id, idx)) = self.state.dropdowns.draw_open_layer(
+                    &mut layers,
+                    dropdown_popup,
+                    &self.theme,
+                    &self.input,
+                ) {
+                    if id == DROPDOWN_ID {
+                        self.state.dropdown_sel = idx;
+                    }
+                }
+                self.state.dropdowns.end_frame();
 
                 // Bonus: rotated badge from the original demo, on the base layer
                 // (built via UiContext::with_layers so it stays clipped to the

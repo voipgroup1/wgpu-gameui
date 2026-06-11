@@ -66,7 +66,17 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 ## Widgets
 
-- [ ] **P0 — Dropdown / combo / select.** Universal in settings/mod menus.
+- [x] **P0 — Dropdown / combo / select.** `Dropdown<'a>` + caller-owned
+      single-owner `DropdownState`/`DropdownId` (one open at a time, like
+      `FocusState`). Button drawn inline; the open list floats in a `Popup`
+      layer pushed at frame-top (blocks clicks underneath). Click/Esc/
+      click-outside close, hover highlight, selected highlight, scroll-clipped
+      past `max_visible`. `src/widgets/dropdown.rs`. Keyboard nav + Tab-focus
+      deferred (P1 below).
+- [ ] **P1 — Dropdown keyboard nav.** Arrow Up/Down + Enter to select, and
+      register the dropdown in `FocusState` so Tab reaches it (open with
+      Space/Enter). Same-frame open (drop the 1-frame open latency) for the
+      just-opened case.
 - [x] **P0 — ScrollView / scroll container** (general — `ScrollView` widget
       with caller-owned `ScrollState`, vertical+horizontal scroll, wheel
       input, draggable thumb, lives in `src/widgets/scroll_view.rs`. `Table`

@@ -4,6 +4,7 @@ mod button;
 mod checkbox;
 mod drag;
 mod draw_list;
+mod dropdown;
 mod focus;
 mod image;
 mod image_button;
@@ -23,6 +24,7 @@ pub(crate) use draw_list::ColorCmd;
 pub use draw_list::{
     ChromeInstance, CircleInstance, DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex,
 };
+pub use dropdown::{Dropdown, DropdownId, DropdownOutput, DropdownState};
 pub use focus::{FocusId, FocusState};
 pub use image::{Image, ImageAlign, ImageFit};
 pub use image_button::ImageButton;

@@ -13,9 +13,9 @@
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    Button, Checkbox, ColumnWidth, DragCapture, DrawList, FocusState, ImageButton, ImageFit,
-    InputState, LayerStack, ProgressBar, ScrollState, ScrollView, Slider, Table, TableCell,
-    TableColumn, Tabs,
+    Button, Checkbox, ColumnWidth, DragCapture, DrawList, Dropdown, DropdownState, FocusState,
+    ImageButton, ImageFit, InputState, LayerStack, ProgressBar, ScrollState, ScrollView, Slider,
+    Table, TableCell, TableColumn, Tabs,
     TextAlign, TextBlock, TextInput, Theme, TooltipContent, TooltipLayer, UiRenderer,
     SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
 };
@@ -177,6 +177,11 @@ fn render_widget_gallery() {
     let mut focus = FocusState::new();
     focus.focus(0);
     focus.begin_frame(&input);
+
+    // Dropdown owner, seeded OPEN so the PNG shows the floating option list.
+    const DROPDOWN_ID: u64 = 100;
+    const DROPDOWN_ITEMS: [&str; 4] = ["Red", "Green", "Blue", "Alpha"];
+    let mut dropdowns = DropdownState::new();
 
     // Reserved by the flow inside the scope below, used afterwards. The scope
     // runs unconditionally, so deferred init is sound (and avoids a dead store).
@@ -371,6 +376,12 @@ fn render_widget_gallery() {
             .with_placeholder("Placeholder...")
             .draw(1, &mut focus, list, &theme, &input);
 
+        // Dropdown, seeded open: the floating list (drawn after the base scope)
+        // renders above whatever cells sit below it.
+        let r = flow.cell(list, "Dropdown (open)", 160.0, 28.0);
+        dropdowns.open_for_test(DROPDOWN_ID, r, &DROPDOWN_ITEMS, 2);
+        Dropdown::new(&DROPDOWN_ITEMS, 2).draw(DROPDOWN_ID, r, &mut dropdowns, list, &theme, &input);
+
         let r = flow.cell(list, "Scroll view", 180.0, 100.0);
         list.rounded_rect(r, 4.0, [0.06, 0.07, 0.10, 1.0]);
         let mut scroll_state = ScrollState::default();
@@ -489,6 +500,12 @@ fn render_widget_gallery() {
     // Size the target to the laid-out content first, so the tooltip layer
     // knows the real screen height (it flips the popup up/left near the edges).
     let h = (content_bottom.ceil() as u32).max(64);
+
+    // Floating dropdown list (Popup layer above the base content).
+    {
+        let popup = dropdowns.push_open_layer(&mut layers);
+        dropdowns.draw_open_layer(&mut layers, popup, &theme, &InputState::default());
+    }
 
     // Tooltip layer, hovering the reserved target.
     {
