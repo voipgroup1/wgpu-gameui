@@ -790,6 +790,15 @@ impl UiRenderer {
     }
 
     /// Render the entire DrawList in one call.
+    /// Render a single `DrawList`.
+    ///
+    /// `viewport` is the **physical** render-target size in pixels. `scale_factor`
+    /// is the display's logical→physical ratio (e.g. `1.0` on a standard display,
+    /// `2.0` on a Retina/HiDPI output — pass the window's scale factor). The UI is
+    /// laid out in **logical** pixels; the renderer divides the physical viewport
+    /// by `scale_factor` when building its projection, so geometry stays the same
+    /// logical size while text rasterizes against the higher-resolution
+    /// framebuffer (the MSDF path sharpens automatically). Pass `1.0` to disable.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -797,11 +806,12 @@ impl UiRenderer {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         viewport: (u32, u32),
+        scale_factor: f32,
         draw_list: &DrawList,
     ) {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_render").entered();
-        self.prepare_frame(device, queue, viewport);
+        self.prepare_frame(device, queue, viewport, scale_factor);
         self.render_one(device, queue, encoder, view, draw_list);
     }
 
@@ -815,11 +825,12 @@ impl UiRenderer {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         viewport: (u32, u32),
+        scale_factor: f32,
         layers: &LayerStack,
     ) {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_render_layers").entered();
-        self.prepare_frame(device, queue, viewport);
+        self.prepare_frame(device, queue, viewport, scale_factor);
         self.render_one(device, queue, encoder, view, layers.base());
         for layer in layers.layers() {
             self.render_one(device, queue, encoder, view, &layer.list);
@@ -831,11 +842,19 @@ impl UiRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         viewport: (u32, u32),
+        scale_factor: f32,
     ) {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_prepare_frame").entered();
+        // The framebuffer is `viewport` physical pixels, but the UI is laid out
+        // in logical pixels. Project logical → NDC by dividing the physical size
+        // by the scale factor: a logical point still maps to the same NDC, while
+        // the GPU rasterizes onto the full physical target (text self-sharpens).
+        let scale = if scale_factor > 0.0 { scale_factor } else { 1.0 };
+        let logical_w = viewport.0 as f32 / scale;
+        let logical_h = viewport.1 as f32 / scale;
         let uniforms = Uniforms {
-            view_proj: ortho_matrix(viewport.0 as f32, viewport.1 as f32),
+            view_proj: ortho_matrix(logical_w, logical_h),
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         self.text_renderer.resize(viewport.0, viewport.1);
@@ -1525,6 +1544,48 @@ mod tests {
     fn crop_uv_none_is_identity() {
         let full = [0.25, 0.5, 0.75, 1.0];
         approx4(apply_crop_uv(full, None), full);
+    }
+
+    /// Replicate the vertex shaders' `vec4(pos, 0, 1) * view_proj` (row-vector ×
+    /// matrix) to get the NDC of a pixel-space point under a given ortho.
+    fn project(m: &[[f32; 4]; 4], x: f32, y: f32) -> (f32, f32) {
+        let v = [x, y, 0.0, 1.0];
+        let mut out = [0.0f32; 4];
+        for (j, o) in out.iter_mut().enumerate() {
+            *o = v[0] * m[0][j] + v[1] * m[1][j] + v[2] * m[2][j] + v[3] * m[3][j];
+        }
+        (out[0], out[1])
+    }
+
+    #[test]
+    fn ortho_maps_logical_corners_to_ndc() {
+        let m = ortho_matrix(800.0, 600.0);
+        // Top-left logical origin → NDC top-left (-1, +1); Y is down in pixels.
+        let (x0, y0) = project(&m, 0.0, 0.0);
+        assert!((x0 + 1.0).abs() < 1e-5 && (y0 - 1.0).abs() < 1e-5, "{x0},{y0}");
+        // Bottom-right logical extent → NDC (+1, -1).
+        let (x1, y1) = project(&m, 800.0, 600.0);
+        assert!((x1 - 1.0).abs() < 1e-5 && (y1 + 1.0).abs() < 1e-5, "{x1},{y1}");
+        // Center → origin.
+        let (xc, yc) = project(&m, 400.0, 300.0);
+        assert!(xc.abs() < 1e-5 && yc.abs() < 1e-5, "{xc},{yc}");
+    }
+
+    #[test]
+    fn dpi_scale_is_logical_size_invariant() {
+        // prepare_frame builds ortho from (physical / scale). Two (physical,
+        // scale) pairs with the SAME logical size must project a logical point
+        // identically — the scale factor only changes which framebuffer the
+        // identical logical UI rasterizes onto.
+        let logical = |w: f32, s: f32| ortho_matrix(w / s, w / s); // square for brevity
+        let a = logical(800.0, 1.0); // physical 800, scale 1 → logical 800
+        let b = logical(1600.0, 2.0); // physical 1600, scale 2 → logical 800
+        for &(px, py) in &[(0.0, 0.0), (250.0, 700.0), (800.0, 800.0)] {
+            let (ax, ay) = project(&a, px, py);
+            let (bx, by) = project(&b, px, py);
+            assert!((ax - bx).abs() < 1e-6 && (ay - by).abs() < 1e-6,
+                "logical point ({px},{py}) projected differently: a=({ax},{ay}) b=({bx},{by})");
+        }
     }
 
     #[test]

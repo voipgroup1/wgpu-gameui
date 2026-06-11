@@ -606,7 +606,7 @@ fn render_widget_gallery() {
         });
     }
 
-    ui.render_layers(&device, &queue, &mut encoder, &view, (W, h), &layers);
+    ui.render_layers(&device, &queue, &mut encoder, &view, (W, h), 1.0, &layers);
 
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {

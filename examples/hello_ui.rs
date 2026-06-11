@@ -680,6 +680,7 @@ impl ApplicationHandler for App {
                     &mut encoder,
                     &view,
                     (gpu.config.width, gpu.config.height),
+                    window.scale_factor() as f32,
                     &layers,
                 );
 

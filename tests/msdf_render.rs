@@ -132,7 +132,7 @@ fn render_text_to_png() {
         });
     }
 
-    ui.render(&device, &queue, &mut encoder, &view, (W, H), &list);
+    ui.render(&device, &queue, &mut encoder, &view, (W, H), 1.0, &list);
 
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {

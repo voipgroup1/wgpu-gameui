@@ -140,7 +140,7 @@ impl Harness {
             });
         }
         self.ui
-            .render(&self.device, &self.queue, &mut encoder, &self.view, (W, H), list);
+            .render(&self.device, &self.queue, &mut encoder, &self.view, (W, H), 1.0, list);
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Poll);
     }

@@ -68,7 +68,7 @@ fn render_list(
             occlusion_query_set: None,
         });
     }
-    ui.render(device, queue, &mut encoder, &view, (W, H), list);
+    ui.render(device, queue, &mut encoder, &view, (W, H), 1.0, list);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &target,
