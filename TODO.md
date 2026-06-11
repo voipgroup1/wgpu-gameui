@@ -143,9 +143,17 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 ## Input & Focus
 
-- [ ] **P0 — Real focus model.** `TextInput.focused: bool` is set by the
-      caller. No focus owner, Tab navigation, blur-on-click-elsewhere,
-      Esc-to-blur. Multiple text inputs all activate at once.
+- [x] **P0 — Real focus model.** Caller-owned `FocusState`/`FocusId`
+      (mirrors `DragCapture`/`DragId`) is the single focus owner: at most one
+      widget focused at a time. `TextInput.draw(id, &mut focus, …)` registers
+      itself in the draw-order Tab ring and requests focus on click; Tab /
+      Shift-Tab cycle, Esc and click-elsewhere blur, only the focused input
+      consumes keys. `TextInput.focused: bool` removed. Modal-scoped Tab
+      trapping deferred (see below).
+- [ ] **P1 — Modal/popup-scoped Tab trapping.** Tab cycling is not yet scoped
+      to the active layer; a modal's Tab ring includes base-layer focusables.
+      Click-to-focus already respects `mouse_consumed`, so only Tab needs
+      scoping (tie focus scopes into `LayerStack` dispatch).
 - [x] **P0 — Full key event model.** `InputState` now has `key_left`,
       `key_right`, `key_home`, `key_end`, `key_delete`, `shift_pressed`,
       `ctrl_pressed`. Arrows/Home/End/Delete on physical keys; Shift/Ctrl as

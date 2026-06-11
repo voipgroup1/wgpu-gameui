@@ -3,7 +3,7 @@
 use crate::text::TextBlock;
 use crate::{InputState, Theme};
 
-use super::DrawList;
+use super::{DrawList, FocusId, FocusState};
 
 /// Byte-position snapping: find the closest cursor position to `click_x`
 /// by binary-searching the cursor-positions table.
@@ -54,7 +54,6 @@ pub struct TextInput {
     pub height: f32,
     pub value: String,
     pub placeholder: String,
-    pub focused: bool,
     /// Byte index of the text cursor (insertion point) within `value`.
     pub cursor_pos: usize,
     /// When set, the text between `selection_start` and `cursor_pos` is selected.
@@ -75,7 +74,6 @@ impl Default for TextInput {
             height: 24.0,
             value: String::new(),
             placeholder: String::new(),
-            focused: false,
             cursor_pos: 0,
             selection_start: None,
             clipboard_get: None,
@@ -93,7 +91,6 @@ impl TextInput {
             height,
             value: String::new(),
             placeholder: String::new(),
-            focused: false,
             cursor_pos: 0,
             selection_start: None,
             clipboard_get: None,
@@ -109,11 +106,6 @@ impl TextInput {
 
     pub fn with_placeholder(mut self, placeholder: impl Into<String>) -> Self {
         self.placeholder = placeholder.into();
-        self
-    }
-
-    pub fn with_focused(mut self, focused: bool) -> Self {
-        self.focused = focused;
         self
     }
 
@@ -273,12 +265,10 @@ impl TextInput {
 
     // ---- Input processing ----
 
-    /// Process keyboard events for the text field. Called automatically by `draw()`.
+    /// Process keyboard events for the text field. Called by `draw()` only when
+    /// the widget holds focus; callers driving it directly are responsible for
+    /// the focus gate.
     pub fn process_keyboard(&mut self, input: &InputState) {
-        if !self.focused {
-            return;
-        }
-
         // Check for Ctrl shortcuts via text_input.
         // When Ctrl is held, `ReceivedCharacter` may send ASCII control codes
         // (0x01 = Ctrl+A, 0x03 = Ctrl+C, 0x16 = Ctrl+V, 0x18 = Ctrl+X)
@@ -417,15 +407,35 @@ impl TextInput {
 
     /// Draw the input, handle text changes, and return true if clicked (to request focus).
     ///
-    /// Processes keyboard input internally when `focused`. To wire up Ctrl+A/C/V/X,
-    /// also call [`set_clipboard_get`](Self::set_clipboard_get) /
+    /// Focus is arbitrated by the caller-owned [`FocusState`]: the widget
+    /// [`register`](FocusState::register)s itself in the Tab ring each frame and
+    /// [`request`](FocusState::request)s focus when clicked. Keyboard input is
+    /// processed only while this widget is the focus owner, so multiple inputs
+    /// can no longer all type at once. To wire up Ctrl+A/C/V/X, also call
+    /// [`set_clipboard_get`](Self::set_clipboard_get) /
     /// [`set_clipboard_set`](Self::set_clipboard_set) before drawing.
-    pub fn draw(&mut self, list: &mut DrawList, theme: &Theme, input: &InputState) -> bool {
+    pub fn draw(
+        &mut self,
+        id: FocusId,
+        focus: &mut FocusState,
+        list: &mut DrawList,
+        theme: &Theme,
+        input: &InputState,
+    ) -> bool {
+        // Join the Tab ring for this frame.
+        focus.register(id);
+
         let hovered = input.is_hovered(self.x, self.y, self.width, self.height);
         let clicked = hovered && input.mouse_clicked;
 
+        // Clicking takes focus immediately (same-frame caret).
+        if clicked {
+            focus.request(id);
+        }
+        let focused = focus.is_focused(id);
+
         // ---- Click-to-position ----
-        if clicked && self.focused {
+        if clicked && focused {
             let click_x = input.mouse_x;
             let padding = theme.padding;
             let text_left = self.x + padding;
@@ -457,8 +467,10 @@ impl TextInput {
             }
         }
 
-        // Process keyboard events.
-        self.process_keyboard(input);
+        // Process keyboard events only while focused.
+        if focused {
+            self.process_keyboard(input);
+        }
 
         // ---- Draw background ----
         list.quad(
@@ -471,7 +483,7 @@ impl TextInput {
 
         // ---- Draw border ----
         let border = theme.border_width;
-        let border_color = if self.focused {
+        let border_color = if focused {
             theme.input_focus_border
         } else if hovered {
             theme.accent
@@ -507,7 +519,7 @@ impl TextInput {
             (&self.value, theme.text)
         };
 
-        if self.focused && !self.value.is_empty() {
+        if focused && !self.value.is_empty() {
             // ---- Draw selection highlight ----
             if let Some((sel_start, sel_end)) = self.selection_range() {
                 if sel_start < sel_end {
@@ -545,7 +557,7 @@ impl TextInput {
         list.text(text);
 
         // ---- Draw cursor ----
-        if self.focused {
+        if focused {
             let cursor_x = if self.value.is_empty() {
                 text_x
             } else {
@@ -576,9 +588,7 @@ mod tests {
     use crate::InputState;
 
     fn make_input(val: &str) -> TextInput {
-        TextInput::new(0.0, 0.0, 200.0, 24.0)
-            .with_value(val.to_string())
-            .with_focused(true)
+        TextInput::new(0.0, 0.0, 200.0, 24.0).with_value(val.to_string())
     }
 
     fn fake_input() -> InputState {
@@ -872,5 +882,54 @@ mod tests {
         ti.process_keyboard(&input);
         assert_eq!(ti.value, "hello");
         assert_eq!(ti.cursor_pos, 4);
+    }
+
+    /// Clicking one input then the other (across frames) hands focus to exactly
+    /// one — the old `focused: bool` bug let multiple inputs activate at once.
+    #[test]
+    fn two_inputs_cannot_both_be_focused() {
+        use crate::FocusState;
+
+        let mut a = TextInput::new(0.0, 0.0, 100.0, 24.0);
+        let mut b = TextInput::new(0.0, 40.0, 100.0, 24.0);
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+
+        // A frame in which the mouse clicks at (x, y).
+        let click_at = |x: f32, y: f32| InputState {
+            mouse_x: x,
+            mouse_y: y,
+            mouse_clicked: true,
+            ..Default::default()
+        };
+
+        // Frame 1: click input A.
+        let input = click_at(10.0, 10.0);
+        focus.begin_frame(&input);
+        a.draw(0, &mut focus, &mut list, &theme, &input);
+        b.draw(1, &mut focus, &mut list, &theme, &input);
+        focus.end_frame();
+        assert!(focus.is_focused(0));
+        assert!(!focus.is_focused(1));
+
+        // Frame 2: click input B — focus moves, A loses it.
+        let input = click_at(10.0, 50.0);
+        focus.begin_frame(&input);
+        a.draw(0, &mut focus, &mut list, &theme, &input);
+        b.draw(1, &mut focus, &mut list, &theme, &input);
+        focus.end_frame();
+        assert!(!focus.is_focused(0));
+        assert!(focus.is_focused(1));
+
+        // Frame 3: click empty space — both blur.
+        let input = click_at(500.0, 500.0);
+        focus.begin_frame(&input);
+        a.draw(0, &mut focus, &mut list, &theme, &input);
+        b.draw(1, &mut focus, &mut list, &theme, &input);
+        focus.end_frame();
+        assert!(!focus.is_focused(0));
+        assert!(!focus.is_focused(1));
+        assert_eq!(focus.focused(), None);
     }
 }

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    FontHandle, InputState, LayerStack, ScrollState, ScrollView, TextAlign, TextBlock, TextInput,
-    Theme, UiContext, UiRenderer,
+    FocusState, FontHandle, InputState, LayerStack, ScrollState, ScrollView, TextAlign, TextBlock,
+    TextInput, Theme, UiContext, UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -79,12 +79,20 @@ struct Gpu {
     custom_font: FontHandle,
 }
 
+/// Focus ids for the two text inputs — any stable, unique `u64` works.
+const TEXT_ID_A: u64 = 0;
+const TEXT_ID_B: u64 = 1;
+
 #[derive(Default)]
 struct UiState {
     scroll: ScrollState,
     modal_open: bool,
     modal_button_was_clicked: bool,
     text_input: TextInput,
+    text_input2: TextInput,
+    /// Single keyboard-focus owner shared by both text inputs. Tab / Shift-Tab
+    /// cycle between them; clicking elsewhere or pressing Esc blurs.
+    focus: FocusState,
 }
 
 struct App {
@@ -249,6 +257,16 @@ impl ApplicationHandler for App {
                         KeyCode::Home => self.input.key_home = pressed,
                         KeyCode::End => self.input.key_end = pressed,
                         KeyCode::Delete => self.input.key_delete = pressed,
+                        KeyCode::Tab => {
+                            if pressed {
+                                self.input.key_tab = true;
+                            }
+                        }
+                        KeyCode::Escape => {
+                            if pressed {
+                                self.input.key_escape = true;
+                            }
+                        }
                         KeyCode::Backspace => {
                             if pressed {
                                 self.input.backspace_pressed = true;
@@ -406,38 +424,44 @@ impl ApplicationHandler for App {
                 );
 
                 // ---------- Text input demo ----------
+                // Two inputs sharing one FocusState: click to focus, Tab /
+                // Shift-Tab to cycle, click empty space or press Esc to blur.
+                // Focus arbitration is resolved in `focus.end_frame()` below.
                 {
-                    // Position the text input.
+                    self.state.focus.begin_frame(&base_input);
+
+                    // Position the two text inputs.
                     self.state.text_input.x = 80.0;
                     self.state.text_input.y = 300.0;
                     self.state.text_input.width = 240.0;
                     self.state.text_input.height = 28.0;
+                    self.state.text_input2.x = 80.0;
+                    self.state.text_input2.y = 336.0;
+                    self.state.text_input2.width = 240.0;
+                    self.state.text_input2.height = 28.0;
 
-                    // Background label for the input.
+                    // Background label for the inputs.
                     list.text(
-                        TextBlock::new("Text Input:", 80.0, 280.0)
+                        TextBlock::new("Text Input (Tab to cycle):", 80.0, 280.0)
                             .with_size(12.0)
                             .with_color(180, 190, 210),
                     );
-                    let text_input_clicked = self.state.text_input.draw(
+                    self.state.text_input.draw(
+                        TEXT_ID_A,
+                        &mut self.state.focus,
                         list,
                         &self.theme,
                         &base_input,
                     );
-                    if text_input_clicked {
-                        self.state.text_input.focused = !self.state.text_input.focused;
-                    }
-                    // Blur on click outside the input area.
-                    if base_input.mouse_clicked
-                        && !base_input.is_hovered(
-                            self.state.text_input.x,
-                            self.state.text_input.y,
-                            self.state.text_input.width,
-                            self.state.text_input.height,
-                        )
-                    {
-                        self.state.text_input.focused = false;
-                    }
+                    self.state.text_input2.draw(
+                        TEXT_ID_B,
+                        &mut self.state.focus,
+                        list,
+                        &self.theme,
+                        &base_input,
+                    );
+
+                    self.state.focus.end_frame();
                 }
 
                 // ---------- Image + custom font + alignment demo ----------

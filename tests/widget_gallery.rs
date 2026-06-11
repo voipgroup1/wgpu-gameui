@@ -13,8 +13,9 @@
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    Button, Checkbox, ColumnWidth, DragCapture, DrawList, ImageButton, ImageFit, InputState,
-    LayerStack, ProgressBar, ScrollState, ScrollView, Slider, Table, TableCell, TableColumn, Tabs,
+    Button, Checkbox, ColumnWidth, DragCapture, DrawList, FocusState, ImageButton, ImageFit,
+    InputState, LayerStack, ProgressBar, ScrollState, ScrollView, Slider, Table, TableCell,
+    TableColumn, Tabs,
     TextAlign, TextBlock, TextInput, Theme, TooltipContent, TooltipLayer, UiRenderer,
     SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
 };
@@ -170,6 +171,12 @@ fn render_widget_gallery() {
     let mut layers = LayerStack::new();
     let theme = Theme::default();
     let mut input = InputState::default();
+
+    // Focus owner for the text inputs. Seed the first as focused so the rendered
+    // PNG shows a caret; `begin_frame`/`end_frame` bracket the draws below.
+    let mut focus = FocusState::new();
+    focus.focus(0);
+    focus.begin_frame(&input);
 
     // Reserved by the flow inside the scope below, used afterwards. The scope
     // runs unconditionally, so deferred init is sound (and avoids a dead store).
@@ -357,13 +364,12 @@ fn render_widget_gallery() {
         let r = flow.cell(list, "Text input", 200.0, 28.0);
         TextInput::new(r.x, r.y, r.width, r.height)
             .with_value("Hello, wgpu-gameui!")
-            .with_focused(true)
-            .draw(list, &theme, &input);
+            .draw(0, &mut focus, list, &theme, &input);
 
         let r = flow.cell(list, "Text input (empty)", 200.0, 28.0);
         TextInput::new(r.x, r.y, r.width, r.height)
             .with_placeholder("Placeholder...")
-            .draw(list, &theme, &input);
+            .draw(1, &mut focus, list, &theme, &input);
 
         let r = flow.cell(list, "Scroll view", 180.0, 100.0);
         list.rounded_rect(r, 4.0, [0.06, 0.07, 0.10, 1.0]);

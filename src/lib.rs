@@ -87,6 +87,11 @@ pub struct InputState {
     pub key_end: bool,
     /// Delete key was pressed this frame.
     pub key_delete: bool,
+    /// Tab key was pressed this frame. Drives focus navigation
+    /// (Shift+Tab reverses via [`shift_pressed`]).
+    pub key_tab: bool,
+    /// Escape key was pressed this frame. Blurs the focused widget.
+    pub key_escape: bool,
     /// Shift key is currently held.
     pub shift_pressed: bool,
     /// Ctrl (or Cmd on macOS) key is currently held.
@@ -116,6 +121,8 @@ impl InputState {
         self.key_home = false;
         self.key_end = false;
         self.key_delete = false;
+        self.key_tab = false;
+        self.key_escape = false;
         // shift_pressed and ctrl_pressed are held-state, cleared by the
         // windowing layer on key-up; they persist across frames.
     }
@@ -149,6 +156,8 @@ impl InputState {
             key_home: false,
             key_end: false,
             key_delete: false,
+            key_tab: false,
+            key_escape: false,
             // shift/ctrl are modifier state, not events — preserve them
             // so modals that have text inputs still see modifier keys.
             ..self.clone()

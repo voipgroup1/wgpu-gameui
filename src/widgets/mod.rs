@@ -4,6 +4,7 @@ mod button;
 mod checkbox;
 mod drag;
 mod draw_list;
+mod focus;
 mod image;
 mod image_button;
 mod panel;
@@ -22,6 +23,7 @@ pub(crate) use draw_list::ColorCmd;
 pub use draw_list::{
     ChromeInstance, CircleInstance, DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex,
 };
+pub use focus::{FocusId, FocusState};
 pub use image::{Image, ImageAlign, ImageFit};
 pub use image_button::ImageButton;
 pub use panel::{label, label_at, label_centered_at, title, title_at, Panel};
