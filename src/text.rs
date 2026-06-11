@@ -24,7 +24,7 @@ use crate::layout::Rect;
 use crate::render::{ortho_matrix, GlyphTile, MsdfGlyphAtlas};
 
 use glyphon::cosmic_text::{fontdb, Align as CosmicAlign, Wrap};
-use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
+use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, Weight};
 
 const MSDF_SHADER: &str = include_str!("render/ui_msdf.wgsl");
 
@@ -36,8 +36,52 @@ const MSDF_SHADER: &str = include_str!("render/ui_msdf.wgsl");
 pub type FontSystemHandle = Arc<Mutex<FontSystem>>;
 
 /// Create a new shared `FontSystem` handle.
+///
+/// `FontSystem::new()` loads the host's system fonts (used for broad script /
+/// emoji fallback). With the default `bundled-font` feature on, the bundled Noto
+/// Sans faces are also embedded and registered as the default sans-serif (see
+/// [`register_bundled_fonts`]), so unstyled text renders identically on every
+/// machine rather than depending on which system font happens to be installed.
 pub fn shared_font_system() -> FontSystemHandle {
-    Arc::new(Mutex::new(FontSystem::new()))
+    let handle = Arc::new(Mutex::new(FontSystem::new()));
+    register_bundled_fonts(&handle);
+    handle
+}
+
+/// Embed the bundled Noto Sans faces (regular/bold/italic/bold-italic) into `fs`
+/// and register the family as the default sans-serif, so `Family::SansSerif` —
+/// and any [`TextBlock`] without an explicit font — resolves to it
+/// deterministically on every machine instead of an OS-dependent system font.
+/// The bold/italic faces share the family name, so [`TextBlock::bold`] /
+/// [`TextBlock::italic`] select them on the default font too.
+///
+/// Returns the family [`FontHandle`] (also usable directly via
+/// [`TextBlock::with_font`]). With the `bundled-font` feature **disabled** this is
+/// a no-op that returns `None` and the default stays the system sans-serif.
+/// [`shared_font_system`] calls this for you; call it yourself only when you
+/// construct a `FontSystem` by other means.
+pub fn register_bundled_fonts(fs: &FontSystemHandle) -> Option<FontHandle> {
+    #[cfg(feature = "bundled-font")]
+    {
+        // Load all four faces; they share the "Noto Sans" family so weight/style
+        // selection picks the right one. Only the regular handle is returned.
+        let regular = load_font_bytes(fs, notosans::REGULAR_TTF).ok()?;
+        let _ = load_font_bytes(fs, notosans::BOLD_TTF);
+        let _ = load_font_bytes(fs, notosans::ITALIC_TTF);
+        let _ = load_font_bytes(fs, notosans::BOLD_ITALIC_TTF);
+        {
+            let mut guard = fs.lock().expect("FontSystem poisoned");
+            guard
+                .db_mut()
+                .set_sans_serif_family(regular.family().to_string());
+        }
+        Some(regular)
+    }
+    #[cfg(not(feature = "bundled-font"))]
+    {
+        let _ = fs;
+        None
+    }
 }
 
 /// Handle to a font loaded into the shared [`FontSystem`], identified by its
@@ -337,7 +381,15 @@ impl TextRenderer {
     /// Measure text using cosmic-text's shaping/layout path without touching GPU state.
     pub fn measure(&mut self, text: &str, font_size: f32) -> (f32, f32) {
         let mut fs = self.font_system.lock().expect("FontSystem poisoned");
-        measure_with_font_system(&mut fs, text, font_size, None, None)
+        measure_with_font_system(
+            &mut fs,
+            text,
+            font_size,
+            None,
+            None,
+            Weight::NORMAL,
+            Style::Normal,
+        )
     }
 
     /// Pre-generate the printable-ASCII glyph set into the atlas so the first
@@ -405,6 +457,8 @@ impl TextRenderer {
                 family_hash(block.font.as_ref()),
                 block.align,
                 block.ellipsize,
+                block.weight.0,
+                style_disc(block.style),
             );
 
             // Fast path: a cached layout for this exact key + content. No
@@ -449,6 +503,8 @@ impl TextRenderer {
                     block.line_height,
                     block.max_width,
                     family,
+                    block.weight,
+                    block.style,
                 );
                 &truncated
             } else {
@@ -465,7 +521,11 @@ impl TextRenderer {
             buffer.set_text(
                 &mut fs,
                 content,
-                Attrs::new().family(family).color(block.color),
+                Attrs::new()
+                    .family(family)
+                    .weight(block.weight)
+                    .style(block.style)
+                    .color(block.color),
                 Shaping::Advanced,
             );
             // Horizontal alignment is set per buffer line before layout; Left is
@@ -780,8 +840,20 @@ struct CachedShape {
 /// Outer cache key: everything that affects shaped layout *except* the content
 /// string (which is the inner `HashMap` key, so hits borrow `&str` with no
 /// allocation — mirrors [`TextMeasurer`]). Scalars are stored as bit patterns so
-/// the key is `Hash + Eq`.
-type ShapeKey = (u32, u32, u32, u64, TextAlign, bool);
+/// the key is `Hash + Eq`. The trailing `(u16, u8)` are the font weight and the
+/// [`style_disc`] style discriminant, so bold/italic variants cache and re-shape
+/// independently of the regular face.
+type ShapeKey = (u32, u32, u32, u64, TextAlign, bool, u16, u8);
+
+/// Stable discriminant for a cosmic-text [`Style`] so it can sit in a `Hash + Eq`
+/// cache key: `Normal = 0`, `Italic = 1`, `Oblique = 2`.
+fn style_disc(style: Style) -> u8 {
+    match style {
+        Style::Normal => 0,
+        Style::Italic => 1,
+        Style::Oblique => 2,
+    }
+}
 
 /// Cap on cached shaping entries before stale ones are evicted. Text-heavy
 /// screens (tables, logs) carry more distinct labels than the measurer's 4096,
@@ -1029,12 +1101,12 @@ const MEASURE_CACHE_CAP: usize = 4096;
 /// stale metrics.
 pub struct TextMeasurer {
     font_system: FontSystemHandle,
-    /// Keyed by quantized `(font_size_bits, max_width_bits, family_hash)` so the
-    /// inner `HashMap<String, _>` can be probed with a borrowed `&str` — no key
-    /// allocation on a cache hit, only on a miss when we insert. `family_hash`
-    /// is 0 for the default font; different fonts have different advances so the
-    /// font must be part of the key.
-    cache: HashMap<(u32, Option<u32>, u64), HashMap<String, (f32, f32)>>,
+    /// Keyed by quantized `(font_size_bits, max_width_bits, family_hash, weight,
+    /// style_disc)` so the inner `HashMap<String, _>` can be probed with a
+    /// borrowed `&str` — no key allocation on a cache hit, only on a miss when we
+    /// insert. `family_hash` is 0 for the default font; different fonts/weights/
+    /// styles have different advances so all three must be part of the key.
+    cache: HashMap<(u32, Option<u32>, u64, u16, u8), HashMap<String, (f32, f32)>>,
     cache_entries: usize,
 }
 
@@ -1100,10 +1172,29 @@ impl TextMeasurer {
         max_width: Option<f32>,
         font: Option<&FontHandle>,
     ) -> (f32, f32) {
+        self.measure_styled(text, font_size, max_width, font, Weight::NORMAL, Style::Normal)
+    }
+
+    /// Like [`measure_with_font`](Self::measure_with_font), but also selects a
+    /// font `weight` and `style`. Bold/italic faces have different advances, so
+    /// each `(font, weight, style)` combination is a distinct cache entry — a
+    /// measurement under this path matches a [`TextBlock`] rendered with the same
+    /// font/weight/style.
+    pub fn measure_styled(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+        font: Option<&FontHandle>,
+        weight: Weight,
+        style: Style,
+    ) -> (f32, f32) {
         let key = (
             font_size.to_bits(),
             max_width.map(f32::to_bits),
             family_hash(font),
+            weight.0,
+            style_disc(style),
         );
 
         if let Some(inner) = self.cache.get(&key) {
@@ -1114,7 +1205,15 @@ impl TextMeasurer {
 
         let dims = {
             let mut fs = self.font_system.lock().expect("FontSystem poisoned");
-            measure_with_font_system(&mut fs, text, font_size, max_width, font.map(|h| h.family()))
+            measure_with_font_system(
+                &mut fs,
+                text,
+                font_size,
+                max_width,
+                font.map(|h| h.family()),
+                weight,
+                style,
+            )
         };
 
         // Bound memory: dynamic strings (FPS, coordinates) would grow the cache
@@ -1164,12 +1263,15 @@ fn cosmic_align(align: TextAlign) -> Option<CosmicAlign> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure_with_font_system(
     font_system: &mut FontSystem,
     text: &str,
     font_size: f32,
     max_width: Option<f32>,
     family_name: Option<&str>,
+    weight: Weight,
+    style: Style,
 ) -> (f32, f32) {
     let line_height = font_size * 1.25;
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
@@ -1179,7 +1281,7 @@ fn measure_with_font_system(
     buffer.set_text(
         font_system,
         text,
-        Attrs::new().family(family),
+        Attrs::new().family(family).weight(weight).style(style),
         Shaping::Advanced,
     );
     buffer.shape_until_scroll(font_system, false);
@@ -1277,6 +1379,7 @@ pub fn text_cursor_positions(
 /// Shapes with no wrapping and reads the laid-out glyph positions to find the
 /// byte cutoff, so it costs at most two extra shaping passes (the content and the
 /// ellipsis) and only for blocks that actually overflow.
+#[allow(clippy::too_many_arguments)]
 fn ellipsize_to_width(
     fs: &mut FontSystem,
     content: &str,
@@ -1284,17 +1387,20 @@ fn ellipsize_to_width(
     line_height: f32,
     max_width: f32,
     family: Family,
+    weight: Weight,
+    style: Style,
 ) -> String {
     if content.is_empty() || !max_width.is_finite() || max_width <= 0.0 {
         return content.to_string();
     }
     let metrics = Metrics::new(font_size, line_height);
+    let attrs = || Attrs::new().family(family).weight(weight).style(style);
 
     // Shape the full content on a single line.
     let mut buffer = Buffer::new(fs, metrics);
     buffer.set_wrap(fs, Wrap::None);
     buffer.set_size(fs, None, None);
-    buffer.set_text(fs, content, Attrs::new().family(family), Shaping::Advanced);
+    buffer.set_text(fs, content, attrs(), Shaping::Advanced);
     buffer.shape_until_scroll(fs, false);
 
     let full_w = buffer.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
@@ -1306,7 +1412,7 @@ fn ellipsize_to_width(
     let mut ell = Buffer::new(fs, metrics);
     ell.set_wrap(fs, Wrap::None);
     ell.set_size(fs, None, None);
-    ell.set_text(fs, "…", Attrs::new().family(family), Shaping::Advanced);
+    ell.set_text(fs, "…", attrs(), Shaping::Advanced);
     ell.shape_until_scroll(fs, false);
     let ellipsis_w = ell.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
 
@@ -1384,6 +1490,13 @@ pub struct TextBlock {
     /// (no wrapping) and truncated with a trailing `'…'` if it would exceed
     /// `max_width`. When `false` (default) the block wraps at `max_width`.
     pub ellipsize: bool,
+    /// Font weight selector (default [`Weight::NORMAL`]). Picks the matching face
+    /// (e.g. [`Weight::BOLD`]) from the block's family during shaping; cosmic-text
+    /// selects a real face and does **not** synthesize faux-bold when absent.
+    pub weight: Weight,
+    /// Font style selector (default [`Style::Normal`]). [`Style::Italic`] /
+    /// [`Style::Oblique`] pick the matching face from the family when present.
+    pub style: Style,
 }
 
 impl TextBlock {
@@ -1403,6 +1516,8 @@ impl TextBlock {
             font: None,
             align: TextAlign::Left,
             ellipsize: false,
+            weight: Weight::NORMAL,
+            style: Style::Normal,
         }
     }
 
@@ -1486,6 +1601,40 @@ impl TextBlock {
         self.ellipsize = true;
         self
     }
+
+    /// Shape this block in `font` when `font` is `Some`, leaving the current font
+    /// unchanged on `None`. Lets callers thread an optional theme font through
+    /// without a branch at every call site.
+    pub fn with_font_opt(mut self, font: Option<FontHandle>) -> Self {
+        if let Some(f) = font {
+            self.font = Some(f);
+        }
+        self
+    }
+
+    /// Render this block bold (shorthand for `with_weight(Weight::BOLD)`).
+    pub fn bold(mut self) -> Self {
+        self.weight = Weight::BOLD;
+        self
+    }
+
+    /// Render this block italic (shorthand for `with_style(Style::Italic)`).
+    pub fn italic(mut self) -> Self {
+        self.style = Style::Italic;
+        self
+    }
+
+    /// Select a specific font weight (e.g. `Weight::BOLD`, `Weight(500)`).
+    pub fn with_weight(mut self, weight: Weight) -> Self {
+        self.weight = weight;
+        self
+    }
+
+    /// Select a specific font style (`Style::Normal`/`Italic`/`Oblique`).
+    pub fn with_style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -1495,7 +1644,7 @@ mod tests {
         measure_with_font_system, shared_font_system, text_cursor_positions, FontHandle, MsdfVertex,
         TextAlign, TextBlock, TextMeasurer, TextRenderer,
     };
-    use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping};
+    use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping, Style, Weight};
 
     #[test]
     fn color_to_rgba_normalizes_channels() {
@@ -1705,11 +1854,125 @@ mod tests {
     }
 
     #[test]
+    fn weight_and_style_defaults_and_builders() {
+        let plain = TextBlock::new("x", 0.0, 0.0);
+        assert_eq!(plain.weight, Weight::NORMAL);
+        assert_eq!(plain.style, Style::Normal);
+
+        assert_eq!(TextBlock::new("x", 0.0, 0.0).bold().weight, Weight::BOLD);
+        assert_eq!(TextBlock::new("x", 0.0, 0.0).italic().style, Style::Italic);
+        assert_eq!(
+            TextBlock::new("x", 0.0, 0.0).with_weight(Weight(500)).weight,
+            Weight(500)
+        );
+        assert_eq!(
+            TextBlock::new("x", 0.0, 0.0).with_style(Style::Oblique).style,
+            Style::Oblique
+        );
+    }
+
+    #[test]
+    fn with_font_opt_only_applies_some() {
+        let none = TextBlock::new("x", 0.0, 0.0).with_font_opt(None);
+        assert!(none.font.is_none());
+        let some = TextBlock::new("x", 0.0, 0.0)
+            .with_font_opt(Some(FontHandle("Noto Sans".to_string())));
+        assert_eq!(some.font.as_ref().unwrap().family(), "Noto Sans");
+        // Some over an existing font replaces it; None leaves it untouched.
+        let kept = TextBlock::new("x", 0.0, 0.0)
+            .with_font(FontHandle("A".into()))
+            .with_font_opt(None);
+        assert_eq!(kept.font.as_ref().unwrap().family(), "A");
+    }
+
+    #[test]
+    fn style_disc_is_stable() {
+        assert_eq!(super::style_disc(Style::Normal), 0);
+        assert_eq!(super::style_disc(Style::Italic), 1);
+        assert_eq!(super::style_disc(Style::Oblique), 2);
+    }
+
+    #[test]
+    fn bold_measures_wider_than_regular() {
+        // Load the regular + bold Noto faces (same "Noto Sans" family); the
+        // weight selects between them at shape time. GPU-free — measurer only.
+        let fs = shared_font_system();
+        let regular = load_font_bytes(&fs, notosans::REGULAR_TTF).unwrap();
+        let _bold = load_font_bytes(&fs, notosans::BOLD_TTF).unwrap();
+        let mut m = TextMeasurer::with_font_system(fs);
+        let text = "The quick brown fox jumps";
+        let (rw, _) =
+            m.measure_styled(text, 18.0, None, Some(&regular), Weight::NORMAL, Style::Normal);
+        let (bw, _) =
+            m.measure_styled(text, 18.0, None, Some(&regular), Weight::BOLD, Style::Normal);
+        assert!(rw > 0.0 && bw > 0.0);
+        assert!(bw > rw, "bold width {bw} should exceed regular {rw}");
+        // Distinct cache entries keyed by weight: re-measuring regular still
+        // returns the regular width (proves weight is part of the key).
+        let (rw2, _) =
+            m.measure_styled(text, 18.0, None, Some(&regular), Weight::NORMAL, Style::Normal);
+        assert_eq!(rw2, rw);
+    }
+
+    #[cfg(feature = "bundled-font")]
+    #[test]
+    fn bundled_font_is_default_sans_serif() {
+        // `shared_font_system` registers the bundled Noto faces + sets the
+        // default sans-serif, so `Family::SansSerif` resolves to Noto.
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+
+        let mut buffer = Buffer::new(&mut guard, Metrics::new(18.0, 22.0));
+        buffer.set_text(
+            &mut guard,
+            "Ag",
+            Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+        );
+        buffer.shape_until_scroll(&mut guard, false);
+        let font_id = buffer.layout_runs().next().unwrap().glyphs[0].font_id;
+        let fam = guard
+            .db()
+            .face(font_id)
+            .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+            .unwrap_or_default();
+        assert!(
+            fam.to_lowercase().contains("noto"),
+            "default sans-serif should be the bundled Noto family, got {fam:?}"
+        );
+
+        // Bold weight selects a heavier face from the same bundled family.
+        let mut bold = Buffer::new(&mut guard, Metrics::new(18.0, 22.0));
+        bold.set_text(
+            &mut guard,
+            "Ag",
+            Attrs::new().family(Family::SansSerif).weight(Weight::BOLD),
+            Shaping::Advanced,
+        );
+        bold.shape_until_scroll(&mut guard, false);
+        let bold_id = bold.layout_runs().next().unwrap().glyphs[0].font_id;
+        let bold_weight = guard.db().face(bold_id).map(|f| f.weight.0).unwrap_or(0);
+        assert!(
+            bold_weight >= 600,
+            "bold weight should select a bold face (>=600), got {bold_weight}"
+        );
+    }
+
+    #[test]
     fn ellipsize_leaves_fitting_text_unchanged() {
         let fs = shared_font_system();
         let mut guard = fs.lock().unwrap();
         // A wide budget the short string easily fits within.
-        let out = ellipsize_to_width(&mut guard, "short", 16.0, 20.0, 1000.0, Family::SansSerif);
+        let out = ellipsize_to_width(
+            &mut guard,
+            "short",
+            16.0,
+            20.0,
+            1000.0,
+            Family::SansSerif,
+            Weight::NORMAL,
+            Style::Normal,
+        );
         assert_eq!(out, "short");
     }
 
@@ -1719,12 +1982,29 @@ mod tests {
         let mut guard = fs.lock().unwrap();
         let long = "a_very_long_object_name_that_will_not_fit";
         let max_width = 80.0;
-        let out = ellipsize_to_width(&mut guard, long, 14.0, 18.0, max_width, Family::SansSerif);
+        let out = ellipsize_to_width(
+            &mut guard,
+            long,
+            14.0,
+            18.0,
+            max_width,
+            Family::SansSerif,
+            Weight::NORMAL,
+            Style::Normal,
+        );
         assert_ne!(out, long, "overflowing text should be truncated");
         assert!(out.ends_with('…'), "truncated text should end with an ellipsis");
         assert!(out.chars().count() < long.chars().count());
         // The truncated line (incl. the ellipsis) must fit the budget.
-        let (w, _) = measure_with_font_system(&mut guard, &out, 14.0, None, None);
+        let (w, _) = measure_with_font_system(
+            &mut guard,
+            &out,
+            14.0,
+            None,
+            None,
+            Weight::NORMAL,
+            Style::Normal,
+        );
         assert!(w <= max_width, "ellipsized width {w} must fit {max_width}");
     }
 
@@ -1733,7 +2013,16 @@ mod tests {
         let fs = shared_font_system();
         let mut guard = fs.lock().unwrap();
         // A budget too small for even one glyph + the ellipsis.
-        let out = ellipsize_to_width(&mut guard, "anything", 14.0, 18.0, 2.0, Family::SansSerif);
+        let out = ellipsize_to_width(
+            &mut guard,
+            "anything",
+            14.0,
+            18.0,
+            2.0,
+            Family::SansSerif,
+            Weight::NORMAL,
+            Style::Normal,
+        );
         assert_eq!(out, "…");
     }
 
@@ -1795,7 +2084,15 @@ mod tests {
         let max_width = 800.0;
         let pos = text_cursor_positions(&mut guard, text, font_size, font_size * 1.25, max_width, None);
 
-        let (total_w, _) = measure_with_font_system(&mut guard, text, font_size, None, None);
+        let (total_w, _) = measure_with_font_system(
+            &mut guard,
+            text,
+            font_size,
+            None,
+            None,
+            Weight::NORMAL,
+            Style::Normal,
+        );
         let final_x = pos.last().map(|(_, x)| *x).unwrap_or(0.0);
         // The final x-position should approximate the measured width.
         assert!(
@@ -1946,6 +2243,8 @@ mod tests {
         let default_font = label("Same", &font).with_max_width(800.0);
         let mut default_font = default_font;
         default_font.font = None; // None vs Noto => different family hash
+        let bold_variant = label("Same", &font).bold();
+        let italic_variant = label("Same", &font).italic();
 
         r.build_vertices(&[
             base,
@@ -1955,11 +2254,13 @@ mod tests {
             clipped_ellipsis,
             other_content,
             default_font,
+            bold_variant,
+            italic_variant,
         ]);
         assert_eq!(
             cache_total(&r),
-            7,
-            "each distinct (content|size|width|align|ellipsize|font) is its own entry"
+            9,
+            "each distinct (content|size|width|align|ellipsize|font|weight|style) is its own entry"
         );
     }
 

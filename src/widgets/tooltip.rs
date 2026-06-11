@@ -308,7 +308,8 @@ fn draw_tooltip_body(
                         (theme.text_highlight[0] * 255.0) as u8,
                         (theme.text_highlight[1] * 255.0) as u8,
                         (theme.text_highlight[2] * 255.0) as u8,
-                    );
+                    )
+                    .with_font_opt(theme.font.clone());
                 list.text(title_block);
                 cursor_y += title_height;
             }
@@ -319,7 +320,8 @@ fn draw_tooltip_body(
                     (theme.text[1] * 255.0) as u8,
                     (theme.text[2] * 255.0) as u8,
                 )
-                .with_max_width(width - padding * 2.0);
+                .with_max_width(width - padding * 2.0)
+                .with_font_opt(theme.font.clone());
             list.text(body_block);
         }
         TooltipContent::Lines { title, lines } => {
@@ -330,7 +332,8 @@ fn draw_tooltip_body(
                         (theme.text_highlight[0] * 255.0) as u8,
                         (theme.text_highlight[1] * 255.0) as u8,
                         (theme.text_highlight[2] * 255.0) as u8,
-                    );
+                    )
+                    .with_font_opt(theme.font.clone());
                 list.text(title_block);
                 cursor_y += title_height;
             }
@@ -341,7 +344,8 @@ fn draw_tooltip_body(
                         (theme.text[0] * 255.0) as u8,
                         (theme.text[1] * 255.0) as u8,
                         (theme.text[2] * 255.0) as u8,
-                    );
+                    )
+                    .with_font_opt(theme.font.clone());
                 list.text(line_block);
                 cursor_y += line_height;
             }
@@ -357,7 +361,8 @@ fn draw_tooltip_body(
                     (theme.text_highlight[0] * 255.0) as u8,
                     (theme.text_highlight[1] * 255.0) as u8,
                     (theme.text_highlight[2] * 255.0) as u8,
-                );
+                )
+                .with_font_opt(theme.font.clone());
             list.text(title_block);
             cursor_y += title_height;
 
@@ -368,7 +373,8 @@ fn draw_tooltip_body(
                     (theme.text[1] * 255.0) as u8,
                     (theme.text[2] * 255.0) as u8,
                 )
-                .with_max_width(width - padding * 2.0);
+                .with_max_width(width - padding * 2.0)
+                .with_font_opt(theme.font.clone());
             list.text(desc_block);
 
             cursor_y += rich_desc_h;
@@ -383,7 +389,8 @@ fn draw_tooltip_body(
                             (theme.text_dim[0] * 255.0) as u8,
                             (theme.text_dim[1] * 255.0) as u8,
                             (theme.text_dim[2] * 255.0) as u8,
-                        );
+                        )
+                        .with_font_opt(theme.font.clone());
                     list.text(detail_block);
                     cursor_y += line_height;
                 }

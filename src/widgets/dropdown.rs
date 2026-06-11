@@ -253,7 +253,8 @@ impl DropdownState {
                     )
                     .with_size(theme.font_size)
                     .with_color(r, g, b)
-                    .with_max_width(list_rect.width - theme.padding * 2.0),
+                    .with_max_width(list_rect.width - theme.padding * 2.0)
+                    .with_font_opt(theme.font.clone()),
                 );
             }
             l.pop_clip();
@@ -396,7 +397,8 @@ impl<'a> Dropdown<'a> {
             )
             .with_size(theme.font_size)
             .with_color(r, g, b)
-            .with_max_width(rect.width - theme.padding * 2.0 - CHEVRON * 3.0),
+            .with_max_width(rect.width - theme.padding * 2.0 - CHEVRON * 3.0)
+            .with_font_opt(theme.font.clone()),
         );
 
         // Chevron at the right edge: down when closed, up when open.

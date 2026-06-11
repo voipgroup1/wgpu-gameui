@@ -107,7 +107,8 @@ fn draw_label(list: &mut DrawList, theme: &Theme, rect: Rect, label: &str, enabl
             (text_color[1] * 255.0) as u8,
             (text_color[2] * 255.0) as u8,
         )
-        .with_max_width(rect.width - theme.padding * 2.0),
+        .with_max_width(rect.width - theme.padding * 2.0)
+        .with_font_opt(theme.font.clone()),
     );
 }
 

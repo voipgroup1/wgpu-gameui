@@ -30,9 +30,13 @@ mod text;
 
 pub use text::{
     FontHandle, FontSystemHandle, TextAlign, TextBlock, TextGlow, TextMeasurer, TextOutline,
-    TextRenderer, TextShadow, load_font_bytes, load_font_file, shared_font_system,
-    text_cursor_positions,
+    TextRenderer, TextShadow, load_font_bytes, load_font_file, register_bundled_fonts,
+    shared_font_system, text_cursor_positions,
 };
+
+/// Font weight and style selectors (re-exported from `glyphon`/`cosmic-text`)
+/// for `TextBlock::with_weight`/`with_style` and the `UiContext` font stack.
+pub use glyphon::{Style, Weight};
 
 pub mod affine;
 pub mod layer;
@@ -46,7 +50,7 @@ pub use affine::Affine2;
 pub use layer::{Layer, LayerKind, LayerStack};
 pub use render::{NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
 pub use theme::Theme;
-pub use ui_context::{AlignH, AlignV, UiContext};
+pub use ui_context::{AlignH, AlignV, FontSpec, UiContext};
 pub use widgets::*;
 
 /// Input state passed to UI for interaction.

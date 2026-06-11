@@ -11,8 +11,9 @@
 
 use crate::layer::{LayerKind, LayerStack};
 use crate::layout::Rect;
-use crate::text::TextBlock;
+use crate::text::{FontHandle, TextBlock};
 use crate::widgets::DrawList;
+use glyphon::{Style, Weight};
 
 /// Horizontal alignment relative to the current origin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -88,6 +89,32 @@ impl AlignSpec {
     }
 }
 
+/// The current font selection — family, size, weight, and style — tracked on a
+/// push/pop stack so Teardown's stateful `UiFont` verb (and bold/italic) scope
+/// to their enclosing `UiPush`/`UiPop` frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FontSpec {
+    /// Family handle, or `None` to fall back to the theme/bundled default.
+    pub font: Option<FontHandle>,
+    /// Font size in pixels.
+    pub size: f32,
+    /// Weight (e.g. `Weight::NORMAL` / `Weight::BOLD`).
+    pub weight: Weight,
+    /// Style (`Normal` / `Italic` / `Oblique`).
+    pub style: Style,
+}
+
+impl Default for FontSpec {
+    fn default() -> Self {
+        Self {
+            font: None,
+            size: 16.0,
+            weight: Weight::NORMAL,
+            style: Style::Normal,
+        }
+    }
+}
+
 /// What `UiContext` is rendering into.
 enum Backend<'a> {
     /// Plain draw list (no layer system; modal_begin/popup_begin will panic
@@ -128,6 +155,9 @@ pub struct UiContext<'a> {
     /// Names of unknown align tokens we've already warned about, to keep one
     /// typo from spamming the log every frame.
     warned_align_tokens: std::collections::HashSet<String>,
+    /// Active font selection, scoped to `push`/`pop` like `align_stack`. The top
+    /// is the current font; always at least one entry (`FontSpec::default()`).
+    font_stack: Vec<FontSpec>,
 }
 
 impl<'a> UiContext<'a> {
@@ -143,6 +173,7 @@ impl<'a> UiContext<'a> {
             window_depth_stack: Vec::new(),
             open_layer_kinds: Vec::new(),
             warned_align_tokens: std::collections::HashSet::new(),
+            font_stack: vec![FontSpec::default()],
         }
     }
 
@@ -156,6 +187,7 @@ impl<'a> UiContext<'a> {
             window_depth_stack: Vec::new(),
             open_layer_kinds: Vec::new(),
             warned_align_tokens: std::collections::HashSet::new(),
+            font_stack: vec![FontSpec::default()],
         }
     }
 
@@ -168,6 +200,8 @@ impl<'a> UiContext<'a> {
         list.push_tint();
         let top = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         self.align_stack.push(top);
+        let font_top = self.font_stack.last().cloned().unwrap_or_default();
+        self.font_stack.push(font_top);
         self.clip_depth_stack.push(clip_depth);
         self.window_depth_stack.push(window_depth);
     }
@@ -182,6 +216,9 @@ impl<'a> UiContext<'a> {
         list.pop_tint();
         if self.align_stack.len() > 1 {
             self.align_stack.pop();
+        }
+        if self.font_stack.len() > 1 {
+            self.font_stack.pop();
         }
         if let Some(depth) = self.clip_depth_stack.pop() {
             self.backend.list_mut().truncate_clip(depth);
@@ -235,6 +272,79 @@ impl<'a> UiContext<'a> {
                 v: AlignV::Middle,
             };
         }
+    }
+
+    /// Set the current font family and size (Teardown's `UiFont(path, size)`).
+    /// Scoped to the enclosing `push`/`pop`.
+    pub fn font(&mut self, font: FontHandle, size: f32) {
+        if let Some(top) = self.font_stack.last_mut() {
+            top.font = Some(font);
+            top.size = size;
+        }
+    }
+
+    /// Set just the current font size, leaving family/weight/style intact
+    /// (Teardown's `UiFontSize`).
+    pub fn font_size(&mut self, size: f32) {
+        if let Some(top) = self.font_stack.last_mut() {
+            top.size = size;
+        }
+    }
+
+    /// Set just the current font family, leaving size/weight/style intact.
+    pub fn font_family(&mut self, font: FontHandle) {
+        if let Some(top) = self.font_stack.last_mut() {
+            top.font = Some(font);
+        }
+    }
+
+    /// Toggle bold (`Weight::BOLD` when `on`, else `Weight::NORMAL`).
+    pub fn bold(&mut self, on: bool) {
+        if let Some(top) = self.font_stack.last_mut() {
+            top.weight = if on { Weight::BOLD } else { Weight::NORMAL };
+        }
+    }
+
+    /// Set an explicit font weight.
+    pub fn font_weight(&mut self, weight: Weight) {
+        if let Some(top) = self.font_stack.last_mut() {
+            top.weight = weight;
+        }
+    }
+
+    /// Toggle italic (`Style::Italic` when `on`, else `Style::Normal`).
+    pub fn italic(&mut self, on: bool) {
+        if let Some(top) = self.font_stack.last_mut() {
+            top.style = if on { Style::Italic } else { Style::Normal };
+        }
+    }
+
+    /// Set an explicit font style (`Normal` / `Italic` / `Oblique`).
+    pub fn font_style(&mut self, style: Style) {
+        if let Some(top) = self.font_stack.last_mut() {
+            top.style = style;
+        }
+    }
+
+    /// The current font selection (clone of the stack top).
+    pub fn current_font(&self) -> FontSpec {
+        self.font_stack.last().cloned().unwrap_or_default()
+    }
+
+    /// Draw a single line of text using the current font stack (size, family,
+    /// weight, style), honoring align/transform like [`text`](Self::text). The
+    /// line's box for alignment is the font size × line-height of the active
+    /// `FontSpec`.
+    pub fn text_line(&mut self, text: &str, color: [f32; 4]) {
+        let spec = self.current_font();
+        let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0) as u8;
+        let block = TextBlock::new(text, 0.0, 0.0)
+            .with_size(spec.size)
+            .with_rgba(to_u8(color[0]), to_u8(color[1]), to_u8(color[2]), to_u8(color[3]))
+            .with_font_opt(spec.font)
+            .with_weight(spec.weight)
+            .with_style(spec.style);
+        self.text(block);
     }
 
     /// Replace the current tint (Teardown's `UiColor`).
@@ -529,6 +639,12 @@ impl<'a> Drop for UiContext<'a> {
             1,
             "UiContext dropped with {} unbalanced push/pop pair(s) on the align stack",
             self.align_stack.len() - 1
+        );
+        debug_assert_eq!(
+            self.font_stack.len(),
+            1,
+            "UiContext dropped with {} unbalanced push/pop pair(s) on the font stack",
+            self.font_stack.len() - 1
         );
         debug_assert_eq!(
             self.open_layer_kinds.len(),
@@ -891,6 +1007,85 @@ mod tests {
         let mut ui = UiContext::with_layers(&mut layers);
         ui.popup_begin(Rect::new(0.0, 0.0, 1.0, 1.0));
         ui.modal_end(); // wrong kind -> debug_assert; layer still popped
+    }
+
+    #[test]
+    fn font_defaults_to_default_spec() {
+        let mut list = DrawList::new();
+        let ui = UiContext::new(&mut list);
+        assert_eq!(ui.current_font(), FontSpec::default());
+    }
+
+    #[test]
+    fn font_verbs_mutate_stack_top() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.font(FontHandle("Noto Sans".into()), 24.0);
+        ui.bold(true);
+        ui.italic(true);
+        let f = ui.current_font();
+        assert_eq!(f.font, Some(FontHandle("Noto Sans".into())));
+        assert_eq!(f.size, 24.0);
+        assert_eq!(f.weight, Weight::BOLD);
+        assert_eq!(f.style, Style::Italic);
+        // Independent setters leave the rest intact.
+        ui.font_size(12.0);
+        ui.bold(false);
+        let f = ui.current_font();
+        assert_eq!(f.size, 12.0);
+        assert_eq!(f.weight, Weight::NORMAL);
+        assert_eq!(f.style, Style::Italic); // unchanged
+        assert_eq!(f.font, Some(FontHandle("Noto Sans".into()))); // unchanged
+    }
+
+    #[test]
+    fn push_pop_scopes_font_too() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.font(FontHandle("Base".into()), 16.0);
+        ui.push();
+        ui.font(FontHandle("Inner".into()), 32.0);
+        ui.bold(true);
+        let inner = ui.current_font();
+        assert_eq!(inner.font, Some(FontHandle("Inner".into())));
+        assert_eq!(inner.size, 32.0);
+        assert_eq!(inner.weight, Weight::BOLD);
+        ui.pop();
+        let outer = ui.current_font();
+        assert_eq!(outer.font, Some(FontHandle("Base".into())));
+        assert_eq!(outer.size, 16.0);
+        assert_eq!(outer.weight, Weight::NORMAL);
+    }
+
+    #[test]
+    fn text_line_carries_font_stack_attributes() {
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::new(&mut list);
+            ui.font(FontHandle("Noto Sans".into()), 28.0);
+            ui.bold(true);
+            ui.italic(true);
+            ui.text_line("hi", [1.0, 0.0, 0.0, 1.0]);
+        }
+        assert_eq!(list.texts.len(), 1);
+        let block = &list.texts[0];
+        assert_eq!(block.font, Some(FontHandle("Noto Sans".into())));
+        assert_eq!(block.font_size, 28.0);
+        assert_eq!(block.weight, Weight::BOLD);
+        assert_eq!(block.style, Style::Italic);
+    }
+
+    #[test]
+    #[should_panic(expected = "unbalanced push/pop pair(s) on the font stack")]
+    fn unbalanced_font_stack_drop_panics_in_debug() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        // Push the font stack without a matching pop by leaking an extra entry.
+        ui.font_stack.push(FontSpec::default());
+        // Re-balance the align stack so only the font-stack assert can fire.
+        // (push() also grows align_stack; here we touched font_stack directly,
+        // so align_stack is still balanced.)
+        drop(ui);
     }
 
     #[test]

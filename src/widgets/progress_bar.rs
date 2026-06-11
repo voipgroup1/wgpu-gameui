@@ -102,7 +102,8 @@ impl ProgressBar {
                     (theme.text[0] * 255.0) as u8,
                     (theme.text[1] * 255.0) as u8,
                     (theme.text[2] * 255.0) as u8,
-                );
+                )
+                .with_font_opt(theme.font.clone());
             list.text(block);
         }
     }
@@ -125,7 +126,8 @@ impl ProgressBar {
                 (theme.text[0] * 255.0) as u8,
                 (theme.text[1] * 255.0) as u8,
                 (theme.text[2] * 255.0) as u8,
-            );
+            )
+            .with_font_opt(theme.font.clone());
         list.text(label_block);
 
         // Progress bar on the right

@@ -337,6 +337,43 @@ fn render_widget_gallery() {
                 .with_align(TextAlign::Center),
         );
 
+        // ---- Fonts ------------------------------------------------------
+        // The bundled Noto Sans family (registered by `shared_font_system`)
+        // resolves the default sans-serif and provides real bold/italic faces.
+        flow.section(list, "Fonts");
+
+        let r = flow.cell(list, "Regular", 130.0, 24.0);
+        list.text(
+            TextBlock::new("Regular", r.x, r.y)
+                .with_size(22.0)
+                .with_color(220, 225, 235),
+        );
+
+        let r = flow.cell(list, "Bold", 130.0, 24.0);
+        list.text(
+            TextBlock::new("Bold", r.x, r.y)
+                .with_size(22.0)
+                .with_color(220, 225, 235)
+                .bold(),
+        );
+
+        let r = flow.cell(list, "Italic", 130.0, 24.0);
+        list.text(
+            TextBlock::new("Italic", r.x, r.y)
+                .with_size(22.0)
+                .with_color(220, 225, 235)
+                .italic(),
+        );
+
+        let r = flow.cell(list, "Bold Italic", 140.0, 24.0);
+        list.text(
+            TextBlock::new("Bold Italic", r.x, r.y)
+                .with_size(22.0)
+                .with_color(220, 225, 235)
+                .bold()
+                .italic(),
+        );
+
         // ---- Widgets ----------------------------------------------------
         flow.section(list, "Widgets");
 

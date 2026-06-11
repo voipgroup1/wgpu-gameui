@@ -535,6 +535,32 @@ impl ApplicationHandler for App {
                         .with_max_width(300.0)
                         .with_align(TextAlign::Right),
                 );
+                // Bold + italic, using the bundled default sans-serif (real faces).
+                list.text(
+                    TextBlock::new("Bold", 232.0, 388.0)
+                        .with_size(16.0)
+                        .with_color(255, 255, 255)
+                        .bold(),
+                );
+                list.text(
+                    TextBlock::new("Italic", 290.0, 388.0)
+                        .with_size(16.0)
+                        .with_color(255, 255, 255)
+                        .italic(),
+                );
+
+                // A small UiContext font-stack snippet: push a bold 18px font,
+                // draw a line via `text_line`, then pop back to the default.
+                let stack_font = gpu.custom_font.clone();
+                {
+                    let mut ui = UiContext::new(list);
+                    ui.translate(232.0, 410.0);
+                    ui.push();
+                    ui.font(stack_font, 18.0);
+                    ui.bold(true);
+                    ui.text_line("font-stack: pushed bold", [0.7, 0.9, 1.0, 1.0]);
+                    ui.pop();
+                }
 
                 // ---------- Modal demo ----------
                 if let Some(idx) = modal_idx {

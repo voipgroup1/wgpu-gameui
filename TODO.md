@@ -203,10 +203,17 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `TextInput` (`clipboard_get`/`clipboard_set`). Users wire the platform
       clipboard (e.g. `arboard`). Cut/copy/paste (Ctrl+X/C/V) when closures are
       set.
-- [ ] **P0 — Font system.** Hardcoded `Family::SansSerif`
-      (`src/text.rs:74`). No font loading, bold/italic, `UiFont(path,size)`,
-      or font fallback. `UiFont` is one of the most-called UI fns in
-      Teardown (~2k mod calls).
+- [x] **P0 — Font system.** Runtime font loading (`load_font_file`/
+      `load_font_bytes` → `FontHandle`), per-`TextBlock` font selection
+      (`with_font`/`with_font_opt`), bold/italic/weight (`TextBlock::bold()`/
+      `italic()`/`with_weight()`/`with_style()`, threaded through the shape
+      cache + measurement), a bundled default font (Noto Sans, behind the
+      default-on `bundled-font` feature → deterministic `Family::SansSerif` via
+      `register_bundled_fonts`), `Theme.font` driving every widget, and the
+      Teardown `UiFont(family,size)` push/pop font stack on `UiContext`
+      (`font`/`font_size`/`font_family`/`bold`/`italic`/`text_line`).
+      cosmic-text's script/glyph fallback is automatic. (Synthetic bold/oblique
+      for absent faces is out of scope — cosmic-text selects real faces only.)
 - [ ] **P1 — Multi-line `TextInput` / textarea.** Enter is consumed as a
       separate event, never inserted.
 - [ ] **P1 — Text wrapping policy.** `max_width` set, but smaller-than-text
@@ -226,7 +233,9 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [ ] **P0 — DPI / scale factor** propagated through renderer; affects
       glyphon resolution, vertex output, layout. Teardown's `UiScale` exists
       (~1.2k mod calls).
-- [ ] **P1 — Multiple fonts / sizes / weights** (see font system above).
+- [x] **P1 — Multiple fonts / sizes / weights** (see font system above) —
+      per-`TextBlock` family/size/weight/style, `Theme.font`, and the
+      `UiContext` font stack all land this.
 - [ ] **P1 — Per-widget style override** without copying the whole `Theme`.
 - [ ] **P1 — Extensible theme** (typed style map / `HashMap<StyleKey,
       StyleValue>`) so custom widgets don't need core changes.

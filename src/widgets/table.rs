@@ -371,7 +371,8 @@ impl<'a> Table<'a> {
                 (theme.text_dim[0] * 255.0) as u8,
                 (theme.text_dim[1] * 255.0) as u8,
                 (theme.text_dim[2] * 255.0) as u8,
-            );
+            )
+            .with_font_opt(theme.font.clone());
             list.text(text);
 
             x += col_width;
@@ -409,7 +410,8 @@ impl<'a> Table<'a> {
                 (color[0] * 255.0) as u8,
                 (color[1] * 255.0) as u8,
                 (color[2] * 255.0) as u8,
-            );
+            )
+            .with_font_opt(theme.font.clone());
         list.text(text);
     }
 }

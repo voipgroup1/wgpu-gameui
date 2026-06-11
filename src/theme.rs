@@ -1,6 +1,6 @@
 //! UI theming - colors, fonts, spacing.
 
-use crate::text::TextBlock;
+use crate::text::{FontHandle, TextBlock};
 
 /// UI theme with colors and styling.
 #[derive(Clone)]
@@ -43,6 +43,13 @@ pub struct Theme {
     pub font_size_title: f32,
     pub button_height: f32,
     pub input_height: f32,
+
+    /// UI-wide default font. `None` resolves to the default sans-serif (the
+    /// bundled Noto Sans when the `bundled-font` feature is on, else the system
+    /// sans-serif). Set to a loaded [`FontHandle`] to theme all widget text in a
+    /// custom family; every widget that builds text through this `Theme` picks it
+    /// up. Per-block `TextBlock::with_font` still overrides it.
+    pub font: Option<FontHandle>,
 }
 
 impl Default for Theme {
@@ -86,7 +93,35 @@ impl Default for Theme {
             font_size_title: 28.0,
             button_height: 44.0,
             input_height: 40.0,
+
+            font: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_text_and_title_have_no_font_by_default() {
+        let theme = Theme::default();
+        assert!(theme.text("hi", 0.0, 0.0).font.is_none());
+        assert!(theme.title("hi", 0.0, 0.0).font.is_none());
+    }
+
+    #[test]
+    fn theme_font_applies_to_text_and_title() {
+        let mut theme = Theme::default();
+        theme.font = Some(FontHandle("Noto Sans".to_string()));
+        assert_eq!(
+            theme.text("hi", 0.0, 0.0).font.as_ref().unwrap().family(),
+            "Noto Sans"
+        );
+        assert_eq!(
+            theme.title("hi", 0.0, 0.0).font.as_ref().unwrap().family(),
+            "Noto Sans"
+        );
     }
 }
 
@@ -100,6 +135,7 @@ impl Theme {
                 (self.text[1] * 255.0) as u8,
                 (self.text[2] * 255.0) as u8,
             )
+            .with_font_opt(self.font.clone())
     }
 
     /// Create a title text block
@@ -111,5 +147,6 @@ impl Theme {
                 (self.text[1] * 255.0) as u8,
                 (self.text[2] * 255.0) as u8,
             )
+            .with_font_opt(self.font.clone())
     }
 }

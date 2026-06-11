@@ -172,7 +172,8 @@ impl Slider {
                     (text_color[0] * 255.0) as u8,
                     (text_color[1] * 255.0) as u8,
                     (text_color[2] * 255.0) as u8,
-                );
+                )
+                .with_font_opt(theme.font.clone());
             list.text(block);
         }
 
