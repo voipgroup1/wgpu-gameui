@@ -867,7 +867,8 @@ impl<'a> UiContext<'a> {
                 ti.selection_start = None;
             }
             let before = ti.value.clone();
-            ti.draw(id, focus, list, theme, &local_input);
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
+            ti.draw(id, &mut ctx);
             let changed = ti.value != before;
             if changed {
                 buffer.clear();

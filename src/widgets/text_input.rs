@@ -1,9 +1,9 @@
 //! Text input widget with selection, cursor navigation, and clipboard support.
 
 use crate::text::TextBlock;
-use crate::{InputState, Theme};
+use crate::InputState;
 
-use super::{DrawList, FocusId, FocusState};
+use super::{DrawContext, FocusId};
 
 /// Byte-position snapping: find the closest cursor position to `click_x`
 /// by binary-searching the cursor-positions table.
@@ -414,14 +414,11 @@ impl TextInput {
     /// can no longer all type at once. To wire up Ctrl+A/C/V/X, also call
     /// [`set_clipboard_get`](Self::set_clipboard_get) /
     /// [`set_clipboard_set`](Self::set_clipboard_set) before drawing.
-    pub fn draw(
-        &mut self,
-        id: FocusId,
-        focus: &mut FocusState,
-        list: &mut DrawList,
-        theme: &Theme,
-        input: &InputState,
-    ) -> bool {
+    pub fn draw(&mut self, id: FocusId, ctx: &mut DrawContext) -> bool {
+        let list = &mut *ctx.draw_list;
+        let focus = &mut *ctx.focus;
+        let theme = ctx.theme;
+        let input = ctx.input;
         // Join the Tab ring for this frame.
         focus.register(id);
 
@@ -585,10 +582,25 @@ impl TextInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InputState;
+    use crate::{DrawList, FocusState, InputState, Theme};
 
     fn make_input(val: &str) -> TextInput {
         TextInput::new(0.0, 0.0, 200.0, 24.0).with_value(val.to_string())
+    }
+
+    /// Draw a text input through a throwaway `DrawContext`. Scoping the context
+    /// to this call drops its `&mut FocusState` borrow before the caller asserts
+    /// on focus state.
+    fn draw_input(
+        ti: &mut TextInput,
+        id: FocusId,
+        focus: &mut FocusState,
+        list: &mut DrawList,
+        theme: &Theme,
+        input: &InputState,
+    ) -> bool {
+        let mut ctx = DrawContext::new(list, focus, theme, input, 800.0, 600.0);
+        ti.draw(id, &mut ctx)
     }
 
     fn fake_input() -> InputState {
@@ -888,8 +900,6 @@ mod tests {
     /// one — the old `focused: bool` bug let multiple inputs activate at once.
     #[test]
     fn two_inputs_cannot_both_be_focused() {
-        use crate::FocusState;
-
         let mut a = TextInput::new(0.0, 0.0, 100.0, 24.0);
         let mut b = TextInput::new(0.0, 40.0, 100.0, 24.0);
         let mut focus = FocusState::new();
@@ -907,8 +917,8 @@ mod tests {
         // Frame 1: click input A.
         let input = click_at(10.0, 10.0);
         focus.begin_frame(&input);
-        a.draw(0, &mut focus, &mut list, &theme, &input);
-        b.draw(1, &mut focus, &mut list, &theme, &input);
+        draw_input(&mut a, 0, &mut focus, &mut list, &theme, &input);
+        draw_input(&mut b, 1, &mut focus, &mut list, &theme, &input);
         focus.end_frame(None);
         assert!(focus.is_focused(0));
         assert!(!focus.is_focused(1));
@@ -916,8 +926,8 @@ mod tests {
         // Frame 2: click input B — focus moves, A loses it.
         let input = click_at(10.0, 50.0);
         focus.begin_frame(&input);
-        a.draw(0, &mut focus, &mut list, &theme, &input);
-        b.draw(1, &mut focus, &mut list, &theme, &input);
+        draw_input(&mut a, 0, &mut focus, &mut list, &theme, &input);
+        draw_input(&mut b, 1, &mut focus, &mut list, &theme, &input);
         focus.end_frame(None);
         assert!(!focus.is_focused(0));
         assert!(focus.is_focused(1));
@@ -925,8 +935,8 @@ mod tests {
         // Frame 3: click empty space — both blur.
         let input = click_at(500.0, 500.0);
         focus.begin_frame(&input);
-        a.draw(0, &mut focus, &mut list, &theme, &input);
-        b.draw(1, &mut focus, &mut list, &theme, &input);
+        draw_input(&mut a, 0, &mut focus, &mut list, &theme, &input);
+        draw_input(&mut b, 1, &mut focus, &mut list, &theme, &input);
         focus.end_frame(None);
         assert!(!focus.is_focused(0));
         assert!(!focus.is_focused(1));

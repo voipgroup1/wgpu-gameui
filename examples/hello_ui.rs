@@ -461,20 +461,18 @@ impl ApplicationHandler for App {
                             .with_size(12.0)
                             .with_color(180, 190, 210),
                     );
-                    self.state.text_input.draw(
-                        TEXT_ID_A,
-                        &mut self.state.focus,
-                        list,
-                        &self.theme,
-                        &base_input,
-                    );
-                    self.state.text_input2.draw(
-                        TEXT_ID_B,
-                        &mut self.state.focus,
-                        list,
-                        &self.theme,
-                        &base_input,
-                    );
+                    {
+                        let mut ctx = DrawContext::new(
+                            list,
+                            &mut self.state.focus,
+                            &self.theme,
+                            &base_input,
+                            gpu.config.width as f32,
+                            gpu.config.height as f32,
+                        );
+                        self.state.text_input.draw(TEXT_ID_A, &mut ctx);
+                        self.state.text_input2.draw(TEXT_ID_B, &mut ctx);
+                    }
 
                     self.state.focus.end_frame(None);
                 }

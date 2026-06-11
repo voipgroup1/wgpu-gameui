@@ -439,12 +439,12 @@ fn render_widget_gallery() {
         let r = flow.cell(list, "Text input", 200.0, 28.0);
         TextInput::new(r.x, r.y, r.width, r.height)
             .with_value("Hello, wgpu-gameui!")
-            .draw(0, &mut focus, list, &theme, &input);
+            .draw(0, &mut ctx(list, &mut focus, &theme, &input));
 
         let r = flow.cell(list, "Text input (empty)", 200.0, 28.0);
         TextInput::new(r.x, r.y, r.width, r.height)
             .with_placeholder("Placeholder...")
-            .draw(1, &mut focus, list, &theme, &input);
+            .draw(1, &mut ctx(list, &mut focus, &theme, &input));
 
         // Dropdown, seeded open: the floating list (drawn after the base scope)
         // renders above whatever cells sit below it.
