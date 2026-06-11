@@ -240,14 +240,33 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
-                    let pressed = state == ElementState::Pressed;
-                    if pressed && !self.input.mouse_down {
-                        self.input.mouse_clicked = true;
-                    } else if !pressed && self.input.mouse_down {
-                        self.input.mouse_released = true;
+                let pressed = state == ElementState::Pressed;
+                match button {
+                    MouseButton::Left => {
+                        if pressed && !self.input.mouse_down {
+                            self.input.mouse_clicked = true;
+                        } else if !pressed && self.input.mouse_down {
+                            self.input.mouse_released = true;
+                        }
+                        self.input.mouse_down = pressed;
                     }
-                    self.input.mouse_down = pressed;
+                    MouseButton::Right => {
+                        if pressed && !self.input.mouse_right_down {
+                            self.input.mouse_right_clicked = true;
+                        } else if !pressed && self.input.mouse_right_down {
+                            self.input.mouse_right_released = true;
+                        }
+                        self.input.mouse_right_down = pressed;
+                    }
+                    MouseButton::Middle => {
+                        if pressed && !self.input.mouse_middle_down {
+                            self.input.mouse_middle_clicked = true;
+                        } else if !pressed && self.input.mouse_middle_down {
+                            self.input.mouse_middle_released = true;
+                        }
+                        self.input.mouse_middle_down = pressed;
+                    }
+                    _ => {}
                 }
                 window.request_redraw();
             }

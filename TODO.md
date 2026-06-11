@@ -202,8 +202,12 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       the flag automatically. (Note: existing widgets that call
       `rect.contains(input.mouse_x, ...)` directly should additionally AND
       with `!input.mouse_consumed` — `Table` and the example already do.)
-- [ ] **P1 — Multi-button mouse** (right click, middle click) for context
-      menus.
+- [x] **P1 — Multi-button mouse** (right click, middle click) for context
+      menus. `InputState` gained `mouse_right_down/clicked/released` and
+      `mouse_middle_down/clicked/released`. Edge fields (`clicked`/`released`)
+      are cleared by `end_frame` and zeroed by `consumed()`; held-state (`down`)
+      passes through. Example wires `MouseButton::Right` and `MouseButton::Middle`
+      from the winit event. 5 tests. (`src/lib.rs`)
 - [ ] **P1 — Double-click and click-and-hold distinction** (timestamps).
 - [x] **P1 — Drag detection on `InputState`** (`is_dragging`, `drag_delta`)
       so widgets stop reinventing it. `InputState` gained `is_dragging: bool`
@@ -215,8 +219,11 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       and `end_frame()` clear the outputs. Complementary to `DragCapture`
       (ownership) — a window-mover uses both. (`src/drag_tracker.rs`, 13 tests;
       example has a "drag me" box.)
-- [ ] **P1 — Scroll wheel propagation/capture** with a "consumed" flag for
-      overlapping scroll regions.
+- [x] **P1 — Scroll wheel propagation/capture** with a "consumed" flag for
+      overlapping scroll regions. `InputState::scroll_consumed` is set by any
+      `ScrollView` that claims the wheel (even at a clamp boundary, so the event
+      can't "bubble out" to an outer scrollable). 4 tests: basic consume,
+      inner/outer nesting, cursor-outside-inner passes through. (`scroll_view.rs`)
 - [ ] **P1 — IME / composition** for CJK/accented input.
 - [ ] **P1 — Keyboard navigation** (Tab/Space-to-activate, arrows in lists).
 - [ ] **P2 — Controller / gamepad** input abstraction.

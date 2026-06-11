@@ -65,6 +65,20 @@ pub struct InputState {
     pub mouse_down: bool,
     pub mouse_clicked: bool,
     pub mouse_released: bool,
+    // ---- Right mouse button (context menus, alternate actions) ----
+    /// Right button is currently held.
+    pub mouse_right_down: bool,
+    /// Right button went down this frame (press edge).
+    pub mouse_right_clicked: bool,
+    /// Right button went up this frame (release edge).
+    pub mouse_right_released: bool,
+    // ---- Middle mouse button (e.g. pan, close tab) ----
+    /// Middle button is currently held.
+    pub mouse_middle_down: bool,
+    /// Middle button went down this frame (press edge).
+    pub mouse_middle_clicked: bool,
+    /// Middle button went up this frame (release edge).
+    pub mouse_middle_released: bool,
     /// True while the pointer is dragging: the button has been held since a
     /// press and moved past the drag threshold. Computed each frame by
     /// [`DragTracker::update`]; defaults to `false`. Latches until release, so
@@ -133,6 +147,10 @@ impl InputState {
     pub fn end_frame(&mut self) {
         self.mouse_clicked = false;
         self.mouse_released = false;
+        self.mouse_right_clicked = false;
+        self.mouse_right_released = false;
+        self.mouse_middle_clicked = false;
+        self.mouse_middle_released = false;
         // Drag outputs are recomputed each frame by `DragTracker::update`; clear
         // them so a consumer that stops calling it (or never does) doesn't leave
         // a stale drag latched on.
@@ -181,6 +199,10 @@ impl InputState {
             scroll_consumed: true,
             mouse_clicked: false,
             mouse_released: false,
+            mouse_right_clicked: false,
+            mouse_right_released: false,
+            mouse_middle_clicked: false,
+            mouse_middle_released: false,
             // A layer under a modal/popup must not see an in-progress drag.
             is_dragging: false,
             drag_delta: [0.0, 0.0],
@@ -202,5 +224,75 @@ impl InputState {
             // so modals that have text inputs still see modifier keys.
             ..self.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod input_state_tests {
+    use super::InputState;
+
+    fn right_pressed() -> InputState {
+        InputState {
+            mouse_right_down: true,
+            mouse_right_clicked: true,
+            ..InputState::default()
+        }
+    }
+
+    fn middle_pressed() -> InputState {
+        InputState {
+            mouse_middle_down: true,
+            mouse_middle_clicked: true,
+            ..InputState::default()
+        }
+    }
+
+    #[test]
+    fn right_click_edge_cleared_by_end_frame() {
+        let mut i = right_pressed();
+        i.end_frame();
+        assert!(!i.mouse_right_clicked);
+        assert!(!i.mouse_right_released);
+        // down-state not cleared by end_frame (it's held state)
+        assert!(i.mouse_right_down);
+    }
+
+    #[test]
+    fn middle_click_edge_cleared_by_end_frame() {
+        let mut i = middle_pressed();
+        i.end_frame();
+        assert!(!i.mouse_middle_clicked);
+        assert!(!i.mouse_middle_released);
+        assert!(i.mouse_middle_down);
+    }
+
+    #[test]
+    fn consumed_zeros_right_click_edges() {
+        let i = right_pressed();
+        let c = i.consumed();
+        assert!(c.mouse_consumed);
+        assert!(!c.mouse_right_clicked, "consumed must zero right click edge");
+        assert!(!c.mouse_right_released);
+        // held-state passes through so other logic can see the button is down
+        assert!(c.mouse_right_down, "consumed preserves down-state");
+    }
+
+    #[test]
+    fn consumed_zeros_middle_click_edges() {
+        let i = middle_pressed();
+        let c = i.consumed();
+        assert!(!c.mouse_middle_clicked);
+        assert!(!c.mouse_middle_released);
+        assert!(c.mouse_middle_down);
+    }
+
+    #[test]
+    fn right_release_edge_cleared_by_end_frame() {
+        let mut i = InputState {
+            mouse_right_released: true,
+            ..InputState::default()
+        };
+        i.end_frame();
+        assert!(!i.mouse_right_released);
     }
 }
