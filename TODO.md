@@ -205,8 +205,16 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [ ] **P1 — Multi-button mouse** (right click, middle click) for context
       menus.
 - [ ] **P1 — Double-click and click-and-hold distinction** (timestamps).
-- [ ] **P1 — Drag detection on `InputState`** (`is_dragging`, `drag_delta`)
-      so widgets stop reinventing it.
+- [x] **P1 — Drag detection on `InputState`** (`is_dragging`, `drag_delta`)
+      so widgets stop reinventing it. `InputState` gained `is_dragging: bool`
+      and `drag_delta: [f32; 2]`; a caller-owned [`DragTracker`] (mirrors
+      `DragCapture`/`ScrollState`/`FocusState`) holds the cross-frame press
+      origin + click-vs-drag latch and writes those fields each frame via
+      `update(&mut InputState)`. Press-to-drag threshold (default 4px,
+      configurable); a still press never drags; `cancel()` aborts; `consumed()`
+      and `end_frame()` clear the outputs. Complementary to `DragCapture`
+      (ownership) — a window-mover uses both. (`src/drag_tracker.rs`, 13 tests;
+      example has a "drag me" box.)
 - [ ] **P1 — Scroll wheel propagation/capture** with a "consumed" flag for
       overlapping scroll regions.
 - [ ] **P1 — IME / composition** for CJK/accented input.

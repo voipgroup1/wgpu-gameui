@@ -39,6 +39,7 @@ pub use text::{
 pub use glyphon::{Style, Weight};
 
 pub mod affine;
+mod drag_tracker;
 pub mod layer;
 pub mod layout;
 pub mod projection;
@@ -48,6 +49,7 @@ mod ui_context;
 mod widgets;
 
 pub use affine::Affine2;
+pub use drag_tracker::{DragTracker, DEFAULT_DRAG_THRESHOLD};
 pub use projection::{world_to_screen, world_to_screen_na};
 pub use layer::{Layer, LayerKind, LayerStack};
 pub use render::{NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
@@ -63,6 +65,18 @@ pub struct InputState {
     pub mouse_down: bool,
     pub mouse_clicked: bool,
     pub mouse_released: bool,
+    /// True while the pointer is dragging: the button has been held since a
+    /// press and moved past the drag threshold. Computed each frame by
+    /// [`DragTracker::update`]; defaults to `false`. Latches until release, so
+    /// a drag that momentarily stops moving stays `true`. Widgets read this to
+    /// distinguish a drag gesture from a click.
+    pub is_dragging: bool,
+    /// Per-frame pointer movement `[dx, dy]` (logical px) while [`is_dragging`].
+    /// `[0, 0]` when not dragging (including sub-threshold jitter on a click).
+    /// Computed by [`DragTracker::update`].
+    ///
+    /// [`is_dragging`]: InputState::is_dragging
+    pub drag_delta: [f32; 2],
     /// Scroll wheel delta (positive = scroll up, negative = scroll down)
     pub scroll_delta: f32,
     // Text input
@@ -119,6 +133,11 @@ impl InputState {
     pub fn end_frame(&mut self) {
         self.mouse_clicked = false;
         self.mouse_released = false;
+        // Drag outputs are recomputed each frame by `DragTracker::update`; clear
+        // them so a consumer that stops calling it (or never does) doesn't leave
+        // a stale drag latched on.
+        self.is_dragging = false;
+        self.drag_delta = [0.0, 0.0];
         self.scroll_delta = 0.0;
         self.text_input.clear();
         self.backspace_pressed = false;
@@ -162,6 +181,9 @@ impl InputState {
             scroll_consumed: true,
             mouse_clicked: false,
             mouse_released: false,
+            // A layer under a modal/popup must not see an in-progress drag.
+            is_dragging: false,
+            drag_delta: [0.0, 0.0],
             scroll_delta: 0.0,
             text_input: String::new(),
             backspace_pressed: false,

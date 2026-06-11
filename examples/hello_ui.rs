@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    DrawContext, Dropdown, DropdownState, FocusState, FontHandle, InputState, LayerStack,
-    ScrollState, ScrollView, TextAlign, TextBlock, TextInput, Theme, UiContext, UiRenderer,
+    DragTracker, DrawContext, Dropdown, DropdownState, FocusState, FontHandle, InputState,
+    LayerStack, ScrollState, ScrollView, TextAlign, TextBlock, TextInput, Theme, UiContext,
+    UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -110,6 +111,12 @@ struct App {
     input: InputState,
     theme: Theme,
     state: UiState,
+    /// Cross-frame drag detection feeding `input.is_dragging`/`drag_delta`.
+    drag: DragTracker,
+    /// Top-left of the draggable demo box.
+    drag_box: Rect,
+    /// True while the demo box is the thing being dragged (press started on it).
+    dragging_box: bool,
 }
 
 impl ApplicationHandler for App {
@@ -321,6 +328,11 @@ impl ApplicationHandler for App {
                 let view = frame
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
+
+                // Classify the pointer gesture for this frame (writes
+                // `is_dragging`/`drag_delta` onto `self.input`) before any layer
+                // derives its own input view from it.
+                self.drag.update(&mut self.input);
 
                 // Build a LayerStack so we can demo modal layers.
                 let mut layers = LayerStack::new();
@@ -650,6 +662,44 @@ impl ApplicationHandler for App {
                     ui.pop();
                 }
 
+                // ---------- Draggable box demo (DragTracker) ----------
+                // Press starts the grab only if it lands on the box; the box
+                // then follows the per-frame `drag_delta` until the button is
+                // released. `is_dragging` gates out a plain click (no movement).
+                {
+                    let on_box = !base_input.mouse_consumed
+                        && self
+                            .drag_box
+                            .contains(base_input.mouse_x, base_input.mouse_y);
+                    if base_input.mouse_clicked && on_box {
+                        self.dragging_box = true;
+                    }
+                    if !base_input.mouse_down {
+                        self.dragging_box = false;
+                    }
+                    if self.dragging_box && base_input.is_dragging {
+                        self.drag_box.x += base_input.drag_delta[0];
+                        self.drag_box.y += base_input.drag_delta[1];
+                    }
+
+                    let color = if self.dragging_box {
+                        [0.95, 0.75, 0.30, 1.0]
+                    } else {
+                        [0.30, 0.70, 0.55, 1.0]
+                    };
+                    let list = layers.base_mut();
+                    list.rounded_rect(self.drag_box, 8.0, color);
+                    list.text(
+                        TextBlock::new(
+                            "drag me",
+                            self.drag_box.x + 18.0,
+                            self.drag_box.y + 18.0,
+                        )
+                        .with_size(16.0)
+                        .with_color(20, 24, 28),
+                    );
+                }
+
                 let mut encoder =
                     gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("hello_ui encoder"),
@@ -707,6 +757,9 @@ fn main() {
         input: InputState::default(),
         theme: Theme::default(),
         state: UiState::default(),
+        drag: DragTracker::new(),
+        drag_box: Rect::new(340.0, 360.0, 150.0, 56.0),
+        dragging_box: false,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
