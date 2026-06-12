@@ -880,6 +880,76 @@ impl<'a> UiContext<'a> {
         changed
     }
 
+    /// Multi-line text field (textarea). Like [`text_input`](Self::text_input)
+    /// but `rows` tall, with `Enter` inserting a newline, word/glyph wrapping to
+    /// the field width, Up/Down line navigation, and vertical autoscroll to the
+    /// caret. The box height is `rows * (font_size * 1.25) + 2 * padding`.
+    /// Returns whether the text changed this frame; auto-advances by the height.
+    pub fn text_area(
+        &mut self,
+        id: FocusId,
+        buffer: &mut String,
+        placeholder: &str,
+        w: Option<f32>,
+        rows: u16,
+    ) -> bool {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return false,
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let line_height = theme.font_size * 1.25;
+        let height = (rows.max(1) as f32) * line_height + theme.padding * 2.0;
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = Self::localize(inv, world, input);
+        let changed = {
+            let list = self.backend.list_mut();
+            let state = match self.state.as_mut() {
+                Some(s) => s,
+                None => {
+                    debug_assert!(false, "UiContext::text_area requires interactive state");
+                    return false;
+                }
+            };
+            let UiState {
+                text_inputs, focus, ..
+            } = &mut **state;
+            let ti = text_inputs.entry(id).or_insert_with(|| {
+                let mut t = TextInput::new(local.x, local.y, local.width, local.height)
+                    .with_multiline(true);
+                t.value = buffer.clone();
+                t.cursor_pos = t.value.len();
+                t
+            });
+            ti.x = local.x;
+            ti.y = local.y;
+            ti.width = local.width;
+            ti.height = local.height;
+            ti.multiline = true;
+            ti.placeholder.clear();
+            ti.placeholder.push_str(placeholder);
+            if ti.value != *buffer {
+                ti.value = buffer.clone();
+                if ti.cursor_pos > ti.value.len() {
+                    ti.cursor_pos = ti.value.len();
+                }
+                ti.selection_start = None;
+            }
+            let before = ti.value.clone();
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
+            ti.draw(id, &mut ctx);
+            let changed = ti.value != before;
+            if changed {
+                buffer.clear();
+                buffer.push_str(&ti.value);
+            }
+            changed
+        };
+        self.advance(height);
+        changed
+    }
+
     /// Open a modal layer covering `rect`. Subsequent draw calls go to the
     /// modal layer until `modal_end` is called. Lower layers receive
     /// `mouse_consumed = true` for input dispatch.

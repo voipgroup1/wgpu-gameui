@@ -232,7 +232,12 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `ScrollView` that claims the wheel (even at a clamp boundary, so the event
       can't "bubble out" to an outer scrollable). 4 tests: basic consume,
       inner/outer nesting, cursor-outside-inner passes through. (`scroll_view.rs`)
-- [ ] **P1 — IME / composition** for CJK/accented input.
+- [x] **P1 — IME / composition** for CJK/accented input. Crate-level done:
+      `InputState.preedit`/`preedit_cursor` + `TextInput` renders the inline
+      underlined preedit spliced at the caret (`compose_preedit` in
+      `src/widgets/text_input.rs`). Game-side winit plumbing
+      (`WindowEvent::Ime` → preedit, `set_ime_allowed`/`set_ime_cursor_area`)
+      is a follow-up — the game feeds no keyboard/text input to the UI yet.
 - [ ] **P1 — Keyboard navigation** (Tab/Space-to-activate, arrows in lists).
 - [ ] **P2 — Controller / gamepad** input abstraction.
 - [ ] **P2 — Explicit `Frame`/`Ui` builder** that consumes input and produces
@@ -264,10 +269,16 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       (`font`/`font_size`/`font_family`/`bold`/`italic`/`text_line`).
       cosmic-text's script/glyph fallback is automatic. (Synthetic bold/oblique
       for absent faces is out of scope — cosmic-text selects real faces only.)
-- [ ] **P1 — Multi-line `TextInput` / textarea.** Enter is consumed as a
-      separate event, never inserted.
-- [ ] **P1 — Text wrapping policy.** `max_width` set, but smaller-than-text
-      causes silent truncation. `UiWordWrap` exists in Teardown.
+- [x] **P1 — Multi-line `TextInput` / textarea.** `TextInput::with_multiline`
+      (and the `UiContext::text_area(id, buf, ph, w, rows)` façade): Enter inserts
+      `\n`, the value wraps to the field width, Up/Down navigate visual lines with
+      a sticky column, Home/End are line-relative, selection renders per line, and
+      the field clips + autoscrolls vertically to keep the caret visible
+      (`scroll_offset`). Line-aware caret/click via `text_caret_layout`/`CaretPos`.
+- [x] **P1 — Text wrapping policy.** `TextBlock::with_wrap(WrapMode)` —
+      `None`/`Word`/`Glyph`/`WordOrGlyph` (default `WordOrGlyph` preserves prior
+      rendering). Single-line `TextInput` now uses `WrapMode::None` (no silent
+      wrap-to-hidden-second-line); multiline uses `WordOrGlyph`.
 - [x] **P1 — Ellipsis on overflow.** `TextBlock::with_ellipsis` lays the text
       on one line and truncates with an `…` reserved at the right edge
       (`ellipsize_to_width` in `src/text.rs`); opt-in, no-op when the text fits.

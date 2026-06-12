@@ -1,6 +1,9 @@
 //! Text input widget with selection, cursor navigation, and clipboard support.
 
-use crate::text::{TextBlock, TextSpan};
+use crate::layout::Rect;
+use crate::text::{
+    byte_at_point, byte_on_adjacent_line, caret_for_byte, CaretPos, TextBlock, TextSpan, WrapMode,
+};
 use crate::InputState;
 
 use super::{DrawContext, FocusId};
@@ -95,6 +98,47 @@ fn closest_cursor_pos(positions: &[(usize, f32)], click_x: f32) -> usize {
     }
 }
 
+/// The `(first_byte, last_byte)` of the visual line containing `byte`, from a
+/// [`CaretPos`] layout. Used for line-relative Home/End in multiline mode.
+/// Falls back to `(byte, byte)` for an empty layout.
+fn line_bounds(layout: &[CaretPos], byte: usize) -> (usize, usize) {
+    if layout.is_empty() {
+        return (byte, byte);
+    }
+    let line = caret_for_byte(layout, byte).line;
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    for p in layout.iter().filter(|p| p.line == line) {
+        lo = lo.min(p.byte);
+        hi = hi.max(p.byte);
+    }
+    if lo == usize::MAX { (byte, byte) } else { (lo, hi) }
+}
+
+/// The `(first_byte, last_byte)` byte range of a specific visual `line`.
+fn line_byte_range(layout: &[CaretPos], line: usize) -> (usize, usize) {
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    for p in layout.iter().filter(|p| p.line == line) {
+        lo = lo.min(p.byte);
+        hi = hi.max(p.byte);
+    }
+    if lo == usize::MAX { (0, 0) } else { (lo, hi) }
+}
+
+/// The caret x on visual `line` at (or just after) `byte`, falling back to the
+/// last caret x on that line.
+fn line_x_for_byte(layout: &[CaretPos], line: usize, byte: usize) -> f32 {
+    let mut last = 0.0;
+    for p in layout.iter().filter(|p| p.line == line) {
+        if p.byte >= byte {
+            return p.x;
+        }
+        last = p.x;
+    }
+    last
+}
+
 /// A text input widget with selection, cursor navigation, and optional clipboard integration.
 ///
 /// Supports:
@@ -125,6 +169,17 @@ pub struct TextInput {
     /// When set, the text between `selection_start` and `cursor_pos` is selected.
     /// `None` means no active selection.
     pub selection_start: Option<usize>,
+    /// Multi-line (textarea) mode: `Enter` inserts a newline, the value wraps to
+    /// the field width, Up/Down navigate lines, and the field clips + autoscrolls
+    /// vertically to keep the caret visible. Single-line (`false`) is unchanged.
+    pub multiline: bool,
+    /// Vertical scroll offset in pixels (multiline only). Maintained by autoscroll
+    /// in [`draw`](Self::draw) so the caret line stays inside the box.
+    pub scroll_offset: f32,
+    /// Sticky horizontal column (pixels) for Up/Down navigation. Seeded from the
+    /// caret's x on the first vertical move and cleared by any horizontal
+    /// move/edit, so a run of Up/Down keeps the original column.
+    desired_caret_x: Option<f32>,
     /// Clipboard getter — returns the current clipboard contents.
     clipboard_get: Option<Box<dyn FnMut() -> String>>,
     /// Clipboard setter — writes text to the clipboard.
@@ -142,6 +197,9 @@ impl Default for TextInput {
             placeholder: String::new(),
             cursor_pos: 0,
             selection_start: None,
+            multiline: false,
+            scroll_offset: 0.0,
+            desired_caret_x: None,
             clipboard_get: None,
             clipboard_set: None,
         }
@@ -159,9 +217,18 @@ impl TextInput {
             placeholder: String::new(),
             cursor_pos: 0,
             selection_start: None,
+            multiline: false,
+            scroll_offset: 0.0,
+            desired_caret_x: None,
             clipboard_get: None,
             clipboard_set: None,
         }
+    }
+
+    /// Enable multi-line (textarea) mode. See [`multiline`](Self::multiline).
+    pub fn with_multiline(mut self, multiline: bool) -> Self {
+        self.multiline = multiline;
+        self
     }
 
     pub fn with_value(mut self, value: impl Into<String>) -> Self {
@@ -269,16 +336,6 @@ impl TextInput {
         }
     }
 
-    /// Move cursor to the beginning of the text.
-    fn cursor_home(&mut self) {
-        self.cursor_pos = 0;
-    }
-
-    /// Move cursor to the end of the text.
-    fn cursor_end(&mut self) {
-        self.cursor_pos = self.value.len();
-    }
-
     /// Select all text.
     fn select_all(&mut self) {
         if !self.value.is_empty() {
@@ -334,7 +391,27 @@ impl TextInput {
     /// Process keyboard events for the text field. Called by `draw()` only when
     /// the widget holds focus; callers driving it directly are responsible for
     /// the focus gate.
+    ///
+    /// This is the single-line / no-layout entry point: vertical navigation and
+    /// line-relative Home/End (which need laid-out line geometry) are inert. For
+    /// a multi-line field, call [`process_keyboard_with_layout`] with the field's
+    /// [`CaretPos`] layout instead (which `draw` does automatically).
+    ///
+    /// [`process_keyboard_with_layout`]: Self::process_keyboard_with_layout
     pub fn process_keyboard(&mut self, input: &InputState) {
+        self.handle_keyboard(input, &[]);
+    }
+
+    /// Like [`process_keyboard`](Self::process_keyboard) but with the field's
+    /// laid-out caret geometry, enabling multi-line vertical navigation (Up/Down
+    /// with a sticky column) and line-relative Home/End. The `layout` reflects
+    /// the value as laid out *this* frame (pre-edit); edits re-layout next frame
+    /// — a one-frame latency that only affects the Up/Down target line.
+    pub fn process_keyboard_with_layout(&mut self, input: &InputState, layout: &[CaretPos]) {
+        self.handle_keyboard(input, layout);
+    }
+
+    fn handle_keyboard(&mut self, input: &InputState, layout: &[CaretPos]) {
         // Check for Ctrl shortcuts via text_input.
         // When Ctrl is held, `ReceivedCharacter` may send ASCII control codes
         // (0x01 = Ctrl+A, 0x03 = Ctrl+C, 0x16 = Ctrl+V, 0x18 = Ctrl+X)
@@ -380,8 +457,44 @@ impl TextInput {
             return;
         }
 
+        // Enter — insert a newline in multiline mode. (Single-line fields leave
+        // `enter_pressed` for the caller to read as a submit signal.)
+        if input.enter_pressed && self.multiline {
+            if self.selection_start.is_some() {
+                self.delete_selection();
+            }
+            self.value.insert(self.cursor_pos, '\n');
+            self.cursor_pos += 1;
+            self.selection_start = None;
+            self.desired_caret_x = None;
+            return;
+        }
+
+        // Up/Down — vertical line navigation (multiline only; needs layout).
+        if self.multiline && (input.key_up || input.key_down) && !layout.is_empty() {
+            let dir = if input.key_up { -1 } else { 1 };
+            // Seed the sticky column from the current caret on the first vertical
+            // move; subsequent moves keep the original column.
+            let desired = self
+                .desired_caret_x
+                .unwrap_or_else(|| caret_for_byte(layout, self.cursor_pos).x);
+            let was = self.cursor_pos;
+            let target = byte_on_adjacent_line(layout, self.cursor_pos, dir, desired);
+            if input.shift_pressed {
+                if self.selection_start.is_none() {
+                    self.selection_start = Some(was);
+                }
+            } else {
+                self.selection_start = None;
+            }
+            self.cursor_pos = target;
+            self.desired_caret_x = Some(desired);
+            return;
+        }
+
         // Arrow keys (with possible Shift for selection extension).
         if input.key_left {
+            self.desired_caret_x = None;
             let was = self.cursor_pos;
             if input.shift_pressed {
                 if self.selection_start.is_none() {
@@ -403,6 +516,7 @@ impl TextInput {
         }
 
         if input.key_right {
+            self.desired_caret_x = None;
             let was = self.cursor_pos;
             if input.shift_pressed {
                 if self.selection_start.is_none() {
@@ -422,6 +536,7 @@ impl TextInput {
         }
 
         if input.key_home {
+            self.desired_caret_x = None;
             let was = self.cursor_pos;
             if input.shift_pressed {
                 if self.selection_start.is_none() {
@@ -430,11 +545,18 @@ impl TextInput {
             } else {
                 self.selection_start = None;
             }
-            self.cursor_home();
+            // Multiline: jump to the start of the current visual line; single-line:
+            // document start.
+            self.cursor_pos = if self.multiline && !layout.is_empty() {
+                line_bounds(layout, self.cursor_pos).0
+            } else {
+                0
+            };
             return;
         }
 
         if input.key_end {
+            self.desired_caret_x = None;
             let was = self.cursor_pos;
             if input.shift_pressed {
                 if self.selection_start.is_none() {
@@ -443,24 +565,33 @@ impl TextInput {
             } else {
                 self.selection_start = None;
             }
-            self.cursor_end();
+            // Multiline: jump to the end of the current visual line; single-line:
+            // document end.
+            self.cursor_pos = if self.multiline && !layout.is_empty() {
+                line_bounds(layout, self.cursor_pos).1
+            } else {
+                self.value.len()
+            };
             return;
         }
 
         // Backspace — delete before cursor or selection.
         if input.backspace_pressed {
+            self.desired_caret_x = None;
             self.delete_before_cursor();
             return;
         }
 
         // Delete — delete after cursor or selection.
         if input.key_delete {
+            self.desired_caret_x = None;
             self.delete_after_cursor();
             return;
         }
 
         // Text insertion.
         if !input.text_input.is_empty() {
+            self.desired_caret_x = None;
             // If there's a selection, delete it first.
             if self.selection_start.is_some() {
                 self.delete_selection();
@@ -497,19 +628,44 @@ impl TextInput {
         }
         let focused = focus.is_focused(id);
 
+        // ---- Geometry & layout policy ----
+        let padding = theme.padding;
+        let text_x = self.x + padding;
+        let text_max_w = self.width - padding * 2.0;
+        // Single-line never wraps (a long value overflows + clips); multiline
+        // wraps to the field width.
+        let wrap = if self.multiline { WrapMode::WordOrGlyph } else { WrapMode::None };
+        // Laid-out line height — matches `text_caret_layout` / `TextBlock::with_size`
+        // (font_size * 1.25). Single-line keeps font_size for the selection/caret
+        // quad height (unchanged behaviour).
+        let line_height = if self.multiline { theme.font_size * 1.25 } else { theme.font_size };
+        // Top-aligned for multiline, vertically centred for single-line.
+        let text_top = if self.multiline {
+            self.y + padding
+        } else {
+            self.y + (self.height - theme.font_size) / 2.0
+        };
+        let inner_rect = Rect::new(text_x, self.y + padding, text_max_w, (self.height - padding * 2.0).max(0.0));
+
+        // Caret layout for the *current* value (multiline+focused only), built
+        // BEFORE keyboard/click so vertical nav, line Home/End, and click hit
+        // testing see this frame's geometry (one-frame edit latency — see
+        // `process_keyboard_with_layout`).
+        let nav_layout: Vec<CaretPos> = if self.multiline && focused {
+            list.text_caret_layout(&self.value, theme.font_size, Some(text_max_w), wrap)
+        } else {
+            Vec::new()
+        };
+
         // ---- Click-to-position ----
         if clicked && focused {
-            let click_x = input.mouse_x;
-            let padding = theme.padding;
-            let text_left = self.x + padding;
-            let text_right = self.x + self.width - padding;
-
-            if click_x >= text_left && click_x <= text_right {
-                let local_x = click_x - text_left;
-                let positions = list.text_cursor_positions(&self.value, theme.font_size, Some(self.width - padding * 2.0));
-                let byte_pos = closest_cursor_pos(&positions, local_x);
+            if self.multiline {
+                // Hit-test against the laid-out lines, accounting for the scroll
+                // offset and top-left text origin.
+                let local_x = input.mouse_x - text_x;
+                let local_y = input.mouse_y - text_top + self.scroll_offset;
+                let byte_pos = byte_at_point(&nav_layout, local_x, local_y);
                 if input.shift_pressed {
-                    // Extend selection.
                     if self.selection_start.is_none() {
                         self.selection_start = Some(self.cursor_pos);
                     }
@@ -517,22 +673,42 @@ impl TextInput {
                     self.selection_start = None;
                 }
                 self.cursor_pos = byte_pos;
-            } else if click_x < text_left {
-                self.cursor_pos = 0;
-                if !input.shift_pressed {
-                    self.selection_start = None;
-                }
+                self.desired_caret_x = None;
             } else {
-                self.cursor_pos = self.value.len();
-                if !input.shift_pressed {
-                    self.selection_start = None;
+                let click_x = input.mouse_x;
+                let text_left = self.x + padding;
+                let text_right = self.x + self.width - padding;
+
+                if click_x >= text_left && click_x <= text_right {
+                    let local_x = click_x - text_left;
+                    let positions = list.text_cursor_positions(&self.value, theme.font_size, Some(text_max_w));
+                    let byte_pos = closest_cursor_pos(&positions, local_x);
+                    if input.shift_pressed {
+                        // Extend selection.
+                        if self.selection_start.is_none() {
+                            self.selection_start = Some(self.cursor_pos);
+                        }
+                    } else {
+                        self.selection_start = None;
+                    }
+                    self.cursor_pos = byte_pos;
+                } else if click_x < text_left {
+                    self.cursor_pos = 0;
+                    if !input.shift_pressed {
+                        self.selection_start = None;
+                    }
+                } else {
+                    self.cursor_pos = self.value.len();
+                    if !input.shift_pressed {
+                        self.selection_start = None;
+                    }
                 }
             }
         }
 
         // Process keyboard events only while focused.
         if focused {
-            self.process_keyboard(input);
+            self.process_keyboard_with_layout(input, &nav_layout);
         }
 
         // A live IME composition is shown inline (underlined) and supersedes the
@@ -577,39 +753,103 @@ impl TextInput {
         );
 
         // ---- Draw text content ----
-        let text_x = self.x + theme.padding;
-        let text_y = self.y + (self.height - theme.font_size) / 2.0;
-        let text_max_w = self.width - theme.padding * 2.0;
-        let line_height = theme.font_size;
         let (text_content, text_color) = if self.value.is_empty() {
             (&self.placeholder, theme.text_dim)
         } else {
             (&self.value, theme.text)
         };
 
+        // Render-time caret layout (multiline+focused), reflecting any edits made
+        // this frame — used for autoscroll, per-line selection, and the caret.
+        let render_layout: Vec<CaretPos> = if self.multiline && focused {
+            list.text_caret_layout(&self.value, theme.font_size, Some(text_max_w), wrap)
+        } else {
+            Vec::new()
+        };
+
+        // ---- Autoscroll to keep the caret line visible (multiline) ----
+        if self.multiline && focused {
+            let inner_h = (self.height - padding * 2.0).max(0.0);
+            let caret = caret_for_byte(&render_layout, self.cursor_pos);
+            let caret_top = caret.line_top;
+            let caret_h = if caret.line_height > 0.0 { caret.line_height } else { line_height };
+            let caret_bottom = caret_top + caret_h;
+            if caret_top < self.scroll_offset {
+                self.scroll_offset = caret_top;
+            } else if caret_bottom > self.scroll_offset + inner_h {
+                self.scroll_offset = caret_bottom - inner_h;
+            }
+            if self.scroll_offset < 0.0 {
+                self.scroll_offset = 0.0;
+            }
+        }
+
+        // Multiline content is clipped to the inner box (so wrapped + scrolled
+        // lines, the selection, and the caret never spill past the field).
+        if self.multiline {
+            list.push_clip(inner_rect);
+        }
+
+        // The vertical shift applied to text/selection/caret in multiline mode.
+        let scroll = if self.multiline { self.scroll_offset } else { 0.0 };
+
+        // ---- Draw selection highlight ----
         if focused && !composing && !self.value.is_empty() {
-            // ---- Draw selection highlight ----
             if let Some((sel_start, sel_end)) = self.selection_range() {
                 if sel_start < sel_end {
-                    let positions = list.text_cursor_positions(&self.value, theme.font_size, Some(text_max_w));
-                    let sel_x1 = positions
-                        .iter()
-                        .find(|&&(i, _)| i >= sel_start)
-                        .map(|&(_, x)| x)
-                        .unwrap_or(0.0);
-                    let sel_x2 = positions
-                        .iter()
-                        .find(|&&(i, _)| i >= sel_end)
-                        .map(|&(_, x)| x)
-                        .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
+                    if self.multiline {
+                        let start_line = caret_for_byte(&render_layout, sel_start).line;
+                        let end_line = caret_for_byte(&render_layout, sel_end).line;
+                        for line in start_line..=end_line {
+                            let (line_lo, line_hi) = line_byte_range(&render_layout, line);
+                            let a = sel_start.max(line_lo);
+                            let b = sel_end.min(line_hi);
+                            if b < a {
+                                continue;
+                            }
+                            let x1 = line_x_for_byte(&render_layout, line, a);
+                            // Selection that continues onto the next line fills to
+                            // the inner edge (shows the newline is selected).
+                            let x2 = if sel_end > line_hi {
+                                text_max_w
+                            } else {
+                                line_x_for_byte(&render_layout, line, b)
+                            };
+                            let lt = render_layout
+                                .iter()
+                                .find(|p| p.line == line)
+                                .map(|p| p.line_top)
+                                .unwrap_or(0.0);
+                            list.quad(
+                                text_x + x1,
+                                text_top - scroll + lt,
+                                (x2 - x1).max(1.0),
+                                line_height,
+                                theme.accent,
+                            );
+                        }
+                    } else {
+                        let positions =
+                            list.text_cursor_positions(&self.value, theme.font_size, Some(text_max_w));
+                        let sel_x1 = positions
+                            .iter()
+                            .find(|&&(i, _)| i >= sel_start)
+                            .map(|&(_, x)| x)
+                            .unwrap_or(0.0);
+                        let sel_x2 = positions
+                            .iter()
+                            .find(|&&(i, _)| i >= sel_end)
+                            .map(|&(_, x)| x)
+                            .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
 
-                    list.quad(
-                        text_x + sel_x1,
-                        text_y,
-                        sel_x2 - sel_x1,
-                        line_height,
-                        theme.accent, // selection highlight color
-                    );
+                        list.quad(
+                            text_x + sel_x1,
+                            text_top,
+                            sel_x2 - sel_x1,
+                            line_height,
+                            theme.accent,
+                        );
+                    }
                 }
             }
         }
@@ -629,9 +869,11 @@ impl TextInput {
             None
         };
 
+        let block_y = text_top - scroll;
         if let Some((_display, spans, _caret)) = &composed {
-            let text = TextBlock::new("", text_x, text_y)
+            let text = TextBlock::new("", text_x, block_y)
                 .with_size(theme.font_size)
+                .with_wrap(wrap)
                 .with_color(
                     (theme.text[0] * 255.0) as u8,
                     (theme.text[1] * 255.0) as u8,
@@ -641,8 +883,9 @@ impl TextInput {
                 .with_spans(spans.clone());
             list.text(text);
         } else {
-            let text = TextBlock::new(text_content, text_x, text_y)
+            let text = TextBlock::new(text_content, text_x, block_y)
                 .with_size(theme.font_size)
+                .with_wrap(wrap)
                 .with_color(
                     (text_color[0] * 255.0) as u8,
                     (text_color[1] * 255.0) as u8,
@@ -654,35 +897,51 @@ impl TextInput {
 
         // ---- Draw cursor ----
         if focused {
-            let cursor_x = if let Some((display, _spans, caret_byte)) = &composed {
-                // Caret position is measured on the composed display string so
-                // it sits inside the preedit where the IME asked.
-                let positions =
-                    list.text_cursor_positions(display, theme.font_size, Some(text_max_w));
-                let offset = positions
-                    .iter()
-                    .find(|&&(i, _)| i >= *caret_byte)
-                    .map(|&(_, x)| x)
-                    .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
-                text_x + offset
-            } else if self.value.is_empty() {
-                text_x
+            if self.multiline && composed.is_none() {
+                let caret = caret_for_byte(&render_layout, self.cursor_pos);
+                let caret_h = if caret.line_height > 0.0 { caret.line_height } else { line_height };
+                list.quad(
+                    text_x + caret.x,
+                    text_top - scroll + caret.line_top,
+                    1.5,
+                    caret_h,
+                    theme.text,
+                );
             } else {
-                let positions = list.text_cursor_positions(&self.value, theme.font_size, Some(text_max_w));
-                let offset = positions
-                    .iter()
-                    .find(|&&(i, _)| i >= self.cursor_pos)
-                    .map(|&(_, x)| x)
-                    .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
-                text_x + offset
-            };
-            list.quad(
-                cursor_x,
-                text_y,
-                1.5,
-                line_height,
-                theme.text,
-            );
+                let cursor_x = if let Some((display, _spans, caret_byte)) = &composed {
+                    // Caret position is measured on the composed display string so
+                    // it sits inside the preedit where the IME asked.
+                    let positions =
+                        list.text_cursor_positions(display, theme.font_size, Some(text_max_w));
+                    let offset = positions
+                        .iter()
+                        .find(|&&(i, _)| i >= *caret_byte)
+                        .map(|&(_, x)| x)
+                        .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
+                    text_x + offset
+                } else if self.value.is_empty() {
+                    text_x
+                } else {
+                    let positions = list.text_cursor_positions(&self.value, theme.font_size, Some(text_max_w));
+                    let offset = positions
+                        .iter()
+                        .find(|&&(i, _)| i >= self.cursor_pos)
+                        .map(|&(_, x)| x)
+                        .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
+                    text_x + offset
+                };
+                list.quad(
+                    cursor_x,
+                    block_y,
+                    1.5,
+                    line_height,
+                    theme.text,
+                );
+            }
+        }
+
+        if self.multiline {
+            list.pop_clip();
         }
 
         clicked
@@ -790,11 +1049,16 @@ mod tests {
 
     #[test]
     fn home_end() {
+        // Single-line Home/End jump to document start/end via the keyboard path.
         let mut ti = make_input("hello world");
         ti.cursor_pos = 5;
-        ti.cursor_home();
+        let mut home = fake_input();
+        home.key_home = true;
+        ti.process_keyboard(&home);
         assert_eq!(ti.cursor_pos, 0);
-        ti.cursor_end();
+        let mut end = fake_input();
+        end.key_end = true;
+        ti.process_keyboard(&end);
         assert_eq!(ti.cursor_pos, 11);
     }
 
@@ -1051,6 +1315,156 @@ mod tests {
         assert!(!focus.is_focused(0));
         assert!(!focus.is_focused(1));
         assert_eq!(focus.focused(), None);
+    }
+
+    // ---- Multi-line behaviour ----
+
+    /// Build a `[CaretPos]` layout matching what a multiline field lays out, so
+    /// keyboard tests can exercise vertical nav / line Home-End off-screen.
+    fn caret_layout(text: &str, max_width: f32) -> Vec<CaretPos> {
+        let fsh = crate::text::shared_font_system();
+        let mut fs = fsh.lock().unwrap();
+        crate::text::text_caret_layout(
+            &mut fs,
+            text,
+            16.0,
+            20.0,
+            max_width,
+            WrapMode::WordOrGlyph,
+            None,
+        )
+    }
+
+    #[test]
+    fn enter_inserts_newline_only_when_multiline() {
+        // Single-line: Enter is left for the caller (no value change).
+        let mut single = make_input("ab");
+        single.cursor_pos = 1;
+        let mut ev = fake_input();
+        ev.enter_pressed = true;
+        single.process_keyboard(&ev);
+        assert_eq!(single.value, "ab", "single-line Enter must not insert a newline");
+
+        // Multiline: Enter inserts '\n' at the cursor and advances.
+        let mut multi = make_input("ab").with_multiline(true);
+        multi.cursor_pos = 1;
+        let mut ev2 = fake_input();
+        ev2.enter_pressed = true;
+        multi.process_keyboard(&ev2);
+        assert_eq!(multi.value, "a\nb");
+        assert_eq!(multi.cursor_pos, 2);
+    }
+
+    #[test]
+    fn up_down_move_across_lines() {
+        // Two short lines; the layout is unambiguous.
+        let mut ti = make_input("foo\nbar").with_multiline(true);
+        let layout = caret_layout("foo\nbar", 1000.0);
+        // Put the cursor at the end of line 0 ("foo", byte 3).
+        ti.cursor_pos = 3;
+        // Down → land on line 1.
+        let mut down = fake_input();
+        down.key_down = true;
+        ti.process_keyboard_with_layout(&down, &layout);
+        assert_eq!(caret_for_byte(&layout, ti.cursor_pos).line, 1, "down moves to line 1");
+        // Up → back to line 0.
+        let mut up = fake_input();
+        up.key_up = true;
+        ti.process_keyboard_with_layout(&up, &layout);
+        assert_eq!(caret_for_byte(&layout, ti.cursor_pos).line, 0, "up returns to line 0");
+    }
+
+    #[test]
+    fn up_at_top_and_down_at_bottom_are_noops() {
+        let mut ti = make_input("foo\nbar").with_multiline(true);
+        let layout = caret_layout("foo\nbar", 1000.0);
+        ti.cursor_pos = 1; // line 0
+        let mut up = fake_input();
+        up.key_up = true;
+        ti.process_keyboard_with_layout(&up, &layout);
+        assert_eq!(caret_for_byte(&layout, ti.cursor_pos).line, 0, "up at top stays on line 0");
+
+        ti.cursor_pos = 5; // line 1 ("bar")
+        let mut down = fake_input();
+        down.key_down = true;
+        ti.process_keyboard_with_layout(&down, &layout);
+        assert_eq!(caret_for_byte(&layout, ti.cursor_pos).line, 1, "down at bottom stays on line 1");
+    }
+
+    #[test]
+    fn shift_down_extends_selection() {
+        let mut ti = make_input("foo\nbar").with_multiline(true);
+        let layout = caret_layout("foo\nbar", 1000.0);
+        ti.cursor_pos = 1;
+        let mut ev = fake_input();
+        ev.key_down = true;
+        ev.shift_pressed = true;
+        ti.process_keyboard_with_layout(&ev, &layout);
+        assert_eq!(ti.selection_start, Some(1), "shift+down anchors the selection at the old caret");
+        assert!(ti.cursor_pos > 1, "caret moved down");
+    }
+
+    #[test]
+    fn desired_caret_x_sticks_then_resets_on_horizontal_move() {
+        // A long line then a short line then a long line. Moving down from a far
+        // column on line 0 should keep the column across the short middle line.
+        let text = "abcdefghij\nx\nabcdefghij";
+        let mut ti = make_input(text).with_multiline(true);
+        let layout = caret_layout(text, 1000.0);
+        // Place the caret near the end of line 0 (byte 10, the '\n').
+        ti.cursor_pos = 10;
+        let start_x = caret_for_byte(&layout, ti.cursor_pos).x;
+
+        let mut down = fake_input();
+        down.key_down = true;
+        ti.process_keyboard_with_layout(&down, &layout);
+        // Now on the short line (line 1) — clamped near its end.
+        assert_eq!(caret_for_byte(&layout, ti.cursor_pos).line, 1);
+
+        // Down again — sticky column should land near the original x on line 2,
+        // NOT clamped to the short middle line's end.
+        ti.process_keyboard_with_layout(&down, &layout);
+        let landed = caret_for_byte(&layout, ti.cursor_pos);
+        assert_eq!(landed.line, 2);
+        assert!(
+            (landed.x - start_x).abs() < 30.0,
+            "sticky column preserved across the short line (landed x {} vs start {})",
+            landed.x,
+            start_x,
+        );
+
+        // A horizontal move clears the sticky column.
+        let mut left = fake_input();
+        left.key_left = true;
+        ti.process_keyboard_with_layout(&left, &layout);
+        assert!(ti.desired_caret_x.is_none(), "horizontal move resets the sticky column");
+    }
+
+    #[test]
+    fn home_end_are_line_relative_in_multiline() {
+        let text = "hello\nworld";
+        let mut ti = make_input(text).with_multiline(true);
+        let layout = caret_layout(text, 1000.0);
+        // Cursor in the middle of line 1 ("world", byte 8).
+        ti.cursor_pos = 8;
+        let mut home = fake_input();
+        home.key_home = true;
+        ti.process_keyboard_with_layout(&home, &layout);
+        assert_eq!(ti.cursor_pos, 6, "Home → start of line 1 (absolute byte 6)");
+        let mut end = fake_input();
+        end.key_end = true;
+        ti.process_keyboard_with_layout(&end, &layout);
+        assert_eq!(ti.cursor_pos, 11, "End → end of line 1 (absolute byte 11)");
+    }
+
+    #[test]
+    fn line_bounds_finds_visual_line_extent() {
+        let text = "ab\ncd";
+        let layout = caret_layout(text, 1000.0);
+        // Byte 4 is on line 1 ("cd", bytes 3..5).
+        let (lo, hi) = line_bounds(&layout, 4);
+        assert_eq!(lo, 3);
+        assert_eq!(hi, 5);
     }
 
     // ---- IME preedit composition (compose_preedit) ----

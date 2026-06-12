@@ -1462,6 +1462,220 @@ pub fn text_cursor_positions(
     positions
 }
 
+/// A caret-addressable position in laid-out text, keeping the **line geometry**
+/// that [`text_cursor_positions`] flattens away. Used for multi-line editing:
+/// vertical navigation, line-relative Home/End, per-line selection rectangles,
+/// and click-to-place hit testing.
+///
+/// `byte` is an **absolute** byte offset into the whole text (cosmic-text's
+/// per-glyph `start`/`end` are relative to their buffer line, so this struct
+/// pre-adds the buffer line's starting byte). `x` is the caret x within the
+/// visual line's left edge. `line` is the **visual** line ordinal (a soft-wrap
+/// produces a new visual line even without a `\n`), top-to-bottom. `line_top`
+/// is the y of the top of that visual line; `line_height` its height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaretPos {
+    pub byte: usize,
+    pub x: f32,
+    pub line: usize,
+    pub line_top: f32,
+    pub line_height: f32,
+}
+
+/// Lay text out and return one [`CaretPos`] per cluster boundary, preserving
+/// per-line geometry (unlike [`text_cursor_positions`], which flattens to
+/// `(byte, x)`). This is the keystone for multi-line `TextInput`.
+///
+/// `wrap` controls line breaking; pass [`WrapMode::None`] for single-line fields
+/// and [`WrapMode::WordOrGlyph`] (the default) for a textarea. `family_name`
+/// selects the font (`None` → default sans-serif).
+///
+/// ## Byte offsets are absolute
+/// cosmic-text reports `glyph.start`/`glyph.end` **relative to the buffer line**
+/// (`LayoutRun.line_i`), so this function precomputes each buffer line's starting
+/// byte (by scanning for `\n`) and adds it: `byte = line_start[line_i] +
+/// glyph.start`. Without this, every line after the first would map to the wrong
+/// position in the source string.
+///
+/// ## Soft-wrap boundaries
+/// A soft wrap (no `\n`) yields the same byte at the end of visual line *i*
+/// (`x = line_w`) and the start of line *i+1* (`x = 0`). Both entries are emitted;
+/// [`caret_for_byte`] returns the first (end-of-line) match — acceptable for v1.
+#[allow(clippy::too_many_arguments)]
+pub fn text_caret_layout(
+    font_system: &mut FontSystem,
+    text: &str,
+    font_size: f32,
+    line_height: f32,
+    max_width: f32,
+    wrap: WrapMode,
+    family_name: Option<&str>,
+) -> Vec<CaretPos> {
+    let mut out: Vec<CaretPos> = Vec::with_capacity(text.len().saturating_add(1));
+    if text.is_empty() {
+        out.push(CaretPos { byte: 0, x: 0.0, line: 0, line_top: 0.0, line_height });
+        return out;
+    }
+
+    // Byte offset of the start of each buffer line (text split on '\n'). cosmic's
+    // glyph.start/.end are relative to their buffer line, so we add this to get
+    // absolute byte indices into `text`.
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    buffer.set_wrap(font_system, wrap.into());
+    buffer.set_size(font_system, Some(max_width), None);
+    let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
+    buffer.set_text(
+        font_system,
+        text,
+        Attrs::new().family(family),
+        Shaping::Advanced,
+    );
+    buffer.shape_until_scroll(font_system, false);
+
+    // Visual line ordinal: layout_runs() yields runs top-to-bottom; each run is
+    // one visual line (a wrapped buffer line produces several consecutive runs).
+    let mut visual_line = 0usize;
+    for run in buffer.layout_runs() {
+        let line_base = line_starts.get(run.line_i).copied().unwrap_or(0);
+        let lt = run.line_top;
+        let lh = run.line_height;
+
+        // Leading caret at x=0 for the start of this visual line (covers blank
+        // lines from "\n\n", whose run has no glyphs).
+        let line_start_byte = line_base
+            + run.glyphs.first().map(|g| g.start as usize).unwrap_or(0);
+        out.push(CaretPos {
+            byte: line_start_byte,
+            x: 0.0,
+            line: visual_line,
+            line_top: lt,
+            line_height: lh,
+        });
+
+        for g in run.glyphs.iter() {
+            let b = line_base + g.start as usize;
+            // Record the first time we see each byte on this run.
+            if out.last().map(|p| p.byte) != Some(b) {
+                out.push(CaretPos { byte: b, x: g.x, line: visual_line, line_top: lt, line_height: lh });
+            }
+        }
+
+        // Run-end caret (x = line width). For a hard newline this is the byte of
+        // the '\n'; for a soft wrap it duplicates the next line's start byte.
+        if let Some(last) = run.glyphs.last() {
+            let end_b = line_base + last.end as usize;
+            if out.last().map(|p| p.byte) != Some(end_b) {
+                out.push(CaretPos {
+                    byte: end_b,
+                    x: run.line_w,
+                    line: visual_line,
+                    line_top: lt,
+                    line_height: lh,
+                });
+            }
+        }
+
+        visual_line += 1;
+    }
+
+    // Ensure the final byte index is always addressable (e.g. text with no
+    // trailing newline whose last run-end already covers it is a no-op).
+    let last_byte = text.len();
+    if out.last().map(|p| p.byte).unwrap_or(0) < last_byte {
+        let lp = *out.last().unwrap();
+        out.push(CaretPos {
+            byte: last_byte,
+            x: lp.x,
+            line: lp.line,
+            line_top: lp.line_top,
+            line_height: lp.line_height,
+        });
+    }
+
+    out
+}
+
+/// The caret position at (or just after) `byte`: the first entry whose byte is
+/// `>= byte`, falling back to the last entry. Valid cursor positions always have
+/// an exact match because every cluster boundary is recorded.
+pub fn caret_for_byte(layout: &[CaretPos], byte: usize) -> CaretPos {
+    layout
+        .iter()
+        .copied()
+        .find(|p| p.byte >= byte)
+        .or_else(|| layout.last().copied())
+        .unwrap_or(CaretPos { byte: 0, x: 0.0, line: 0, line_top: 0.0, line_height: 0.0 })
+}
+
+/// Hit-test a point (relative to the text block's top-left origin) to a byte
+/// offset: pick the visual line whose `[line_top, line_top+line_height)` band
+/// brackets `y` (clamping above the first / below the last line), then the
+/// nearest caret `x` on that line.
+pub fn byte_at_point(layout: &[CaretPos], x: f32, y: f32) -> usize {
+    if layout.is_empty() {
+        return 0;
+    }
+    let first = layout.first().unwrap();
+    let last = layout.last().unwrap();
+    let target_line = if y < first.line_top {
+        first.line
+    } else if y >= last.line_top + last.line_height {
+        last.line
+    } else {
+        layout
+            .iter()
+            .find(|p| y >= p.line_top && y < p.line_top + p.line_height)
+            .map(|p| p.line)
+            .unwrap_or(last.line)
+    };
+
+    let mut best_byte = 0usize;
+    let mut best_dx = f32::MAX;
+    for p in layout.iter().filter(|p| p.line == target_line) {
+        let dx = (p.x - x).abs();
+        if dx < best_dx {
+            best_dx = dx;
+            best_byte = p.byte;
+        }
+    }
+    best_byte
+}
+
+/// Move the caret to the visual line `dir` steps away (`-1` up, `+1` down),
+/// landing at the caret nearest `desired_x` on that line (sticky-column vertical
+/// navigation). Returns `byte` unchanged when already at the top/bottom line.
+pub fn byte_on_adjacent_line(layout: &[CaretPos], byte: usize, dir: i32, desired_x: f32) -> usize {
+    if layout.is_empty() {
+        return byte;
+    }
+    let cur = caret_for_byte(layout, byte);
+    let min_line = layout.first().unwrap().line as i32;
+    let max_line = layout.last().unwrap().line as i32;
+    let target = cur.line as i32 + dir;
+    if target < min_line || target > max_line {
+        return byte;
+    }
+    let target = target as usize;
+
+    let mut best_byte = byte;
+    let mut best_dx = f32::MAX;
+    for p in layout.iter().filter(|p| p.line == target) {
+        let dx = (p.x - desired_x).abs();
+        if dx < best_dx {
+            best_dx = dx;
+            best_byte = p.byte;
+        }
+    }
+    best_byte
+}
+
 /// Truncate `content` to a single line that fits within `max_width`, appending a
 /// trailing `'…'`. Returns `content` unchanged when it already fits.
 ///
@@ -1777,8 +1991,9 @@ impl TextBlock {
 #[cfg(test)]
 mod tests {
     use super::{
-        color_to_rgba, cosmic_align, ellipsize_to_width, field_reach, load_font_bytes,
-        measure_with_font_system, resolve_span_color, shared_font_system, text_cursor_positions,
+        byte_at_point, byte_on_adjacent_line, caret_for_byte, color_to_rgba, cosmic_align,
+        ellipsize_to_width, field_reach, load_font_bytes, measure_with_font_system,
+        resolve_span_color, shared_font_system, text_caret_layout, text_cursor_positions, CaretPos,
         FontHandle, MsdfVertex, TextAlign, TextBlock, TextMeasurer, TextRenderer, TextSpan,
         WrapMode,
     };
@@ -2024,6 +2239,138 @@ mod tests {
             text, 14.0, Some(70.0), None, Weight::NORMAL, Style::Normal, WrapMode::None,
         );
         assert_eq!(h_none, h_none2);
+    }
+
+    // ---- text_caret_layout / caret helpers ----
+
+    /// Lay out `text` with a generous width (no wrap unless `\n`) and return the
+    /// caret entries. Uses the shared font system (CPU-only — no GPU needed).
+    fn caret_layout(text: &str, wrap: WrapMode, max_width: f32) -> Vec<CaretPos> {
+        let fsh = shared_font_system();
+        let mut fs = fsh.lock().unwrap();
+        text_caret_layout(&mut fs, text, 16.0, 20.0, max_width, wrap, None)
+    }
+
+    #[test]
+    fn caret_layout_empty_text_has_single_origin_entry() {
+        let layout = caret_layout("", WrapMode::None, 1000.0);
+        assert_eq!(layout.len(), 1);
+        assert_eq!(layout[0].byte, 0);
+        assert_eq!(layout[0].x, 0.0);
+        assert_eq!(layout[0].line, 0);
+    }
+
+    #[test]
+    fn caret_layout_newline_splits_into_distinct_visual_lines() {
+        // "ab\ncd": line 0 = "ab" (bytes 0,1,2), line 1 = "cd" (bytes 3,4,5).
+        let layout = caret_layout("ab\ncd", WrapMode::None, 1000.0);
+        let max_line = layout.iter().map(|p| p.line).max().unwrap();
+        assert_eq!(max_line, 1, "two visual lines expected");
+
+        // Line 1 must start at x=0 and at a byte after the newline (>=3).
+        let line1: Vec<_> = layout.iter().filter(|p| p.line == 1).collect();
+        assert!(!line1.is_empty());
+        assert_eq!(line1[0].x, 0.0, "second line starts at x=0");
+        assert!(line1[0].byte >= 3, "second line bytes are after the newline");
+
+        // Every byte index in the source is addressable, including the final one.
+        assert!(layout.iter().any(|p| p.byte == "ab\ncd".len()));
+        // line_top strictly increases between the two lines.
+        let top0 = layout.iter().find(|p| p.line == 0).unwrap().line_top;
+        let top1 = layout.iter().find(|p| p.line == 1).unwrap().line_top;
+        assert!(top1 > top0, "second line sits below the first");
+    }
+
+    #[test]
+    fn caret_layout_bytes_are_absolute_across_lines() {
+        // The keystone correctness property: byte offsets on later lines are
+        // absolute into the whole string, NOT relative to the buffer line.
+        let text = "hello\nworld";
+        let layout = caret_layout(text, WrapMode::None, 1000.0);
+        // "world" starts at byte 6 (after "hello\n"). Some caret entry on line 1
+        // must reference byte 6, and none may reference a byte < 6 there.
+        let line1: Vec<_> = layout.iter().filter(|p| p.line == 1).collect();
+        assert!(line1.iter().all(|p| p.byte >= 6), "line-1 bytes are absolute (>=6)");
+        assert!(line1.iter().any(|p| p.byte == 6), "line 1 begins at absolute byte 6");
+        assert!(layout.iter().any(|p| p.byte == text.len()));
+    }
+
+    #[test]
+    fn caret_layout_blank_line_is_addressable() {
+        // "a\n\nb": three buffer lines, the middle one empty. The blank middle
+        // line must still get a caret entry at x=0.
+        let layout = caret_layout("a\n\nb", WrapMode::None, 1000.0);
+        let max_line = layout.iter().map(|p| p.line).max().unwrap();
+        assert_eq!(max_line, 2, "three visual lines (incl. the empty middle)");
+        let mid: Vec<_> = layout.iter().filter(|p| p.line == 1).collect();
+        assert!(!mid.is_empty(), "blank middle line must be addressable");
+        assert!(mid.iter().all(|p| p.x == 0.0), "blank line caret sits at x=0");
+        // The blank line's byte is the position just after the first '\n' (byte 2).
+        assert!(mid.iter().any(|p| p.byte == 2));
+    }
+
+    #[test]
+    fn caret_layout_long_line_wraps_into_multiple_lines() {
+        // A long unbreakable run forces a glyph wrap at a narrow width → >1 line,
+        // each line's carets x-monotonic increasing.
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let layout = caret_layout(text, WrapMode::WordOrGlyph, 60.0);
+        let max_line = layout.iter().map(|p| p.line).max().unwrap();
+        assert!(max_line >= 1, "narrow width must wrap the long run");
+        // Within each visual line, x is non-decreasing.
+        for line in 0..=max_line {
+            let xs: Vec<f32> = layout.iter().filter(|p| p.line == line).map(|p| p.x).collect();
+            for w in xs.windows(2) {
+                assert!(w[1] >= w[0] - 0.01, "x is monotonic within a line");
+            }
+        }
+    }
+
+    #[test]
+    fn caret_for_byte_finds_exact_and_clamps() {
+        let layout = caret_layout("ab\ncd", WrapMode::None, 1000.0);
+        // Exact match for the first byte.
+        assert_eq!(caret_for_byte(&layout, 0).byte, 0);
+        // A byte past the end clamps to the last entry.
+        let last = *layout.last().unwrap();
+        assert_eq!(caret_for_byte(&layout, 9999).byte, last.byte);
+    }
+
+    #[test]
+    fn byte_at_point_picks_line_by_y_then_nearest_x() {
+        let text = "ab\ncd";
+        let layout = caret_layout(text, WrapMode::None, 1000.0);
+        let lh = layout[0].line_height;
+        // A click well into the second line's y band, far left → its start byte.
+        let y_line1 = layout.iter().find(|p| p.line == 1).unwrap().line_top + lh * 0.5;
+        let b = byte_at_point(&layout, 0.0, y_line1);
+        let line1_start = layout.iter().find(|p| p.line == 1).unwrap().byte;
+        assert_eq!(b, line1_start, "click on line 1 left edge → line-1 start byte");
+
+        // A click above everything clamps to line 0.
+        let b_top = byte_at_point(&layout, 0.0, -100.0);
+        assert_eq!(caret_for_byte(&layout, b_top).line, 0);
+        // A click far below clamps to the last line.
+        let b_bot = byte_at_point(&layout, 1e6, 1e6);
+        assert_eq!(caret_for_byte(&layout, b_bot).line, 1);
+    }
+
+    #[test]
+    fn byte_on_adjacent_line_moves_with_sticky_column() {
+        // Two lines of different content; moving down from line 0 at a desired x
+        // lands on line 1, and moving up returns toward line 0.
+        let text = "hello\nworld";
+        let layout = caret_layout(text, WrapMode::None, 1000.0);
+        // Start near the end of line 0 (byte 5 = the '\n' position, x≈line_w).
+        let start = caret_for_byte(&layout, 5);
+        let down = byte_on_adjacent_line(&layout, start.byte, 1, start.x);
+        assert_eq!(caret_for_byte(&layout, down).line, 1, "down moves to line 1");
+        // Moving up from there returns to line 0.
+        let up = byte_on_adjacent_line(&layout, down, -1, start.x);
+        assert_eq!(caret_for_byte(&layout, up).line, 0, "up returns to line 0");
+        // At the top line, up is a no-op.
+        let top = byte_on_adjacent_line(&layout, 0, -1, 0.0);
+        assert_eq!(top, 0);
     }
 
     #[test]

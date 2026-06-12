@@ -292,6 +292,30 @@ impl DrawList {
         crate::text::text_cursor_positions(&mut fs, text, font_size, lh, mw, None)
     }
 
+    /// Line-aware caret layout for the given text — the multi-line counterpart of
+    /// [`Self::text_cursor_positions`]. Returns one [`crate::text::CaretPos`] per
+    /// cluster boundary, preserving per-visual-line geometry (line index, top y,
+    /// height) needed for vertical navigation, per-line selection, and
+    /// click-to-place hit testing in a multi-line `TextInput`.
+    ///
+    /// `wrap` controls line breaking (use [`crate::text::WrapMode::None`] for
+    /// single-line, [`crate::text::WrapMode::WordOrGlyph`] for a textarea).
+    /// `max_width` constrains the layout width; pass `None` for effectively
+    /// infinite width (single-line).
+    pub fn text_caret_layout(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+        wrap: crate::text::WrapMode,
+    ) -> Vec<crate::text::CaretPos> {
+        let handle = self.text_measurer.font_system_handle();
+        let mut fs = handle.lock().expect("FontSystem poisoned");
+        let mw = max_width.unwrap_or(f32::MAX / 4.0);
+        let lh = font_size * 1.25;
+        crate::text::text_caret_layout(&mut fs, text, font_size, lh, mw, wrap, None)
+    }
+
     // ---- Clip stack ----
 
     /// Push a clipping rectangle. Nested clips are intersected with the current clip.

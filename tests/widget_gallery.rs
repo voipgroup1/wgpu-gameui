@@ -505,6 +505,26 @@ fn render_widget_gallery() {
             );
         }
 
+        // Multi-line text area: focused, with two hard newlines and one line long
+        // enough to wrap at the field width. Uses a local focus+input so it
+        // doesn't disturb the shared focus owner above.
+        let r = flow.cell(list, "Text area (multiline)", 200.0, 86.0);
+        {
+            const AREA_ID: u64 = 201;
+            let area_input = InputState::default();
+            let mut area_focus = FocusState::new();
+            area_focus.focus(AREA_ID);
+            area_focus.begin_frame(&area_input);
+            let mut field = TextInput::new(r.x, r.y, r.width, r.height)
+                .with_multiline(true)
+                .with_value("line one\nsecond line\nthis third line is long enough to wrap");
+            field.cursor_pos = field.value.len();
+            field.draw(
+                AREA_ID,
+                &mut DrawContext::new(list, &mut area_focus, &theme, &area_input, W as f32, 600.0),
+            );
+        }
+
         // Dropdown, seeded open: the floating list (drawn after the base scope)
         // renders above whatever cells sit below it.
         let r = flow.cell(list, "Dropdown (open)", 160.0, 28.0);
