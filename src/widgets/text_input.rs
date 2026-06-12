@@ -900,13 +900,12 @@ impl TextInput {
             if self.multiline && composed.is_none() {
                 let caret = caret_for_byte(&render_layout, self.cursor_pos);
                 let caret_h = if caret.line_height > 0.0 { caret.line_height } else { line_height };
-                list.quad(
-                    text_x + caret.x,
-                    text_top - scroll + caret.line_top,
-                    1.5,
-                    caret_h,
-                    theme.text,
-                );
+                let caret_x = text_x + caret.x;
+                let caret_y = text_top - scroll + caret.line_top;
+                list.quad(caret_x, caret_y, 1.5, caret_h, theme.text);
+                // Tell the windowing layer a text field is focused (so it can
+                // enable IME) and where to anchor the IME candidate window.
+                focus.request_ime(Rect::new(caret_x, caret_y, 1.5, caret_h));
             } else {
                 let cursor_x = if let Some((display, _spans, caret_byte)) = &composed {
                     // Caret position is measured on the composed display string so
@@ -930,13 +929,9 @@ impl TextInput {
                         .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
                     text_x + offset
                 };
-                list.quad(
-                    cursor_x,
-                    block_y,
-                    1.5,
-                    line_height,
-                    theme.text,
-                );
+                list.quad(cursor_x, block_y, 1.5, line_height, theme.text);
+                // See the multiline branch: declare IME focus + caret anchor.
+                focus.request_ime(Rect::new(cursor_x, block_y, 1.5, line_height));
             }
         }
 
@@ -974,6 +969,54 @@ mod tests {
 
     fn fake_input() -> InputState {
         InputState::default()
+    }
+
+    #[test]
+    fn focused_field_requests_ime_unfocused_does_not() {
+        let mut ti = TextInput::new(5.0, 6.0, 120.0, 24.0).with_value("hi".to_string());
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        let input = InputState::default();
+
+        // Unfocused frame: the field must not request IME.
+        focus.begin_frame(&input);
+        draw_input(&mut ti, 0, &mut focus, &mut list, &theme, &input);
+        assert_eq!(
+            focus.ime_request(),
+            None,
+            "an unfocused text field must not enable IME"
+        );
+
+        // Focused frame: it requests IME with a caret rect anchored in the field.
+        focus.focus(0);
+        focus.begin_frame(&input);
+        draw_input(&mut ti, 0, &mut focus, &mut list, &theme, &input);
+        let req = focus
+            .ime_request()
+            .expect("a focused text field must request IME");
+        assert!(req.x >= 5.0, "caret x within the field");
+        assert!(req.y >= 6.0, "caret y within the field");
+        assert!(req.height > 0.0, "caret has a height for IME anchoring");
+    }
+
+    #[test]
+    fn multiline_focused_field_requests_ime() {
+        let mut ti = TextInput::new(0.0, 0.0, 120.0, 80.0)
+            .with_multiline(true)
+            .with_value("line one\nline two".to_string());
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        let input = InputState::default();
+
+        focus.focus(0);
+        focus.begin_frame(&input);
+        draw_input(&mut ti, 0, &mut focus, &mut list, &theme, &input);
+        assert!(
+            focus.ime_request().is_some(),
+            "a focused multiline field requests IME"
+        );
     }
 
     #[test]

@@ -39,6 +39,7 @@
 //! while a modal is open. Click-to-focus already respects `mouse_consumed`,
 //! so a modal won't mis-focus a base-layer widget on click either.
 
+use crate::layout::Rect;
 use crate::InputState;
 
 /// Stable identity for a focusable widget within one UI surface.
@@ -88,6 +89,13 @@ pub struct FocusState {
     mouse_clicked: bool,
     /// A focusable claimed this frame's click (suppresses click-elsewhere blur).
     click_claimed: bool,
+    /// Set by the focused text widget during draw: it wants IME composition and
+    /// here is its caret rect (screen coords) for candidate-window placement.
+    /// `None` means no text field is focused this frame, so the windowing layer
+    /// should disable IME — preventing an active IME from swallowing keystrokes
+    /// (e.g. WASD) while the user isn't editing text. Drained each frame via
+    /// [`take_ime_request`](FocusState::take_ime_request).
+    ime_request: Option<Rect>,
 }
 
 impl FocusState {
@@ -112,6 +120,7 @@ impl FocusState {
         };
         self.escape = input.key_escape;
         self.mouse_clicked = input.mouse_clicked;
+        self.ime_request = None;
         self.click_claimed = false;
     }
 
@@ -159,6 +168,31 @@ impl FocusState {
     /// Programmatically clear focus.
     pub fn blur(&mut self) {
         self.focused = None;
+    }
+
+    /// Declare that the focused text widget wants IME composition this frame,
+    /// passing its caret rect (screen coords) for IME candidate placement.
+    /// Called by the text widget during draw while it holds focus. The
+    /// windowing layer drains this with [`take_ime_request`](Self::take_ime_request)
+    /// to gate `set_ime_allowed`, so an active IME only intercepts keys while a
+    /// text field is actually being edited.
+    pub fn request_ime(&mut self, caret_rect: Rect) {
+        self.ime_request = Some(caret_rect);
+    }
+
+    /// Peek this frame's IME request (the focused text field's caret rect), if
+    /// any. Non-consuming; see [`take_ime_request`](Self::take_ime_request).
+    pub fn ime_request(&self) -> Option<Rect> {
+        self.ime_request
+    }
+
+    /// Take and clear this frame's IME request. The windowing layer calls this
+    /// once per frame after drawing the UI: `Some(rect)` → enable IME and point
+    /// its candidate window at `rect`; `None` → disable IME. Self-clearing, so
+    /// it reverts to "no IME" the instant no text field reports one — correct
+    /// even when [`begin_frame`](Self::begin_frame) isn't being driven.
+    pub fn take_ime_request(&mut self) -> Option<Rect> {
+        self.ime_request.take()
     }
 
     /// End a frame: resolve Escape, click-elsewhere blur, and Tab navigation.
@@ -231,6 +265,35 @@ mod tests {
         let f = FocusState::new();
         assert_eq!(f.focused(), None);
         assert!(!f.is_focused(0));
+        assert_eq!(f.ime_request(), None, "no IME requested by default");
+    }
+
+    #[test]
+    fn request_ime_is_peekable_then_taken() {
+        let mut f = FocusState::new();
+        let rect = Rect::new(10.0, 20.0, 1.5, 18.0);
+        f.request_ime(rect);
+        // Peek doesn't consume.
+        assert_eq!(f.ime_request(), Some(rect));
+        assert_eq!(f.ime_request(), Some(rect));
+        // Take consumes.
+        assert_eq!(f.take_ime_request(), Some(rect));
+        assert_eq!(f.take_ime_request(), None, "second take is empty");
+    }
+
+    #[test]
+    fn begin_frame_clears_stale_ime_request() {
+        let mut f = FocusState::new();
+        f.request_ime(Rect::new(1.0, 2.0, 1.5, 12.0));
+        // A new frame with no text field drawn must not leave a stale request:
+        // begin_frame clears it, and nothing re-requests it this frame.
+        f.begin_frame(&input(false, false, false, false));
+        f.end_frame(None);
+        assert_eq!(
+            f.take_ime_request(),
+            None,
+            "stale IME request cleared when no field is focused"
+        );
     }
 
     #[test]
