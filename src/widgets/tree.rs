@@ -222,6 +222,7 @@ pub struct TreeNode<'a> {
     leading: &'a [TreeAction<'a>],
     trailing: &'a [TreeAction<'a>],
     slot_size: Option<f32>,
+    label_color: Option<[f32; 4]>,
 }
 
 /// Result of drawing one tree row.
@@ -252,6 +253,7 @@ impl<'a> TreeNode<'a> {
             leading: &[],
             trailing: &[],
             slot_size: None,
+            label_color: None,
         }
     }
 
@@ -313,6 +315,16 @@ impl<'a> TreeNode<'a> {
         self
     }
 
+    /// Override the label colour (linear RGBA). When unset the label uses
+    /// `theme.text` (or `theme.background` when selected, for contrast against
+    /// the accent fill). When set, this colour is used in every state — the
+    /// caller is responsible for picking something readable on a selected row.
+    /// Lets an outliner colour-code rows by kind (group / object / section).
+    pub fn with_label_color(mut self, color: [f32; 4]) -> Self {
+        self.label_color = Some(color);
+        self
+    }
+
     /// Draw this row into `rect` and handle expand / select / action
     /// interaction. The row's content is indented by `depth * INDENT`; the
     /// selection/hover highlight spans the full `rect` width regardless of
@@ -371,7 +383,9 @@ impl<'a> TreeNode<'a> {
             list.quad(rect.x, rect.y, rect.width, rect.height, theme.button_hover);
         }
 
-        let text_color = if selected { theme.background } else { theme.text };
+        let text_color = self
+            .label_color
+            .unwrap_or(if selected { theme.background } else { theme.text });
         let arrow_color = if selected { theme.background } else { theme.text_dim };
 
         // ---- disclosure triangle ------------------------------------------
@@ -722,6 +736,27 @@ mod tests {
         let none = label_max_w(&[]);
         let two = label_max_w(&[TreeAction::key(1, "a"), TreeAction::key(2, "b")]);
         assert!(two < none, "trailing icons reserve width (none={none}, two={two})");
+    }
+
+    #[test]
+    fn label_color_overrides_default_text_color() {
+        use glyphon::Color;
+
+        // Default path: the label takes the theme text colour.
+        let mut s = TreeState::new();
+        let (def_list, _) = draw_node(&TreeNode::leaf("Node"), 1, row(), &mut s, &idle());
+        let def_color = def_list.texts.first().expect("label emitted").color;
+        let (tr, tg, tb) = rgb(theme().text);
+        assert_eq!(def_color, Color::rgb(tr, tg, tb), "default path uses theme.text");
+
+        // Overridden path: a distinctive colour wins.
+        let mut s2 = TreeState::new();
+        let node = TreeNode::leaf("Node").with_label_color([0.1, 0.9, 0.3, 1.0]);
+        let (list, _) = draw_node(&node, 1, row(), &mut s2, &idle());
+        let col = list.texts.first().expect("label emitted").color;
+        let (r, g, b) = rgb([0.1, 0.9, 0.3, 1.0]);
+        assert_eq!(col, Color::rgb(r, g, b), "label_color is applied verbatim");
+        assert_ne!(col, def_color, "override differs from the default text colour");
     }
 
     #[test]
