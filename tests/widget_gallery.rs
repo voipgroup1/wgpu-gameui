@@ -16,8 +16,8 @@ use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DrawContext, DrawList, Dropdown, DropdownState,
     FocusState, ImageButton, ImageFit, InputState, LayerStack, NumberInput, ProgressBar, ScrollState,
     ScrollView, Slider, Table, TableCell, TableColumn, Tabs,
-    TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer, UiContext,
-    UiRenderer, UiState, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
+    TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer, TreeNode,
+    TreeState, UiContext, UiRenderer, UiState, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
 };
 
 /// Convenience: build a DrawContext for a single draw call in the gallery.
@@ -553,6 +553,37 @@ fn render_widget_gallery() {
                     r,
                     &mut DrawContext::new(list, &mut num_focus, &theme, &num_input, W as f32, 600.0),
                 );
+        }
+
+        // Tree view: a seeded hierarchy — an expanded branch with indented
+        // children (one selected), a collapsed branch, and a root leaf. Uses the
+        // raw `TreeNode` widget with idle input so nothing toggles.
+        let r = flow.cell(list, "Tree view", 160.0, 110.0);
+        {
+            let mut tree = TreeState::new();
+            tree.set_expanded(1, true); // "Materials" expanded
+            tree.set_expanded(4, false); // "Foliage" collapsed
+            tree.select(3); // "Metal" selected
+            let idle = InputState {
+                mouse_x: -1.0,
+                mouse_y: -1.0,
+                ..InputState::default()
+            };
+            let rows: [(u64, &str, bool, usize); 5] = [
+                (1, "Materials", false, 0),
+                (2, "Wood", true, 1),
+                (3, "Metal", true, 1),
+                (4, "Foliage", false, 0),
+                (5, "Stone", true, 0),
+            ];
+            for (i, (id, label, leaf, depth)) in rows.iter().enumerate() {
+                let row = Rect::new(r.x, r.y + i as f32 * 21.0, r.width, 20.0);
+                let mut tctx = DrawContext::new(list, &mut focus, &theme, &idle, W as f32, 600.0);
+                TreeNode::new(label)
+                    .with_leaf(*leaf)
+                    .with_depth(*depth)
+                    .draw(*id, row, &mut tree, &mut tctx);
+            }
         }
 
         // Dropdown, seeded open: the floating list (drawn after the base scope)

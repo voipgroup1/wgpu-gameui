@@ -17,6 +17,7 @@ mod table;
 mod tabs;
 mod text_input;
 mod tooltip;
+mod tree;
 
 pub use button::Button;
 pub use checkbox::{Checkbox, CHECKBOX_CHECKED_ICON, CHECKBOX_ICON};
@@ -38,6 +39,7 @@ pub use table::{Align, ColumnWidth, Table, TableCell, TableColumn, TableOutput};
 pub use tabs::{Tabs, TabsOutput};
 pub use text_input::TextInput;
 pub use tooltip::{TooltipContent, TooltipLayer};
+pub use tree::{TreeId, TreeNode, TreeNodeOutput, TreeState};
 
 use crate::{InputState, Theme};
 

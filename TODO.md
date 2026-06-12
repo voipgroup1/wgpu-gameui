@@ -121,7 +121,19 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       feedback); `.padding()` insets the image. Disabled dims via overlay so
       string-key sources without tint still read as disabled.
 - [ ] **P1 — Radio button group.**
-- [ ] **P1 — Tree view / collapsing header.**
+- [x] **P1 — Tree view / collapsing header.** `TreeNode`
+      (`src/widgets/tree.rs`) draws one row — a disclosure triangle + indented
+      label for *branches*, a terminal *leaf* otherwise — against a `Rect`/
+      `DrawContext`. Caller-owned `TreeState` holds the expanded set + a
+      single-owner selection (`select`/`is_selected`/`toggle`/`set_expanded`/
+      `collapse_all`); `with_default_open` expands a node the first time its
+      `TreeId` is seen. A click anywhere on a row selects it (and toggles a
+      branch); selection/hover highlight spans the full row width, honoring
+      `mouse_consumed`. Façade `UiContext::tree_node`/`tree_node_open` (returns
+      expanded → draw children → `tree_pop`) + `tree_leaf` (returns clicked),
+      with automatic per-depth indentation and auto-advance, backed by
+      `UiState::tree`. Keyboard arrow-nav deferred to the separate
+      keyboard-navigation P1.
 - [x] **P1 — Number input / spin box** with validation. `NumberInput`
       (`src/widgets/number_input.rs`) wraps a `TextInput` (inheriting cursor /
       selection / clipboard) around an `f64` value: parses + clamps to
