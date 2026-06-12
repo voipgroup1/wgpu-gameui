@@ -117,6 +117,40 @@ pub enum TextAlign {
     Right,
 }
 
+/// How a [`TextBlock`] breaks lines when its content is wider than
+/// [`max_width`](TextBlock::max_width).
+///
+/// The default, [`WordOrGlyph`](WrapMode::WordOrGlyph), is exactly the implicit
+/// behaviour every block had before this knob existed (cosmic-text's `Buffer`
+/// default), so leaving it unset changes nothing. Use [`None`](WrapMode::None)
+/// for single-line fields that should overflow (and be clipped) rather than
+/// wrap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WrapMode {
+    /// Never wrap; the text stays on one line and overflows `max_width`
+    /// (combine with [`TextBlock::with_clip`] to hide the overflow).
+    None,
+    /// Break between words; a single word too long to fit still overflows.
+    Word,
+    /// Break anywhere between glyphs.
+    Glyph,
+    /// Break between words, falling back to glyph breaks for a word too long to
+    /// fit on a line by itself. Matches the pre-existing implicit behaviour.
+    #[default]
+    WordOrGlyph,
+}
+
+impl From<WrapMode> for Wrap {
+    fn from(mode: WrapMode) -> Self {
+        match mode {
+            WrapMode::None => Wrap::None,
+            WrapMode::Word => Wrap::Word,
+            WrapMode::Glyph => Wrap::Glyph,
+            WrapMode::WordOrGlyph => Wrap::WordOrGlyph,
+        }
+    }
+}
+
 /// Load a font from a TTF/OTF file into the shared `FontSystem`, returning a
 /// [`FontHandle`] that selects it for [`TextBlock::with_font`].
 ///
@@ -389,6 +423,7 @@ impl TextRenderer {
             None,
             Weight::NORMAL,
             Style::Normal,
+            WrapMode::default(),
         )
     }
 
@@ -459,6 +494,7 @@ impl TextRenderer {
                 block.ellipsize,
                 block.weight.0,
                 style_disc(block.style),
+                block.wrap,
             );
 
             // Fast path: a cached layout for this exact key + content. No
@@ -517,6 +553,7 @@ impl TextRenderer {
                 buffer.set_wrap(&mut fs, Wrap::None);
                 buffer.set_size(&mut fs, None, None);
             } else {
+                buffer.set_wrap(&mut fs, block.wrap.into());
                 buffer.set_size(&mut fs, Some(block.max_width), None);
             }
             buffer.set_text(
@@ -847,10 +884,11 @@ struct CachedShape {
 /// Outer cache key: everything that affects shaped layout *except* the content
 /// string (which is the inner `HashMap` key, so hits borrow `&str` with no
 /// allocation — mirrors [`TextMeasurer`]). Scalars are stored as bit patterns so
-/// the key is `Hash + Eq`. The trailing `(u16, u8)` are the font weight and the
+/// the key is `Hash + Eq`. The `(u16, u8)` are the font weight and the
 /// [`style_disc`] style discriminant, so bold/italic variants cache and re-shape
-/// independently of the regular face.
-type ShapeKey = (u32, u32, u32, u64, TextAlign, bool, u16, u8);
+/// independently of the regular face; the trailing [`WrapMode`] keys the wrap
+/// policy so the same content at the same metrics caches separately per wrap.
+type ShapeKey = (u32, u32, u32, u64, TextAlign, bool, u16, u8, WrapMode);
 
 /// Stable discriminant for a cosmic-text [`Style`] so it can sit in a `Hash + Eq`
 /// cache key: `Normal = 0`, `Italic = 1`, `Oblique = 2`.
@@ -1143,7 +1181,7 @@ pub struct TextMeasurer {
     /// borrowed `&str` — no key allocation on a cache hit, only on a miss when we
     /// insert. `family_hash` is 0 for the default font; different fonts/weights/
     /// styles have different advances so all three must be part of the key.
-    cache: HashMap<(u32, Option<u32>, u64, u16, u8), HashMap<String, (f32, f32)>>,
+    cache: HashMap<(u32, Option<u32>, u64, u16, u8, WrapMode), HashMap<String, (f32, f32)>>,
     cache_entries: usize,
 }
 
@@ -1209,14 +1247,23 @@ impl TextMeasurer {
         max_width: Option<f32>,
         font: Option<&FontHandle>,
     ) -> (f32, f32) {
-        self.measure_styled(text, font_size, max_width, font, Weight::NORMAL, Style::Normal)
+        self.measure_styled(
+            text,
+            font_size,
+            max_width,
+            font,
+            Weight::NORMAL,
+            Style::Normal,
+            WrapMode::default(),
+        )
     }
 
     /// Like [`measure_with_font`](Self::measure_with_font), but also selects a
-    /// font `weight` and `style`. Bold/italic faces have different advances, so
-    /// each `(font, weight, style)` combination is a distinct cache entry — a
+    /// font `weight`, `style`, and wrap policy. Bold/italic faces have different
+    /// advances and the wrap policy changes line breaks, so each
+    /// `(font, weight, style, wrap)` combination is a distinct cache entry — a
     /// measurement under this path matches a [`TextBlock`] rendered with the same
-    /// font/weight/style.
+    /// font/weight/style/wrap.
     pub fn measure_styled(
         &mut self,
         text: &str,
@@ -1225,6 +1272,7 @@ impl TextMeasurer {
         font: Option<&FontHandle>,
         weight: Weight,
         style: Style,
+        wrap: WrapMode,
     ) -> (f32, f32) {
         let key = (
             font_size.to_bits(),
@@ -1232,6 +1280,7 @@ impl TextMeasurer {
             family_hash(font),
             weight.0,
             style_disc(style),
+            wrap,
         );
 
         if let Some(inner) = self.cache.get(&key) {
@@ -1250,6 +1299,7 @@ impl TextMeasurer {
                 font.map(|h| h.family()),
                 weight,
                 style,
+                wrap,
             )
         };
 
@@ -1309,10 +1359,12 @@ fn measure_with_font_system(
     family_name: Option<&str>,
     weight: Weight,
     style: Style,
+    wrap: WrapMode,
 ) -> (f32, f32) {
     let line_height = font_size * 1.25;
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
     let shape_width = max_width.unwrap_or(f32::MAX / 4.0);
+    buffer.set_wrap(font_system, wrap.into());
     buffer.set_size(font_system, Some(shape_width), None);
     let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
     buffer.set_text(
@@ -1559,6 +1611,10 @@ pub struct TextBlock {
     /// draw time and need not be set by the caller. All spans must share the
     /// block's global font attributes (see [`TextSpan`]).
     pub spans: Vec<TextSpan>,
+    /// Line-wrapping policy when the content exceeds `max_width` (default
+    /// [`WrapMode::WordOrGlyph`], matching the historical implicit behaviour).
+    /// Ignored in `ellipsize` mode, which always lays out on a single line.
+    pub wrap: WrapMode,
 }
 
 impl TextBlock {
@@ -1581,6 +1637,7 @@ impl TextBlock {
             weight: Weight::NORMAL,
             style: Style::Normal,
             spans: Vec::new(),
+            wrap: WrapMode::default(),
         }
     }
 
@@ -1707,6 +1764,14 @@ impl TextBlock {
         self.spans = spans;
         self
     }
+
+    /// Set the line-wrapping policy (default [`WrapMode::WordOrGlyph`]). Use
+    /// [`WrapMode::None`] to keep the text on one line and overflow `max_width`
+    /// (pair with [`with_clip`](Self::with_clip) to hide the overflow).
+    pub fn with_wrap(mut self, wrap: WrapMode) -> Self {
+        self.wrap = wrap;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -1715,6 +1780,7 @@ mod tests {
         color_to_rgba, cosmic_align, ellipsize_to_width, field_reach, load_font_bytes,
         measure_with_font_system, resolve_span_color, shared_font_system, text_cursor_positions,
         FontHandle, MsdfVertex, TextAlign, TextBlock, TextMeasurer, TextRenderer, TextSpan,
+        WrapMode,
     };
     use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping, Style, Weight};
 
@@ -1863,6 +1929,101 @@ mod tests {
         let (_, h_unwrapped) = measurer.measure(long, 14.0, None);
         let (_, h_wrapped) = measurer.measure(long, 14.0, Some(80.0));
         assert!(h_wrapped > h_unwrapped);
+    }
+
+    /// Helper: number of laid-out lines = height / line_height (font_size*1.25).
+    fn line_count(measurer: &mut TextMeasurer, text: &str, size: f32, w: f32, wrap: WrapMode) -> u32 {
+        let (_, h) =
+            measurer.measure_styled(text, size, Some(w), None, Weight::NORMAL, Style::Normal, wrap);
+        (h / (size * 1.25)).round() as u32
+    }
+
+    #[test]
+    fn wrap_mode_controls_line_count() {
+        let mut m = TextMeasurer::new();
+        let size = 14.0;
+        let w = 70.0;
+
+        // A multi-word string narrower than its natural width: every wrapping
+        // mode breaks it; `None` keeps it on one line. (Word- vs glyph-packing
+        // line *counts* are font-dependent, so we don't compare those two here —
+        // see the unbreakable-word case below for that distinction.)
+        let words = "alpha beta gamma delta epsilon";
+        assert_eq!(
+            line_count(&mut m, words, size, w, WrapMode::None),
+            1,
+            "Wrap::None must stay on a single line",
+        );
+        assert!(line_count(&mut m, words, size, w, WrapMode::Word) > 1, "Word should wrap");
+        assert!(
+            line_count(&mut m, words, size, w, WrapMode::WordOrGlyph) > 1,
+            "WordOrGlyph should wrap",
+        );
+        assert!(line_count(&mut m, words, size, w, WrapMode::Glyph) > 1, "Glyph should wrap");
+
+        // A single word with no break opportunities: `Word` cannot break it (it
+        // overflows on one line) while `Glyph`/`WordOrGlyph` break mid-word.
+        // This is the font-independent Word-vs-Glyph distinction.
+        let long_word = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
+        assert_eq!(
+            line_count(&mut m, long_word, size, w, WrapMode::Word),
+            1,
+            "Word wrap cannot split a single long word — it overflows on one line",
+        );
+        assert!(
+            line_count(&mut m, long_word, size, w, WrapMode::Glyph) > 1,
+            "Glyph wrap must break a long word across lines",
+        );
+        assert!(
+            line_count(&mut m, long_word, size, w, WrapMode::WordOrGlyph) > 1,
+            "WordOrGlyph falls back to glyph breaks for a too-long word",
+        );
+    }
+
+    #[test]
+    fn wrap_mode_default_is_word_or_glyph() {
+        // The TextBlock default and the bare `measure` default must agree.
+        assert_eq!(WrapMode::default(), WrapMode::WordOrGlyph);
+        let block = TextBlock::new("x", 0.0, 0.0);
+        assert_eq!(block.wrap, WrapMode::WordOrGlyph);
+        let with = block.with_wrap(WrapMode::None);
+        assert_eq!(with.wrap, WrapMode::None);
+
+        // `measure` (no wrap arg) must match `measure_styled` with the default,
+        // proving the convenience path forwards the same policy.
+        let mut m = TextMeasurer::new();
+        let text = "alpha beta gamma delta epsilon";
+        let bare = m.measure(text, 14.0, Some(70.0));
+        let styled = m.measure_styled(
+            text,
+            14.0,
+            Some(70.0),
+            None,
+            Weight::NORMAL,
+            Style::Normal,
+            WrapMode::default(),
+        );
+        assert_eq!(bare, styled);
+    }
+
+    #[test]
+    fn wrap_mode_is_part_of_measure_cache_key() {
+        // Same content/metrics, different wrap → distinct cached results (None
+        // stays one line, Glyph wraps), so the wrap must be in the key.
+        let mut m = TextMeasurer::new();
+        let text = "alpha beta gamma delta epsilon";
+        let (_, h_none) = m.measure_styled(
+            text, 14.0, Some(70.0), None, Weight::NORMAL, Style::Normal, WrapMode::None,
+        );
+        let (_, h_glyph) = m.measure_styled(
+            text, 14.0, Some(70.0), None, Weight::NORMAL, Style::Normal, WrapMode::Glyph,
+        );
+        assert!(h_glyph > h_none, "distinct wrap modes must not collide in the cache");
+        // Re-measuring None still returns the one-line height (key really splits).
+        let (_, h_none2) = m.measure_styled(
+            text, 14.0, Some(70.0), None, Weight::NORMAL, Style::Normal, WrapMode::None,
+        );
+        assert_eq!(h_none, h_none2);
     }
 
     #[test]
@@ -2058,15 +2219,15 @@ mod tests {
         let mut m = TextMeasurer::with_font_system(fs);
         let text = "The quick brown fox jumps";
         let (rw, _) =
-            m.measure_styled(text, 18.0, None, Some(&regular), Weight::NORMAL, Style::Normal);
+            m.measure_styled(text, 18.0, None, Some(&regular), Weight::NORMAL, Style::Normal, WrapMode::default());
         let (bw, _) =
-            m.measure_styled(text, 18.0, None, Some(&regular), Weight::BOLD, Style::Normal);
+            m.measure_styled(text, 18.0, None, Some(&regular), Weight::BOLD, Style::Normal, WrapMode::default());
         assert!(rw > 0.0 && bw > 0.0);
         assert!(bw > rw, "bold width {bw} should exceed regular {rw}");
         // Distinct cache entries keyed by weight: re-measuring regular still
         // returns the regular width (proves weight is part of the key).
         let (rw2, _) =
-            m.measure_styled(text, 18.0, None, Some(&regular), Weight::NORMAL, Style::Normal);
+            m.measure_styled(text, 18.0, None, Some(&regular), Weight::NORMAL, Style::Normal, WrapMode::default());
         assert_eq!(rw2, rw);
     }
 
@@ -2160,6 +2321,7 @@ mod tests {
             None,
             Weight::NORMAL,
             Style::Normal,
+            WrapMode::default(),
         );
         assert!(w <= max_width, "ellipsized width {w} must fit {max_width}");
     }
@@ -2248,6 +2410,7 @@ mod tests {
             None,
             Weight::NORMAL,
             Style::Normal,
+            WrapMode::default(),
         );
         let final_x = pos.last().map(|(_, x)| *x).unwrap_or(0.0);
         // The final x-position should approximate the measured width.

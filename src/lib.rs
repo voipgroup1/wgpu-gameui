@@ -30,8 +30,8 @@ mod text;
 
 pub use text::{
     FontHandle, FontSystemHandle, TextAlign, TextBlock, TextGlow, TextMeasurer, TextOutline,
-    TextRenderer, TextShadow, TextSpan, load_font_bytes, load_font_file, register_bundled_fonts,
-    resolve_span_color, shared_font_system, text_cursor_positions,
+    TextRenderer, TextShadow, TextSpan, WrapMode, load_font_bytes, load_font_file,
+    register_bundled_fonts, resolve_span_color, shared_font_system, text_cursor_positions,
 };
 
 /// Font weight and style selectors (re-exported from `glyphon`/`cosmic-text`)
