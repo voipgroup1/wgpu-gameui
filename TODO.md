@@ -122,7 +122,16 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       string-key sources without tint still read as disabled.
 - [ ] **P1 — Radio button group.**
 - [ ] **P1 — Tree view / collapsing header.**
-- [ ] **P1 — Number input / spin box** with validation. TextInput is raw text.
+- [x] **P1 — Number input / spin box** with validation. `NumberInput`
+      (`src/widgets/number_input.rs`) wraps a `TextInput` (inheriting cursor /
+      selection / clipboard) around an `f64` value: parses + clamps to
+      `[min, max]`, with +/- step buttons, mouse-wheel stepping, and Up/Down
+      arrow stepping (both gated on focus so they never hijack page scroll or
+      collide with text editing — single-line `TextInput` ignores Up/Down).
+      `decimals` sets precision (`0` = integer). Text is sanitised to numeric
+      characters while editing; the value owns the text when unfocused (external
+      changes win), and `Enter` canonicalises. Façade
+      `UiContext::number_input(id, &mut f64, min, max, step, decimals, w)`.
 - [ ] **P1 — Drag handle / window-mover.**
 - [ ] **P1 — List / grid / virtualized list.** Table is the only iterator.
 - [ ] **P2 — Color picker.**

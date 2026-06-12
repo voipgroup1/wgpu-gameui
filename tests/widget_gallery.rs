@@ -14,7 +14,7 @@
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DrawContext, DrawList, Dropdown, DropdownState,
-    FocusState, ImageButton, ImageFit, InputState, LayerStack, ProgressBar, ScrollState,
+    FocusState, ImageButton, ImageFit, InputState, LayerStack, NumberInput, ProgressBar, ScrollState,
     ScrollView, Slider, Table, TableCell, TableColumn, Tabs,
     TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer, UiContext,
     UiRenderer, UiState, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
@@ -428,6 +428,12 @@ fn render_widget_gallery() {
             let mut vstate = UiState::new();
             vstate.begin_frame(&input, &theme);
             let mut buf = String::from("editable");
+            // Scope the `ui.translate` to this block: `UiContext::translate`
+            // mutates the shared list's transform-stack top in place and is not
+            // restored on drop, so without a push/pop bracket the translate
+            // leaks and shifts every later base-layer cell (the whole Widgets
+            // section) off-position.
+            list.push_transform();
             {
                 let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
                 ui.translate(r.x, r.y);
@@ -437,6 +443,7 @@ fn render_widget_gallery() {
                 let _ = ui.checkbox("checkbox()", true);
                 let _ = ui.text_input(1, &mut buf, "type…", Some(200.0));
             }
+            list.pop_transform();
             vstate.end_frame();
         }
 
@@ -523,6 +530,29 @@ fn render_widget_gallery() {
                 AREA_ID,
                 &mut DrawContext::new(list, &mut area_focus, &theme, &area_input, W as f32, 600.0),
             );
+        }
+
+        // Number input / spin box: a focused float field showing the +/- step
+        // buttons in the right column and an editable value.
+        let r = flow.cell(list, "Number input", 140.0, 28.0);
+        {
+            const NUM_ID: u64 = 202;
+            let num_input = InputState::default();
+            let mut num_focus = FocusState::new();
+            num_focus.focus(NUM_ID);
+            num_focus.begin_frame(&num_input);
+            let mut field = TextInput::new(r.x, r.y, r.width, r.height);
+            NumberInput::new()
+                .with_range(0.0, 100.0)
+                .with_step(1.0)
+                .with_decimals(1)
+                .draw(
+                    42.5,
+                    NUM_ID,
+                    &mut field,
+                    r,
+                    &mut DrawContext::new(list, &mut num_focus, &theme, &num_input, W as f32, 600.0),
+                );
         }
 
         // Dropdown, seeded open: the floating list (drawn after the base scope)

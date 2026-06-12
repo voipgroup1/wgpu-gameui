@@ -16,7 +16,7 @@ use crate::text::{FontHandle, TextBlock};
 use crate::theme::Theme;
 use crate::widgets::{
     Button, Checkbox, DragCapture, DragId, DrawContext, DropdownState, FocusId, FocusState,
-    ScrollState, Slider, TextInput,
+    NumberInput, ScrollState, Slider, TextInput,
 };
 use crate::widgets::DrawList;
 use crate::InputState;
@@ -945,6 +945,67 @@ impl<'a> UiContext<'a> {
                 buffer.push_str(&ti.value);
             }
             changed
+        };
+        self.advance(height);
+        changed
+    }
+
+    /// Draw a numeric spin box bound to the caller's `value`. Validates and
+    /// clamps to `[min, max]`, stepping by `step` via +/- buttons, the mouse
+    /// wheel (while focused), and Up/Down arrows (while focused). `decimals`
+    /// sets the displayed precision (`0` = integer field). Returns whether the
+    /// value changed this frame; writes the (clamped) value back into `value`.
+    /// `w` defaults to [`default_field_width`](Self::default_field_width);
+    /// height is `theme.input_height`. Auto-advances by the height.
+    ///
+    /// Edit state (cursor/selection) persists in `UiState` keyed by `id`, in the
+    /// same map as [`text_input`](Self::text_input) — give number fields ids
+    /// distinct from any text field's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn number_input(
+        &mut self,
+        id: FocusId,
+        value: &mut f64,
+        min: f64,
+        max: f64,
+        step: f64,
+        decimals: usize,
+        w: Option<f32>,
+    ) -> bool {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return false,
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let height = theme.input_height;
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = Self::localize(inv, world, input);
+        let changed = {
+            let list = self.backend.list_mut();
+            let state = match self.state.as_mut() {
+                Some(s) => s,
+                None => {
+                    debug_assert!(false, "UiContext::number_input requires interactive state");
+                    return false;
+                }
+            };
+            let UiState {
+                text_inputs, focus, ..
+            } = &mut **state;
+            let ti = text_inputs
+                .entry(id)
+                .or_insert_with(|| TextInput::new(local.x, local.y, local.width, local.height));
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
+            let out = NumberInput::new()
+                .with_range(min, max)
+                .with_step(step)
+                .with_decimals(decimals)
+                .draw(*value, id, ti, local, &mut ctx);
+            if out.changed {
+                *value = out.value;
+            }
+            out.changed
         };
         self.advance(height);
         changed
