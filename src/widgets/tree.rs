@@ -152,7 +152,14 @@ impl TreeState {
 
     /// Resolve `id`'s expanded state, applying `default_open` the first time the
     /// id is ever seen. Returns the resulting expanded flag.
-    fn resolve_expanded(&mut self, id: TreeId, default_open: bool) -> bool {
+    ///
+    /// Public so an external layout that flattens the tree *before* drawing rows
+    /// (e.g. a scrolled, culled outliner that needs to know which branches are
+    /// open to decide what to emit) can query expansion with the same
+    /// default-applied-once semantics the row draw uses. Idempotent within a
+    /// frame: calling it here and again from [`TreeNode::draw`] for the same id
+    /// returns the same value and applies the default at most once.
+    pub fn resolve_expanded(&mut self, id: TreeId, default_open: bool) -> bool {
         if self.seen.insert(id) && default_open {
             self.expanded.insert(id);
         }
@@ -705,6 +712,23 @@ mod tests {
         assert!(s.is_expanded(3));
         s.collapse_all();
         assert!(!s.is_expanded(3));
+    }
+
+    #[test]
+    fn resolve_expanded_applies_default_once_and_is_idempotent() {
+        let mut s = TreeState::new();
+        // First sight with default_open=true marks it open.
+        assert!(s.resolve_expanded(7, true));
+        assert!(s.is_expanded(7));
+        // The user collapses it; a later resolve must NOT re-apply the default.
+        s.set_expanded(7, false);
+        assert!(!s.resolve_expanded(7, true), "default is applied at most once");
+        // Repeated calls within/across frames are stable (idempotent), matching
+        // what TreeNode::draw does for the same id after an external pre-query.
+        assert!(!s.resolve_expanded(7, true));
+        // A never-seen id with default_open=false starts collapsed.
+        assert!(!s.resolve_expanded(99, false));
+        assert!(!s.is_expanded(99));
     }
 
     #[test]
