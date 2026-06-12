@@ -16,8 +16,9 @@ use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DrawContext, DrawList, Dropdown, DropdownState,
     FocusState, ImageButton, ImageFit, InputState, LayerStack, NumberInput, ProgressBar, ScrollState,
     ScrollView, Slider, Table, TableCell, TableColumn, Tabs,
-    TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer, TreeNode,
-    TreeState, UiContext, UiRenderer, UiState, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE,
+    TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer, TreeAction,
+    TreeNode, TreeState, UiContext, UiRenderer, UiState, SLIDER_SCRUBBER_ICON,
+    SLIDER_TRACK_NINE_SLICE,
 };
 
 /// Convenience: build a DrawContext for a single draw call in the gallery.
@@ -555,11 +556,16 @@ fn render_widget_gallery() {
                 );
         }
 
-        // Tree view: a seeded hierarchy — an expanded branch with indented
-        // children (one selected), a collapsed branch, and a root leaf. Uses the
-        // raw `TreeNode` widget with idle input so nothing toggles.
-        let r = flow.cell(list, "Tree view", 160.0, 110.0);
+        // Tree view (outliner): a seeded hierarchy — an expanded branch with
+        // indented children (one selected), a collapsed branch, and a root leaf.
+        // Each row carries a leading "visibility" icon plus trailing
+        // rename/delete icons (their own hit targets), demonstrating the
+        // scene/layer-outliner shape. Idle input, so nothing toggles.
+        let r = flow.cell(list, "Tree view (outliner)", 200.0, 110.0);
         {
+            const VIS: u32 = 1;
+            const RENAME: u32 = 2;
+            const DEL: u32 = 3;
             let mut tree = TreeState::new();
             tree.set_expanded(1, true); // "Materials" expanded
             tree.set_expanded(4, false); // "Foliage" collapsed
@@ -569,6 +575,11 @@ fn render_widget_gallery() {
                 mouse_y: -1.0,
                 ..InputState::default()
             };
+            let leading = [TreeAction::sprite(VIS, ball)];
+            let trailing = [
+                TreeAction::sprite(RENAME, board),
+                TreeAction::sprite(DEL, suitcase),
+            ];
             let rows: [(u64, &str, bool, usize); 5] = [
                 (1, "Materials", false, 0),
                 (2, "Wood", true, 1),
@@ -582,6 +593,8 @@ fn render_widget_gallery() {
                 TreeNode::new(label)
                     .with_leaf(*leaf)
                     .with_depth(*depth)
+                    .with_leading(&leading)
+                    .with_trailing(&trailing)
                     .draw(*id, row, &mut tree, &mut tctx);
             }
         }

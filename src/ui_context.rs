@@ -16,7 +16,7 @@ use crate::text::{FontHandle, TextBlock};
 use crate::theme::Theme;
 use crate::widgets::{
     Button, Checkbox, DragCapture, DragId, DrawContext, DropdownState, FocusId, FocusState,
-    NumberInput, ScrollState, Slider, TextInput, TreeId, TreeNode, TreeState,
+    NumberInput, ScrollState, Slider, TextInput, TreeId, TreeNode, TreeNodeOutput, TreeState,
 };
 use crate::widgets::DrawList;
 use crate::InputState;
@@ -1018,6 +1018,58 @@ impl<'a> UiContext<'a> {
         changed
     }
 
+    /// Draw a fully-configured [`TreeNode`] at the current indentation depth and
+    /// return its [`TreeNodeOutput`]. This is the rich tree verb: it accepts
+    /// leading/trailing action icons, `leaf`, `default_open`, and the
+    /// `toggle_on_label` flag via the passed-in `node`. The façade injects the
+    /// depth, places + clips to the layout cursor, advances one row, and bumps
+    /// the indentation when the node is expanded — so on `expanded`, draw the
+    /// children and close with [`tree_pop`](Self::tree_pop):
+    ///
+    /// ```ignore
+    /// let out = ui.tree_row(id, TreeNode::new("Layer 1")
+    ///     .with_leading(&[TreeAction::sprite(VIS, eye)])
+    ///     .with_trailing(&[TreeAction::sprite(DEL, trash)]));
+    /// match out.action {
+    ///     Some(VIS) => layer.visible = !layer.visible,
+    ///     Some(DEL) => delete(layer),
+    ///     _ => {}
+    /// }
+    /// if out.expanded { /* children */ ui.tree_pop(); }
+    /// ```
+    ///
+    /// Expansion + selection persist in [`UiState::tree`] keyed by `id`.
+    pub fn tree_row(&mut self, id: TreeId, node: TreeNode) -> TreeNodeOutput {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return TreeNodeOutput::default(),
+        };
+        let height = theme.font_size.max(20.0);
+        let width = self.default_field_width();
+        let depth = self.tree_depth;
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = Self::localize(inv, world, input);
+        let out = {
+            let list = self.backend.list_mut();
+            let state = match self.state.as_mut() {
+                Some(s) => s,
+                None => {
+                    debug_assert!(false, "UiContext::tree_row requires interactive state");
+                    return TreeNodeOutput::default();
+                }
+            };
+            let UiState { tree, focus, .. } = &mut **state;
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
+            node.with_depth(depth).draw(id, local, tree, &mut ctx)
+        };
+        self.advance(height);
+        if out.expanded {
+            self.tree_depth += 1;
+        }
+        out
+    }
+
     /// Draw a collapsing **branch** node at the current indentation depth.
     /// Returns whether it is expanded — when `true`, draw its children (further
     /// `tree_node`/`tree_leaf` calls indent automatically) and close with
@@ -1031,90 +1083,38 @@ impl<'a> UiContext<'a> {
     /// }
     /// ```
     ///
-    /// Expansion + selection persist in [`UiState::tree`] keyed by `id` (any
-    /// per-tree-unique `u64`). Auto-advances by one row.
+    /// This is the no-icon convenience over [`tree_row`](Self::tree_row); the
+    /// whole row toggles (and selects). For action icons or outliner-style
+    /// "label selects, ▸ expands" behaviour, use `tree_row` with a configured
+    /// [`TreeNode`]. Expansion + selection persist in [`UiState::tree`] keyed by
+    /// `id`. Auto-advances by one row.
     pub fn tree_node(&mut self, id: TreeId, label: &str) -> bool {
-        self.tree_branch(id, label, false)
+        self.tree_row(id, TreeNode::new(label).with_toggle_on_label(true))
+            .expanded
     }
 
     /// Like [`tree_node`](Self::tree_node) but expanded the first time `id` is
     /// seen (thereafter the state in [`UiState::tree`] wins).
     pub fn tree_node_open(&mut self, id: TreeId, label: &str) -> bool {
-        self.tree_branch(id, label, true)
-    }
-
-    fn tree_branch(&mut self, id: TreeId, label: &str, default_open: bool) -> bool {
-        let (input, theme) = match self.interactive_refs() {
-            Some(v) => v,
-            None => return false,
-        };
-        let height = theme.font_size.max(20.0);
-        let width = self.default_field_width();
-        let depth = self.tree_depth;
-        let world = self.place_rect(width, height);
-        let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
-        let expanded = {
-            let list = self.backend.list_mut();
-            let state = match self.state.as_mut() {
-                Some(s) => s,
-                None => {
-                    debug_assert!(false, "UiContext::tree_node requires interactive state");
-                    return false;
-                }
-            };
-            let UiState { tree, focus, .. } = &mut **state;
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
+        self.tree_row(
+            id,
             TreeNode::new(label)
-                .with_depth(depth)
-                .with_default_open(default_open)
-                .draw(id, local, tree, &mut ctx)
-                .expanded
-        };
-        self.advance(height);
-        if expanded {
-            self.tree_depth += 1;
-        }
-        expanded
+                .with_default_open(true)
+                .with_toggle_on_label(true),
+        )
+        .expanded
     }
 
     /// Draw a **leaf** node (no disclosure, terminal) at the current depth.
     /// Returns whether it was clicked this frame; clicking also makes it the
     /// tree's selection ([`UiState::tree`]'s `selected`). Auto-advances one row.
     pub fn tree_leaf(&mut self, id: TreeId, label: &str) -> bool {
-        let (input, theme) = match self.interactive_refs() {
-            Some(v) => v,
-            None => return false,
-        };
-        let height = theme.font_size.max(20.0);
-        let width = self.default_field_width();
-        let depth = self.tree_depth;
-        let world = self.place_rect(width, height);
-        let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
-        let clicked = {
-            let list = self.backend.list_mut();
-            let state = match self.state.as_mut() {
-                Some(s) => s,
-                None => {
-                    debug_assert!(false, "UiContext::tree_leaf requires interactive state");
-                    return false;
-                }
-            };
-            let UiState { tree, focus, .. } = &mut **state;
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
-            TreeNode::leaf(label)
-                .with_depth(depth)
-                .draw(id, local, tree, &mut ctx)
-                .clicked
-        };
-        self.advance(height);
-        clicked
+        self.tree_row(id, TreeNode::leaf(label)).clicked
     }
 
     /// Close the most recent expanded [`tree_node`](Self::tree_node), restoring
-    /// the indentation depth. Call once for each `tree_node` that returned
-    /// `true`.
+    /// the indentation depth. Call once for each `tree_node`/`tree_row` that
+    /// returned an expanded node.
     pub fn tree_pop(&mut self) {
         self.tree_depth = self.tree_depth.saturating_sub(1);
     }

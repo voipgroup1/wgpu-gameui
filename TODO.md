@@ -124,16 +124,22 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [x] **P1 — Tree view / collapsing header.** `TreeNode`
       (`src/widgets/tree.rs`) draws one row — a disclosure triangle + indented
       label for *branches*, a terminal *leaf* otherwise — against a `Rect`/
-      `DrawContext`. Caller-owned `TreeState` holds the expanded set + a
-      single-owner selection (`select`/`is_selected`/`toggle`/`set_expanded`/
-      `collapse_all`); `with_default_open` expands a node the first time its
-      `TreeId` is seen. A click anywhere on a row selects it (and toggles a
-      branch); selection/hover highlight spans the full row width, honoring
-      `mouse_consumed`. Façade `UiContext::tree_node`/`tree_node_open` (returns
-      expanded → draw children → `tree_pop`) + `tree_leaf` (returns clicked),
-      with automatic per-depth indentation and auto-advance, backed by
-      `UiState::tree`. Keyboard arrow-nav deferred to the separate
-      keyboard-navigation P1.
+      `DrawContext`. **Action-icon slots** (`with_leading`/`with_trailing` taking
+      `&[TreeAction]`, sprite or string-key via `TreeIcon`) give the
+      scene/layer-outliner shape: a leading visibility toggle + right-aligned
+      rename/delete, each its own hit target — clicking one returns its
+      `TreeAction::id` via `TreeNodeOutput::action` and does *not* select/expand.
+      Interaction: the disclosure triangle toggles; the label/body selects (and
+      *also* toggles only with `with_toggle_on_label`); actions fire alone.
+      Caller-owned `TreeState` holds the expanded set + single-owner selection
+      (`select`/`is_selected`/`toggle`/`set_expanded`/`collapse_all`);
+      `with_default_open` expands a node the first time its `TreeId` is seen.
+      Highlight spans the full row width; honors `mouse_consumed`. Façade
+      `UiContext::tree_row(id, TreeNode)` → `TreeNodeOutput` is the rich verb;
+      `tree_node`/`tree_node_open` (whole-row toggle) + `tree_leaf` are the
+      no-icon convenience path, all with automatic per-depth indentation +
+      auto-advance and `tree_pop`, backed by `UiState::tree`. Keyboard arrow-nav
+      deferred to the separate keyboard-navigation P1.
 - [x] **P1 — Number input / spin box** with validation. `NumberInput`
       (`src/widgets/number_input.rs`) wraps a `TextInput` (inheriting cursor /
       selection / clipboard) around an `f64` value: parses + clamps to

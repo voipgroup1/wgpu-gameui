@@ -39,7 +39,7 @@ pub use table::{Align, ColumnWidth, Table, TableCell, TableColumn, TableOutput};
 pub use tabs::{Tabs, TabsOutput};
 pub use text_input::TextInput;
 pub use tooltip::{TooltipContent, TooltipLayer};
-pub use tree::{TreeId, TreeNode, TreeNodeOutput, TreeState};
+pub use tree::{TreeAction, TreeIcon, TreeId, TreeNode, TreeNodeOutput, TreeState};
 
 use crate::{InputState, Theme};
 
