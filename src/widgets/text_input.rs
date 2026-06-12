@@ -1,9 +1,75 @@
 //! Text input widget with selection, cursor navigation, and clipboard support.
 
-use crate::text::TextBlock;
+use crate::text::{TextBlock, TextSpan};
 use crate::InputState;
 
 use super::{DrawContext, FocusId};
+
+/// Snap a byte index to the nearest char boundary at or below it, clamped to
+/// `s.len()`. Guards the `value[..cursor]` slice in [`compose_preedit`] against
+/// a `cursor_pos` that lands inside a multi-byte UTF-8 sequence.
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Build the inline-composition display for a focused field that is composing
+/// an IME preedit.
+///
+/// Returns `(display_string, spans, caret_byte_in_display)` where:
+/// - `display_string` = `value[..cursor] + preedit + value[cursor..]`
+/// - `spans` = the before / preedit / after runs, with empty before/after
+///   segments omitted so we never emit zero-length spans. Only the preedit span
+///   carries `underline` (and `color: None`, so it inherits the block's normal
+///   colour — the standard IME convention of normal-coloured underlined text).
+/// - `caret_byte_in_display` = `cursor + (preedit_cursor.start | preedit.len())`,
+///   i.e. the caret sits inside the preedit where the IME asked, or at its end.
+///
+/// `cursor_pos` is clamped and snapped to a char boundary; `preedit_cursor`'s
+/// start is likewise snapped to a preedit char boundary.
+fn compose_preedit(
+    value: &str,
+    cursor_pos: usize,
+    preedit: &str,
+    preedit_cursor: Option<[usize; 2]>,
+    underline: [f32; 4],
+) -> (String, Vec<TextSpan>, usize) {
+    let cursor = floor_char_boundary(value, cursor_pos);
+    let before = &value[..cursor];
+    let after = &value[cursor..];
+
+    let mut display = String::with_capacity(value.len() + preedit.len());
+    display.push_str(before);
+    display.push_str(preedit);
+    display.push_str(after);
+
+    let mut spans = Vec::with_capacity(3);
+    if !before.is_empty() {
+        spans.push(TextSpan { text: before.to_string(), color: None, underline: None });
+    }
+    spans.push(TextSpan {
+        text: preedit.to_string(),
+        color: None,
+        underline: Some(underline),
+    });
+    if !after.is_empty() {
+        spans.push(TextSpan { text: after.to_string(), color: None, underline: None });
+    }
+
+    // Caret within the preedit: the IME's cursor start, snapped to a boundary,
+    // else the preedit end. Display-space byte = cursor + that offset.
+    let ime_caret = preedit_cursor
+        .map(|[start, _]| floor_char_boundary(preedit, start))
+        .unwrap_or(preedit.len());
+    let caret_byte = cursor + ime_caret;
+
+    (display, spans, caret_byte)
+}
 
 /// Byte-position snapping: find the closest cursor position to `click_x`
 /// by binary-searching the cursor-positions table.
@@ -469,6 +535,11 @@ impl TextInput {
             self.process_keyboard(input);
         }
 
+        // A live IME composition is shown inline (underlined) and supersedes the
+        // value selection; commit reuses the normal `text_input` path so the
+        // preedit itself is display-only and never mutates `self.value`.
+        let composing = focused && !input.preedit.is_empty();
+
         // ---- Draw background ----
         list.quad(
             self.x,
@@ -516,7 +587,7 @@ impl TextInput {
             (&self.value, theme.text)
         };
 
-        if focused && !self.value.is_empty() {
+        if focused && !composing && !self.value.is_empty() {
             // ---- Draw selection highlight ----
             if let Some((sel_start, sel_end)) = self.selection_range() {
                 if sel_start < sel_end {
@@ -543,19 +614,58 @@ impl TextInput {
             }
         }
 
-        let text = TextBlock::new(text_content, text_x, text_y)
-            .with_size(theme.font_size)
-            .with_color(
-                (text_color[0] * 255.0) as u8,
-                (text_color[1] * 255.0) as u8,
-                (text_color[2] * 255.0) as u8,
-            )
-            .with_max_width(text_max_w);
-        list.text(text);
+        // A composing field splices the underlined preedit into the value at
+        // the caret and renders it as spans; otherwise it's the plain value (or
+        // placeholder). `composed` is owned, so it is reused for the caret below.
+        let composed = if composing {
+            Some(compose_preedit(
+                &self.value,
+                self.cursor_pos,
+                &input.preedit,
+                input.preedit_cursor,
+                theme.text, // underline colour matches the text
+            ))
+        } else {
+            None
+        };
+
+        if let Some((_display, spans, _caret)) = &composed {
+            let text = TextBlock::new("", text_x, text_y)
+                .with_size(theme.font_size)
+                .with_color(
+                    (theme.text[0] * 255.0) as u8,
+                    (theme.text[1] * 255.0) as u8,
+                    (theme.text[2] * 255.0) as u8,
+                )
+                .with_max_width(text_max_w)
+                .with_spans(spans.clone());
+            list.text(text);
+        } else {
+            let text = TextBlock::new(text_content, text_x, text_y)
+                .with_size(theme.font_size)
+                .with_color(
+                    (text_color[0] * 255.0) as u8,
+                    (text_color[1] * 255.0) as u8,
+                    (text_color[2] * 255.0) as u8,
+                )
+                .with_max_width(text_max_w);
+            list.text(text);
+        }
 
         // ---- Draw cursor ----
         if focused {
-            let cursor_x = if self.value.is_empty() {
+            let cursor_x = if let Some((display, _spans, caret_byte)) = &composed {
+                // Caret position is measured on the composed display string so
+                // it sits inside the preedit where the IME asked.
+                let positions =
+                    list.text_cursor_positions(display, theme.font_size, Some(text_max_w));
+                let offset = positions
+                    .iter()
+                    .find(|&&(i, _)| i >= *caret_byte)
+                    .map(|&(_, x)| x)
+                    .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
+                text_x + offset
+            } else if self.value.is_empty() {
                 text_x
             } else {
                 let positions = list.text_cursor_positions(&self.value, theme.font_size, Some(text_max_w));
@@ -941,5 +1051,94 @@ mod tests {
         assert!(!focus.is_focused(0));
         assert!(!focus.is_focused(1));
         assert_eq!(focus.focused(), None);
+    }
+
+    // ---- IME preedit composition (compose_preedit) ----
+
+    const UL: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+    #[test]
+    fn compose_preedit_empty_value_single_underlined_span() {
+        let (display, spans, caret) = compose_preedit("", 0, "ㄓㄨ", None, UL);
+        assert_eq!(display, "ㄓㄨ");
+        assert_eq!(spans.len(), 1, "no before/after segments → one span");
+        assert_eq!(spans[0].text, "ㄓㄨ");
+        assert_eq!(spans[0].underline, Some(UL));
+        assert_eq!(spans[0].color, None, "preedit inherits the block colour");
+        // Caret at end of preedit (no preedit_cursor): 'ㄓㄨ' is 6 bytes.
+        assert_eq!(caret, 6);
+    }
+
+    #[test]
+    fn compose_preedit_caret_mid_value_splices_in_order() {
+        // value "abXYZ", caret after "ab" (byte 2), preedit "QQ".
+        let (display, spans, caret) = compose_preedit("abXYZ", 2, "QQ", None, UL);
+        assert_eq!(display, "abQQXYZ");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text, "ab");
+        assert_eq!(spans[0].underline, None);
+        assert_eq!(spans[1].text, "QQ");
+        assert_eq!(spans[1].underline, Some(UL));
+        assert_eq!(spans[2].text, "XYZ");
+        assert_eq!(spans[2].underline, None);
+        // Caret at end of preedit: 2 (before) + 2 (preedit) = 4.
+        assert_eq!(caret, 4);
+    }
+
+    #[test]
+    fn compose_preedit_uses_preedit_cursor_start() {
+        // preedit_cursor [1,1] → caret one byte into the preedit.
+        let (_display, _spans, caret) = compose_preedit("ab", 2, "QQ", Some([1, 1]), UL);
+        assert_eq!(caret, 2 + 1);
+    }
+
+    #[test]
+    fn compose_preedit_at_value_start_omits_before_span() {
+        let (display, spans, caret) = compose_preedit("xyz", 0, "PRE", None, UL);
+        assert_eq!(display, "PRExyz");
+        assert_eq!(spans.len(), 2, "empty before segment is omitted");
+        assert_eq!(spans[0].text, "PRE");
+        assert_eq!(spans[0].underline, Some(UL));
+        assert_eq!(spans[1].text, "xyz");
+        assert_eq!(caret, 3);
+    }
+
+    #[test]
+    fn compose_preedit_at_value_end_omits_after_span() {
+        let (display, spans, _caret) = compose_preedit("xyz", 3, "PRE", None, UL);
+        assert_eq!(display, "xyzPRE");
+        assert_eq!(spans.len(), 2, "empty after segment is omitted");
+        assert_eq!(spans[0].text, "xyz");
+        assert_eq!(spans[1].text, "PRE");
+        assert_eq!(spans[1].underline, Some(UL));
+    }
+
+    #[test]
+    fn compose_preedit_multibyte_value_and_preedit_on_boundaries() {
+        // value "あい" (each 3 bytes), caret after first char (byte 3),
+        // preedit "ん" (3 bytes).
+        let (display, spans, caret) = compose_preedit("あい", 3, "ん", None, UL);
+        assert_eq!(display, "あんい");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text, "あ");
+        assert_eq!(spans[1].text, "ん");
+        assert_eq!(spans[2].text, "い");
+        assert_eq!(caret, 6, "3 (before) + 3 (preedit)");
+    }
+
+    #[test]
+    fn compose_preedit_cursor_past_end_is_clamped() {
+        // A cursor_pos beyond the value length is clamped to value.len().
+        let (display, _spans, caret) = compose_preedit("ab", 999, "Q", None, UL);
+        assert_eq!(display, "abQ");
+        assert_eq!(caret, 3);
+    }
+
+    #[test]
+    fn floor_char_boundary_snaps_into_multibyte() {
+        // "é" = bytes [0,1]; index 1 is mid-char → snaps to 0.
+        assert_eq!(floor_char_boundary("é", 1), 0);
+        assert_eq!(floor_char_boundary("é", 2), 2);
+        assert_eq!(floor_char_boundary("é", 99), 2, "clamped to len");
     }
 }

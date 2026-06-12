@@ -111,6 +111,19 @@ pub struct InputState {
     pub text_input: String,
     pub backspace_pressed: bool,
     pub enter_pressed: bool,
+    /// The in-progress IME composition ("preedit") string, shown inline and
+    /// underlined inside the focused text field but NOT yet part of its value.
+    /// `""` when not composing. Set by the windowing layer on `Ime::Preedit`;
+    /// cleared (to `""`) on `Ime::Commit`/`Ime::Disabled`. This is held state
+    /// (like the modifier flags), so [`InputState::end_frame`] does NOT clear
+    /// it — the windowing layer owns its lifetime. Commit reuses the normal
+    /// [`InputState::text_input`] insertion path.
+    pub preedit: String,
+    /// Byte range `[start, end]` within [`InputState::preedit`] that the IME
+    /// marks as its cursor/selection (winit's `Ime::Preedit` second field). The
+    /// inline caret is drawn at `start`. `None` → caret at the end of the
+    /// preedit.
+    pub preedit_cursor: Option<[usize; 2]>,
     /// True when the layer dispatcher has decided this input is already
     /// consumed by a higher layer (modal, popup, etc.). Widgets must treat
     /// this as if the mouse is not over them and not clicking. Widgets that
@@ -177,6 +190,9 @@ impl InputState {
         self.text_input.clear();
         self.backspace_pressed = false;
         self.enter_pressed = false;
+        // `preedit`/`preedit_cursor` are deliberately NOT cleared here: the IME
+        // composition is held state owned by the windowing layer (set on
+        // `Ime::Preedit`, cleared on commit/disable), just like the modifiers.
         // `mouse_consumed` is a per-layer dispatch flag, not a per-frame
         // input event — it's set by the layer system every frame, so we
         // clear it here too for cleanliness.
@@ -229,6 +245,9 @@ impl InputState {
             text_input: String::new(),
             backspace_pressed: false,
             enter_pressed: false,
+            // A layer under a modal/popup must not see the composition either.
+            preedit: String::new(),
+            preedit_cursor: None,
             key_left: false,
             key_right: false,
             key_home: false,
@@ -313,5 +332,34 @@ mod input_state_tests {
         };
         i.end_frame();
         assert!(!i.mouse_right_released);
+    }
+
+    // ---- IME preedit ----
+
+    #[test]
+    fn preedit_survives_end_frame() {
+        // The composition is held state owned by the windowing layer, like the
+        // modifiers — end_frame must NOT drop it mid-composition.
+        let mut i = InputState {
+            preedit: "ㄓㄨ".into(),
+            preedit_cursor: Some([3, 3]),
+            ..InputState::default()
+        };
+        i.end_frame();
+        assert_eq!(i.preedit, "ㄓㄨ", "preedit must persist across end_frame");
+        assert_eq!(i.preedit_cursor, Some([3, 3]));
+    }
+
+    #[test]
+    fn consumed_clears_preedit() {
+        // A layer beneath a modal must not see the composition.
+        let i = InputState {
+            preedit: "ㄓㄨ".into(),
+            preedit_cursor: Some([3, 3]),
+            ..InputState::default()
+        };
+        let c = i.consumed();
+        assert!(c.preedit.is_empty(), "consumed must clear preedit");
+        assert_eq!(c.preedit_cursor, None);
     }
 }

@@ -479,6 +479,32 @@ fn render_widget_gallery() {
             .with_placeholder("Placeholder...")
             .draw(1, &mut ctx(list, &mut focus, &theme, &input));
 
+        // Text input mid-IME-composition: focused, with a non-empty preedit
+        // spliced into the value at the caret and rendered underlined. Uses a
+        // local focus+input so it doesn't disturb the shared focus owner above.
+        let r = flow.cell(list, "Text input (composing)", 200.0, 28.0);
+        {
+            const COMPOSE_ID: u64 = 200;
+            let mut compose_input = InputState::default();
+            compose_input.preedit = "nihongo".to_string();
+            let mut compose_focus = FocusState::new();
+            compose_focus.focus(COMPOSE_ID);
+            compose_focus.begin_frame(&compose_input);
+            let mut field = TextInput::new(r.x, r.y, r.width, r.height).with_value("ab cd");
+            field.cursor_pos = 3; // caret after "ab ", before "cd"
+            field.draw(
+                COMPOSE_ID,
+                &mut DrawContext::new(
+                    list,
+                    &mut compose_focus,
+                    &theme,
+                    &compose_input,
+                    W as f32,
+                    600.0,
+                ),
+            );
+        }
+
         // Dropdown, seeded open: the floating list (drawn after the base scope)
         // renders above whatever cells sit below it.
         let r = flow.cell(list, "Dropdown (open)", 160.0, 28.0);
