@@ -3,11 +3,15 @@
 mod button;
 mod checkbox;
 mod drag;
+mod drag_handle;
 mod draw_list;
 mod dropdown;
 mod focus;
+#[cfg(feature = "phosphor-icons")]
+mod icon;
 mod image;
 mod image_button;
+mod list;
 mod number_input;
 mod panel;
 mod progress_bar;
@@ -20,21 +24,27 @@ mod tooltip;
 mod tree;
 
 pub use button::Button;
-pub use checkbox::{Checkbox, CHECKBOX_CHECKED_ICON, CHECKBOX_ICON};
+pub use checkbox::{CHECKBOX_CHECKED_ICON, CHECKBOX_ICON, Checkbox};
 pub use drag::{DragCapture, DragId};
+pub use drag_handle::{DragHandle, DragHandleOutput};
 pub(crate) use draw_list::ColorCmd;
+#[cfg(feature = "phosphor-icons")]
+pub use draw_list::IconMsdf;
 pub use draw_list::{
     ChromeInstance, CircleInstance, DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex,
 };
 pub use dropdown::{Dropdown, DropdownId, DropdownOutput, DropdownState};
 pub use focus::{FocusId, FocusState};
+#[cfg(feature = "phosphor-icons")]
+pub use icon::Icon;
 pub use image::{Image, ImageAlign, ImageFit};
 pub use image_button::ImageButton;
+pub use list::{List, ListItem, ListOutput, ListState, SelectionMode};
 pub use number_input::{NumberInput, NumberOutput};
-pub use panel::{label, label_at, label_centered_at, title, title_at, Panel};
+pub use panel::{Panel, label, label_at, label_centered_at, title, title_at};
 pub use progress_bar::ProgressBar;
 pub use scroll_view::{ScrollBegin, ScrollState, ScrollView};
-pub use slider::{Slider, SliderOutput, SLIDER_SCRUBBER_ICON, SLIDER_TRACK_NINE_SLICE};
+pub use slider::{Slider, SliderOutput};
 pub use table::{Align, ColumnWidth, Table, TableCell, TableColumn, TableOutput};
 pub use tabs::{Tabs, TabsOutput};
 pub use text_input::TextInput;
@@ -95,5 +105,17 @@ impl<'a> DrawContext<'a> {
             Some(layer) => self.focus.register_layer(id, layer),
             None => self.focus.register(id),
         }
+    }
+
+    /// Draw the keyboard-focus ring around `rect`: a 2px rounded outline in
+    /// [`Theme::focus_ring`]. Focusable widgets call this when they hold focus so
+    /// every widget gets a consistent focus indicator from one place.
+    pub fn draw_focus_ring(&mut self, rect: crate::layout::Rect) {
+        self.draw_list.rounded_rect_outline(
+            rect,
+            self.theme.border_radius,
+            2.0,
+            self.theme.focus_ring,
+        );
     }
 }

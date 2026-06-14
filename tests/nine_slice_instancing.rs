@@ -181,11 +181,7 @@ fn panel_rects() -> Vec<Rect> {
 
 /// Emit the 9 cropped-image quads that reproduce the old CPU nine-slice
 /// tessellation for one panel `r`.
-fn reference_nine_slice(
-    list: &mut DrawList,
-    sprite: wgpu_gameui::render::SpriteId,
-    r: Rect,
-) {
+fn reference_nine_slice(list: &mut DrawList, sprite: wgpu_gameui::render::SpriteId, r: Rect) {
     let b = BORDER as f32;
     let s = SPRITE as f32;
     // Screen-space region stops.
@@ -255,10 +251,16 @@ fn instanced_nine_slice_matches_immediate() {
 
     // Persist for eyeballing.
     std::fs::create_dir_all("test_output").ok();
-    image::RgbaImage::from_raw(W, H, img_inst.clone())
-        .and_then(|i| i.save("test_output/nine_slice_instanced.png").ok().map(|_| i));
-    image::RgbaImage::from_raw(W, H, img_imm.clone())
-        .and_then(|i| i.save("test_output/nine_slice_immediate.png").ok().map(|_| i));
+    image::RgbaImage::from_raw(W, H, img_inst.clone()).and_then(|i| {
+        i.save("test_output/nine_slice_instanced.png")
+            .ok()
+            .map(|_| i)
+    });
+    image::RgbaImage::from_raw(W, H, img_imm.clone()).and_then(|i| {
+        i.save("test_output/nine_slice_immediate.png")
+            .ok()
+            .map(|_| i)
+    });
 
     assert_eq!(img_inst.len(), img_imm.len());
 

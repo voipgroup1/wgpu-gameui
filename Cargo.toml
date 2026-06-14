@@ -28,12 +28,17 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 notosans = { version = "0.1.0", optional = true }
 
 [features]
-default = ["bundled-font"]
+default = ["bundled-font", "phosphor-icons"]
 # Emit tracing spans around the render path for Tracy profiling.
 tracy = ["dep:tracing"]
 # Embed Noto Sans and register it as the default sans-serif family. Disable
 # (`--no-default-features`) to drop ~1.5 MB and fall back to system fonts only.
 bundled-font = ["dep:notosans"]
+# Embed the Phosphor (regular weight, MIT) icon font and expose the
+# `PhosphorIcon` enum + `Icon` widget, rendered through a dedicated MSDF icon
+# atlas. Disable (`--no-default-features`) to drop the ~0.5 MB font; widgets
+# fall back to text glyphs (`+`/`\u{2212}`) for their icon affordances.
+phosphor-icons = []
 
 [dev-dependencies]
 winit = "0.30"

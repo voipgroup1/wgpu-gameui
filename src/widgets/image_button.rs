@@ -23,7 +23,7 @@
 use crate::layout::Rect;
 use crate::{InputState, SpriteId, Theme};
 
-use super::button::{draw_chrome, ButtonVisual};
+use super::button::{ButtonVisual, draw_chrome};
 use super::{DrawList, Image, ImageAlign, ImageFit};
 
 /// Image / icon button — an [`Image`] with clickable button chrome.
@@ -119,6 +119,7 @@ impl ImageButton {
                 list,
                 theme,
                 rect,
+                theme.border_radius,
                 &ButtonVisual {
                     enabled: self.enabled,
                     hovered,
@@ -140,13 +141,31 @@ impl ImageButton {
         // State overlay on top of the image, so feedback shows even for
         // string-key sources whose tint can't be modulated.
         if !self.enabled {
-            list.quad(rect.x, rect.y, rect.width, rect.height, [0.0, 0.0, 0.0, 0.4]);
+            list.quad(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                [0.0, 0.0, 0.0, 0.4],
+            );
         } else if !self.chrome {
             // Bare buttons get their only feedback from the overlay.
             if pressed {
-                list.quad(rect.x, rect.y, rect.width, rect.height, [0.0, 0.0, 0.0, 0.2]);
+                list.quad(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    [0.0, 0.0, 0.0, 0.2],
+                );
             } else if hovered {
-                list.quad(rect.x, rect.y, rect.width, rect.height, [1.0, 1.0, 1.0, 0.08]);
+                list.quad(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    [1.0, 1.0, 1.0, 0.08],
+                );
             }
         }
 
@@ -196,9 +215,11 @@ mod tests {
         let mut list = DrawList::new();
         let theme = Theme::default();
         let input = input_at(50.0, 50.0, true, true);
-        assert!(!ImageButton::sprite(ID)
-            .enabled(false)
-            .draw(rect(), &mut list, &theme, &input));
+        assert!(
+            !ImageButton::sprite(ID)
+                .enabled(false)
+                .draw(rect(), &mut list, &theme, &input)
+        );
     }
 
     #[test]
@@ -238,7 +259,11 @@ mod tests {
             .draw(rect(), &mut bare, &theme, &input);
         // Chrome records one instanced rounded-rect (background + border); the
         // bare variant draws no chrome instance.
-        assert_eq!(chrome.chrome_instances.len(), 1, "chrome draws one instance");
+        assert_eq!(
+            chrome.chrome_instances.len(),
+            1,
+            "chrome draws one instance"
+        );
         assert!(bare.chrome_instances.is_empty(), "bare draws no chrome");
     }
 
@@ -246,13 +271,19 @@ mod tests {
     fn bare_hover_adds_overlay() {
         let theme = Theme::default();
         let mut idle = DrawList::new();
-        ImageButton::sprite(ID)
-            .bare()
-            .draw(rect(), &mut idle, &theme, &input_at(0.0, 0.0, false, false));
+        ImageButton::sprite(ID).bare().draw(
+            rect(),
+            &mut idle,
+            &theme,
+            &input_at(0.0, 0.0, false, false),
+        );
         let mut hot = DrawList::new();
-        ImageButton::sprite(ID)
-            .bare()
-            .draw(rect(), &mut hot, &theme, &input_at(50.0, 50.0, false, false));
+        ImageButton::sprite(ID).bare().draw(
+            rect(),
+            &mut hot,
+            &theme,
+            &input_at(50.0, 50.0, false, false),
+        );
         assert!(
             hot.chrome_instances.len() > idle.chrome_instances.len(),
             "hover overlay should add a quad (instanced)"
@@ -263,14 +294,19 @@ mod tests {
     fn disabled_adds_dim_overlay() {
         let theme = Theme::default();
         let mut enabled = DrawList::new();
-        ImageButton::sprite(ID)
-            .bare()
-            .draw(rect(), &mut enabled, &theme, &input_at(0.0, 0.0, false, false));
+        ImageButton::sprite(ID).bare().draw(
+            rect(),
+            &mut enabled,
+            &theme,
+            &input_at(0.0, 0.0, false, false),
+        );
         let mut disabled = DrawList::new();
-        ImageButton::sprite(ID)
-            .bare()
-            .enabled(false)
-            .draw(rect(), &mut disabled, &theme, &input_at(0.0, 0.0, false, false));
+        ImageButton::sprite(ID).bare().enabled(false).draw(
+            rect(),
+            &mut disabled,
+            &theme,
+            &input_at(0.0, 0.0, false, false),
+        );
         assert!(
             disabled.chrome_instances.len() > enabled.chrome_instances.len(),
             "disabled dim overlay should add a quad (instanced)"
@@ -282,7 +318,12 @@ mod tests {
         let mut list = DrawList::new();
         let theme = Theme::default();
         let input = input_at(0.0, 0.0, true, true);
-        assert!(!ImageButton::sprite(ID).draw(Rect::new(0.0, 0.0, 0.0, 50.0), &mut list, &theme, &input));
+        assert!(!ImageButton::sprite(ID).draw(
+            Rect::new(0.0, 0.0, 0.0, 50.0),
+            &mut list,
+            &theme,
+            &input
+        ));
         assert!(list.icons.is_empty());
         assert!(list.vertices.is_empty());
     }

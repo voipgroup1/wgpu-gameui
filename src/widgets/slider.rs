@@ -3,13 +3,7 @@
 use crate::layout::Rect;
 use crate::text::TextBlock;
 
-use super::{DragCapture, DragId, DrawContext};
-
-/// Icon key for the scrubber texture (must be loaded into the icon atlas).
-pub const SLIDER_SCRUBBER_ICON: &str = "textures/ui/scrubber.png";
-
-/// Nine-slice key for the track texture.
-pub const SLIDER_TRACK_NINE_SLICE: &str = "track";
+use super::{DragCapture, DragId, DrawContext, FocusId};
 
 /// Output from drawing a slider.
 pub struct SliderOutput {
@@ -23,8 +17,11 @@ pub struct SliderOutput {
 
 /// Slider widget - a horizontal track with a draggable scrubber handle.
 ///
-/// The scrubber is drawn as an icon (not nine-sliced) and is capped at 20px tall.
-/// The track is nine-sliced horizontally.
+/// Rendering is fully procedural (no textures): a rounded "pill" track filled
+/// with `theme.accent` up to the current value, and a circular knob (capped at
+/// 20px) drawn with `theme.text` + a `theme.button_border` outline. Sizes and
+/// colours derive from the [`Theme`](crate::Theme), so it re-themes and
+/// DPI-scales like the rest of the UI.
 ///
 /// Drag ownership is arbitrated through a caller-owned [`DragCapture`] keyed by
 /// a stable [`DragId`], so adjacent or overlapping sliders never both follow a
@@ -45,6 +42,9 @@ pub struct Slider {
     max: f32,
     step: Option<f32>,
     show_value: bool,
+    /// When set, the slider joins the Tab ring under this [`FocusId`] and can be
+    /// adjusted with the arrow keys while focused.
+    focus_id: Option<FocusId>,
 }
 
 impl Slider {
@@ -54,7 +54,17 @@ impl Slider {
             max,
             step: None,
             show_value: false,
+            focus_id: None,
         }
+    }
+
+    /// Make the slider keyboard-focusable under `id` (a [`FocusId`], distinct
+    /// from the [`DragId`] used for drag arbitration): it joins the Tab ring,
+    /// draws a focus ring while focused, and adjusts on Left/Down (decrement) and
+    /// Right/Up (increment) by `step` (or 1/20 of the range when no step is set).
+    pub fn focusable(mut self, id: FocusId) -> Self {
+        self.focus_id = Some(id);
+        self
     }
 
     /// Snap to discrete steps (e.g., 1.0 for integer values).
@@ -83,9 +93,17 @@ impl Slider {
         rect: Rect,
         ctx: &mut DrawContext,
     ) -> SliderOutput {
-        let list = &mut *ctx.draw_list;
-        let theme = ctx.theme;
+        // Snapshot the input fields up front so we can mutate `ctx` (focus
+        // registration) later without holding a borrow on `ctx.input`.
         let input = ctx.input;
+        let mouse_x = input.mouse_x;
+        let mouse_y = input.mouse_y;
+        let mouse_down = input.mouse_down;
+        let mouse_clicked = input.mouse_clicked;
+        let mouse_consumed = input.mouse_consumed;
+        let kb_dec = input.key_left || input.key_down;
+        let kb_inc = input.key_right || input.key_up;
+
         let scrubber_size = rect.height.min(20.0);
         let value_text_width = if self.show_value { 40.0 } else { 0.0 };
 
@@ -106,16 +124,17 @@ impl Slider {
         // Honor layer capture (`mouse_consumed`) so a slider under a modal/popup
         // doesn't grab the drag.
         let track_rect = Rect::new(rect.x, rect.y, track_width, rect.height);
-        let hovered = track_rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
+        let hovered = track_rect.contains(mouse_x, mouse_y) && !mouse_consumed;
 
         // Release first so a mouse-up frame reports not-dragging. `release` is a
         // no-op unless we own the capture, so it never clobbers another
         // slider's active drag.
-        if !input.mouse_down {
+        if !mouse_down {
             capture.release(id);
         }
         // Then claim the drag if nothing else already owns it this gesture.
-        if hovered && input.mouse_clicked && capture.is_free() {
+        let claimed_now = hovered && mouse_clicked && capture.is_free();
+        if claimed_now {
             capture.try_begin(id);
         }
         let dragging = capture.is_active(id);
@@ -123,7 +142,7 @@ impl Slider {
         // Calculate new value from mouse position while dragging
         let mut new_value = value;
         if dragging && slide_range > 0.0 {
-            let mouse_t = ((input.mouse_x - slide_left) / slide_range).clamp(0.0, 1.0);
+            let mouse_t = ((mouse_x - slide_left) / slide_range).clamp(0.0, 1.0);
             new_value = self.min + mouse_t * range;
 
             if let Some(step) = self.step {
@@ -132,7 +151,32 @@ impl Slider {
             new_value = new_value.clamp(self.min, self.max);
         }
 
+        // Keyboard focus + arrow-key adjustment (opt-in via `focusable`).
+        let mut focused = false;
+        if let Some(fid) = self.focus_id {
+            ctx.register_focus(fid);
+            if claimed_now {
+                ctx.focus.request(fid);
+            }
+            focused = ctx.focus.is_focused(fid);
+            if focused && (kb_dec || kb_inc) {
+                let kb_step = self.step.unwrap_or_else(|| (range / 20.0).abs());
+                if kb_dec {
+                    new_value -= kb_step;
+                }
+                if kb_inc {
+                    new_value += kb_step;
+                }
+                if let Some(step) = self.step {
+                    new_value = (new_value / step).round() * step;
+                }
+                new_value = new_value.clamp(self.min, self.max);
+            }
+        }
+
         let changed = (new_value - value).abs() > f32::EPSILON;
+        let theme = ctx.theme;
+        let list = &mut *ctx.draw_list;
 
         // Recalculate scrubber position with potentially updated value
         let display_t = if range > 0.0 {
@@ -142,18 +186,43 @@ impl Slider {
         };
         let display_scrubber_x = slide_left + display_t * slide_range;
 
-        // Draw track (nine-slice)
-        list.nine_slice(rect.x, track_y, track_width, track_height, SLIDER_TRACK_NINE_SLICE);
+        // ---- Track (procedural rounded pill) ----
+        let track_rect = Rect::new(rect.x, track_y, track_width, track_height);
+        let track_radius = track_height * 0.5;
+        list.rounded_rect(track_rect, track_radius, theme.input_background);
 
-        // Draw scrubber (icon, centered on current position)
-        let scrubber_x = display_scrubber_x - scrubber_size / 2.0;
-        let scrubber_y = rect.y + (rect.height - scrubber_size) / 2.0;
-        list.icon(SLIDER_SCRUBBER_ICON, scrubber_x, scrubber_y, scrubber_size, scrubber_size);
-
-        // Hover highlight on scrubber
-        if dragging || hovered {
-            list.quad(scrubber_x, scrubber_y, scrubber_size, scrubber_size, [1.0, 1.0, 1.0, 0.06]);
+        // Filled portion: from the track's left up to the knob centre.
+        let fill_w = (display_scrubber_x - rect.x).clamp(0.0, track_width);
+        if fill_w > 0.0 {
+            list.rounded_rect(
+                Rect::new(rect.x, track_y, fill_w, track_height),
+                track_radius,
+                theme.accent,
+            );
         }
+
+        // Subtle outline for definition, matching the rounded inputs.
+        list.rounded_rect_outline(
+            track_rect,
+            track_radius,
+            theme.border_width,
+            theme.input_border,
+        );
+
+        // ---- Scrubber (procedural circle handle) ----
+        let knob_center = (display_scrubber_x, rect.y + rect.height * 0.5);
+        let knob_radius = scrubber_size * 0.5;
+        // Hover/drag halo behind the knob.
+        if dragging || hovered {
+            list.circle(knob_center, knob_radius + 2.0, [1.0, 1.0, 1.0, 0.10]);
+        }
+        list.circle(knob_center, knob_radius, theme.text);
+        list.circle_outline(
+            knob_center,
+            knob_radius,
+            theme.border_width.max(1.0),
+            theme.button_border,
+        );
 
         // Value text
         if self.show_value {
@@ -165,7 +234,13 @@ impl Slider {
             let text_color = theme.text;
             let font_size = theme.font_size * 0.8;
             let text_x = rect.x + track_width + 6.0;
-            let text_y = rect.y + (rect.height - font_size) / 2.0;
+            let text_y = list.vcentered_text_y(
+                rect.y,
+                rect.height,
+                font_size,
+                theme.font.as_ref(),
+                &display,
+            );
             let block = TextBlock::new(&display, text_x, text_y)
                 .with_size(font_size)
                 .with_color(
@@ -175,6 +250,10 @@ impl Slider {
                 )
                 .with_font_opt(theme.font.clone());
             list.text(block);
+        }
+
+        if focused {
+            ctx.draw_focus_ring(rect);
         }
 
         SliderOutput {
@@ -257,7 +336,10 @@ mod tests {
         let out = draw_slider(&slider, 50.0, 0, &mut cap, rect(), &input);
         assert!(out.dragging, "click inside the track should begin a drag");
         assert!(cap.is_active(0));
-        assert!(out.value > 50.0, "dragging to the right edge raises the value");
+        assert!(
+            out.value > 50.0,
+            "dragging to the right edge raises the value"
+        );
     }
 
     #[test]
@@ -289,7 +371,10 @@ mod tests {
         let a1 = draw_slider(&slider, 10.0, 0, &mut cap, r, &down);
         let b1 = draw_slider(&slider, 90.0, 1, &mut cap, r, &down);
         assert!(a1.dragging, "first slider claims the drag");
-        assert!(!b1.dragging, "second slider must not also grab the same press");
+        assert!(
+            !b1.dragging,
+            "second slider must not also grab the same press"
+        );
         assert!(cap.is_active(0));
 
         // Frame 2: mouse moves while held. Only A tracks it.
@@ -314,7 +399,10 @@ mod tests {
         // tracking because capture, not hit-testing, gates an in-progress drag.
         let mov = hold_at(95.0, 500.0);
         let out = draw_slider(&slider, value, 0, &mut cap, r, &mov);
-        assert!(out.dragging, "held drag continues even when cursor leaves the rect");
+        assert!(
+            out.dragging,
+            "held drag continues even when cursor leaves the rect"
+        );
         value = out.value;
         assert!(value > 50.0);
 
@@ -333,5 +421,169 @@ mod tests {
         let out = draw_slider(&slider, 50.0, 0, &mut cap, rect(), &input);
         assert!(!out.dragging);
         assert!(cap.is_free());
+    }
+
+    // ---- Keyboard focus / arrow adjustment ----
+
+    /// Draw a slider with an explicitly seeded focus state.
+    fn draw_slider_focused(
+        slider: &Slider,
+        value: f32,
+        id: DragId,
+        cap: &mut DragCapture,
+        focus: &mut FocusState,
+        input: &InputState,
+    ) -> SliderOutput {
+        let mut list = DrawList::new();
+        let theme = theme();
+        let mut ctx = DrawContext::new(&mut list, focus, &theme, input, 800.0, 600.0);
+        slider.draw(value, id, cap, rect(), &mut ctx)
+    }
+
+    fn arrow(left: bool, right: bool, up: bool, down: bool) -> InputState {
+        InputState {
+            mouse_x: -1.0,
+            mouse_y: -1.0,
+            key_left: left,
+            key_right: right,
+            key_up: up,
+            key_down: down,
+            ..InputState::default()
+        }
+    }
+
+    #[test]
+    fn arrows_adjust_only_when_focused() {
+        let slider = Slider::new(0.0, 100.0).focusable(42);
+        // Unfocused: Right is ignored.
+        let mut cap = DragCapture::new();
+        let mut focus = FocusState::new();
+        let out = draw_slider_focused(
+            &slider,
+            50.0,
+            0,
+            &mut cap,
+            &mut focus,
+            &arrow(false, true, false, false),
+        );
+        assert!(!out.changed, "arrows must not move an unfocused slider");
+        assert_eq!(out.value, 50.0);
+        // Focused: Right increments by 1/20 of the range (5.0).
+        let mut cap = DragCapture::new();
+        let mut focus = FocusState::new();
+        focus.focus(42);
+        let out = draw_slider_focused(
+            &slider,
+            50.0,
+            0,
+            &mut cap,
+            &mut focus,
+            &arrow(false, true, false, false),
+        );
+        assert!(out.changed);
+        assert!(
+            (out.value - 55.0).abs() < 1e-3,
+            "Right increments by range/20"
+        );
+    }
+
+    #[test]
+    fn left_decrements_when_focused() {
+        let slider = Slider::new(0.0, 100.0).focusable(42);
+        let mut cap = DragCapture::new();
+        let mut focus = FocusState::new();
+        focus.focus(42);
+        let out = draw_slider_focused(
+            &slider,
+            50.0,
+            0,
+            &mut cap,
+            &mut focus,
+            &arrow(true, false, false, false),
+        );
+        assert!(
+            (out.value - 45.0).abs() < 1e-3,
+            "Left decrements by range/20"
+        );
+    }
+
+    #[test]
+    fn arrows_clamp_to_range() {
+        let slider = Slider::new(0.0, 100.0).focusable(42);
+        // Down at the floor stays at min.
+        let mut cap = DragCapture::new();
+        let mut focus = FocusState::new();
+        focus.focus(42);
+        let out = draw_slider_focused(
+            &slider,
+            0.0,
+            0,
+            &mut cap,
+            &mut focus,
+            &arrow(false, false, false, true),
+        );
+        assert_eq!(out.value, 0.0, "Down clamps at min");
+        // Up at the ceiling stays at max.
+        let mut cap = DragCapture::new();
+        let mut focus = FocusState::new();
+        focus.focus(42);
+        let out = draw_slider_focused(
+            &slider,
+            100.0,
+            0,
+            &mut cap,
+            &mut focus,
+            &arrow(false, false, true, false),
+        );
+        assert_eq!(out.value, 100.0, "Up clamps at max");
+    }
+
+    #[test]
+    fn arrow_step_uses_explicit_step() {
+        let slider = Slider::new(0.0, 10.0).with_step(1.0).focusable(42);
+        let mut cap = DragCapture::new();
+        let mut focus = FocusState::new();
+        focus.focus(42);
+        let out = draw_slider_focused(
+            &slider,
+            5.0,
+            0,
+            &mut cap,
+            &mut focus,
+            &arrow(false, true, false, false),
+        );
+        assert_eq!(out.value, 6.0, "explicit step drives keyboard increments");
+    }
+
+    #[test]
+    fn focus_ring_drawn_only_when_focused() {
+        let slider = Slider::new(0.0, 100.0).focusable(42);
+        let idle = InputState {
+            mouse_x: -1.0,
+            mouse_y: -1.0,
+            ..InputState::default()
+        };
+        // Unfocused.
+        let mut cap = DragCapture::new();
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = theme();
+        {
+            let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &idle, 800.0, 600.0);
+            slider.draw(50.0, 0, &mut cap, rect(), &mut ctx);
+        }
+        let unfocused_chrome = list.chrome_instances.len();
+        // Focused.
+        let mut focus = FocusState::new();
+        focus.focus(42);
+        let mut list = DrawList::new();
+        {
+            let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &idle, 800.0, 600.0);
+            slider.draw(50.0, 0, &mut cap, rect(), &mut ctx);
+        }
+        assert!(
+            list.chrome_instances.len() > unfocused_chrome,
+            "focus ring adds outline geometry"
+        );
     }
 }

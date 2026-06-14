@@ -22,8 +22,8 @@
 //!     .draw(dest_rect, &mut list);
 //! ```
 
-use crate::layout::Rect;
 use crate::SpriteId;
+use crate::layout::Rect;
 
 use super::DrawList;
 
@@ -221,13 +221,18 @@ mod tests {
     fn stretch_fills_dest_exactly() {
         let mut list = DrawList::new();
         let dest = Rect::new(10.0, 20.0, 200.0, 100.0);
-        Image::sprite(ID).fit(ImageFit::Stretch).draw(dest, &mut list);
+        Image::sprite(ID)
+            .fit(ImageFit::Stretch)
+            .draw(dest, &mut list);
         let r = drawn_rect(&list);
         approx(r.x, 10.0);
         approx(r.y, 20.0);
         approx(r.width, 200.0);
         approx(r.height, 100.0);
-        assert!(list.icons[0].src.is_none(), "stretch draws the whole sprite");
+        assert!(
+            list.icons[0].src.is_none(),
+            "stretch draws the whole sprite"
+        );
     }
 
     #[test]
@@ -343,7 +348,9 @@ mod tests {
         let mut list = DrawList::new();
         let dest = Rect::new(5.0, 5.0, 60.0, 40.0);
         // Contain without a natural size can't preserve aspect -> fills the box.
-        Image::sprite(ID).fit(ImageFit::Contain).draw(dest, &mut list);
+        Image::sprite(ID)
+            .fit(ImageFit::Contain)
+            .draw(dest, &mut list);
         let r = drawn_rect(&list);
         approx(r.width, 60.0);
         approx(r.height, 40.0);
@@ -353,7 +360,9 @@ mod tests {
     fn tint_passes_through_on_sprite_source() {
         let mut list = DrawList::new();
         let dest = Rect::new(0.0, 0.0, 10.0, 10.0);
-        Image::sprite(ID).tint([1.0, 0.0, 0.0, 0.5]).draw(dest, &mut list);
+        Image::sprite(ID)
+            .tint([1.0, 0.0, 0.0, 0.5])
+            .draw(dest, &mut list);
         assert_eq!(list.icons[0].tint, [1.0, 0.0, 0.0, 0.5]);
     }
 

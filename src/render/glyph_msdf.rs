@@ -143,8 +143,11 @@ pub fn generate_glyph_msdf(
     let mut shape = shape;
     shape.transform(&affine);
 
-    let colored =
-        Shape::<ColoredContour>::edge_coloring_simple(shape, EDGE_COLORING_SIN_ALPHA, EDGE_COLORING_SEED);
+    let colored = Shape::<ColoredContour>::edge_coloring_simple(
+        shape,
+        EDGE_COLORING_SIN_ALPHA,
+        EDGE_COLORING_SEED,
+    );
     let prepared = colored.prepare();
 
     let mut image = RgbImage::new(width_px, height_px);
@@ -272,6 +275,9 @@ mod tests {
             generated += 1;
         }
         eprintln!("wrote {generated} glyph MSDFs to {}", dir.display());
-        assert!(generated > 90, "expected most of printable ASCII to generate");
+        assert!(
+            generated > 90,
+            "expected most of printable ASCII to generate"
+        );
     }
 }

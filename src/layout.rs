@@ -34,7 +34,12 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn zero() -> Self {
@@ -95,12 +100,14 @@ impl Anchor {
     pub fn resolve(&self, parent: Rect, width: f32, height: f32) -> (f32, f32) {
         match *self {
             Anchor::TopLeft { offset } => (parent.x + offset.0, parent.y + offset.1),
-            Anchor::TopRight { offset } => {
-                (parent.x + parent.width - width + offset.0, parent.y + offset.1)
-            }
-            Anchor::BottomLeft { offset } => {
-                (parent.x + offset.0, parent.y + parent.height - height + offset.1)
-            }
+            Anchor::TopRight { offset } => (
+                parent.x + parent.width - width + offset.0,
+                parent.y + offset.1,
+            ),
+            Anchor::BottomLeft { offset } => (
+                parent.x + offset.0,
+                parent.y + parent.height - height + offset.1,
+            ),
             Anchor::BottomRight { offset } => (
                 parent.x + parent.width - width + offset.0,
                 parent.y + parent.height - height + offset.1,
@@ -109,16 +116,18 @@ impl Anchor {
                 parent.x + (parent.width - width) / 2.0 + offset.0,
                 parent.y + (parent.height - height) / 2.0 + offset.1,
             ),
-            Anchor::TopCenter { offset } => {
-                (parent.x + (parent.width - width) / 2.0 + offset.0, parent.y + offset.1)
-            }
+            Anchor::TopCenter { offset } => (
+                parent.x + (parent.width - width) / 2.0 + offset.0,
+                parent.y + offset.1,
+            ),
             Anchor::BottomCenter { offset } => (
                 parent.x + (parent.width - width) / 2.0 + offset.0,
                 parent.y + parent.height - height + offset.1,
             ),
-            Anchor::LeftCenter { offset } => {
-                (parent.x + offset.0, parent.y + (parent.height - height) / 2.0 + offset.1)
-            }
+            Anchor::LeftCenter { offset } => (
+                parent.x + offset.0,
+                parent.y + (parent.height - height) / 2.0 + offset.1,
+            ),
             Anchor::RightCenter { offset } => (
                 parent.x + parent.width - width + offset.0,
                 parent.y + (parent.height - height) / 2.0 + offset.1,
@@ -172,21 +181,33 @@ pub struct Constraint {
 
 impl Constraint {
     /// No bounds (the default).
-    pub const NONE: Self = Self { min: None, max: None };
+    pub const NONE: Self = Self {
+        min: None,
+        max: None,
+    };
 
     /// Lower bound only.
     pub fn min(min: f32) -> Self {
-        Self { min: Some(min), max: None }
+        Self {
+            min: Some(min),
+            max: None,
+        }
     }
 
     /// Upper bound only.
     pub fn max(max: f32) -> Self {
-        Self { min: None, max: Some(max) }
+        Self {
+            min: None,
+            max: Some(max),
+        }
     }
 
     /// Both bounds.
     pub fn between(min: f32, max: f32) -> Self {
-        Self { min: Some(min), max: Some(max) }
+        Self {
+            min: Some(min),
+            max: Some(max),
+        }
     }
 
     /// Set the lower bound, keeping any existing upper bound.
@@ -349,7 +370,11 @@ pub struct Positioned<T> {
 
 impl<T> Positioned<T> {
     pub fn new(anchor: Anchor, size: Size, child: T) -> Self {
-        Self { anchor, size, child }
+        Self {
+            anchor,
+            size,
+            child,
+        }
     }
 
     /// Layout starting from screen coordinates.
@@ -785,7 +810,9 @@ mod tests {
     #[test]
     fn test_anchor_top_right() {
         let screen = Rect::new(0.0, 0.0, 1280.0, 720.0);
-        let anchor = Anchor::TopRight { offset: (-10.0, 10.0) };
+        let anchor = Anchor::TopRight {
+            offset: (-10.0, 10.0),
+        };
         let (x, y) = anchor.resolve(screen, 80.0, 120.0);
         assert_eq!(x, 1280.0 - 80.0 - 10.0); // 1190
         assert_eq!(y, 10.0);
@@ -795,8 +822,8 @@ mod tests {
     fn test_vstack_layout() {
         let stack = VStack::new(8.0)
             .with_padding(10.0)
-            .child(30.0, 60.0)  // button
-            .child(20.0, 60.0)  // label
+            .child(30.0, 60.0) // button
+            .child(20.0, 60.0) // label
             .child(30.0, 60.0); // button
 
         let bounds = Rect::new(100.0, 50.0, 80.0, 150.0);
@@ -849,7 +876,10 @@ mod tests {
         // the leaf is lifted by min_height.
         let node = Positioned::new(
             Anchor::TopLeft { offset: (0.0, 0.0) },
-            Size::fill().max_width(300.0).height_fixed(20.0).min_height(50.0),
+            Size::fill()
+                .max_width(300.0)
+                .height_fixed(20.0)
+                .min_height(50.0),
             Leaf::new(10.0, 10.0),
         );
         let result = node.layout(Rect::new(0.0, 0.0, 1000.0, 1000.0));
@@ -899,7 +929,9 @@ mod tests {
     #[test]
     fn test_positioned_top_right() {
         let layout = Positioned::new(
-            Anchor::TopRight { offset: (-10.0, 10.0) },
+            Anchor::TopRight {
+                offset: (-10.0, 10.0),
+            },
             Size::fixed(80.0, 120.0),
             Leaf::new(80.0, 120.0),
         );
@@ -929,12 +961,14 @@ mod tests {
     fn test_floor_switcher_layout() {
         // Define the layout once
         let floor_switcher = Positioned::new(
-            Anchor::TopRight { offset: (-10.0, 10.0) },
+            Anchor::TopRight {
+                offset: (-10.0, 10.0),
+            },
             Size::fixed(80.0, 110.0),
             VStack::new(5.0)
                 .with_padding(5.0)
-                .child(30.0, 70.0)  // up button
-                .child(24.0, 70.0)  // floor label
+                .child(30.0, 70.0) // up button
+                .child(24.0, 70.0) // floor label
                 .child(30.0, 70.0), // down button
         );
 
@@ -951,7 +985,7 @@ mod tests {
         // Up button (index 1)
         let up_btn = result.get(1);
         assert_eq!(up_btn.x, 1190.0 + 5.0); // container.x + padding
-        assert_eq!(up_btn.y, 10.0 + 5.0);   // container.y + padding
+        assert_eq!(up_btn.y, 10.0 + 5.0); // container.y + padding
         assert_eq!(up_btn.height, 30.0);
 
         // Floor label (index 2)
@@ -1018,17 +1052,18 @@ mod tests {
 
     #[test]
     fn vstack_align_start_pins_left() {
-        let stack = VStack::new(0.0)
-            .child(30.0, 40.0).align(CrossAlign::Start);
+        let stack = VStack::new(0.0).child(30.0, 40.0).align(CrossAlign::Start);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         assert_eq!(result.rects[1].x, 10.0, "start aligns to left edge");
-        assert_eq!(result.rects[1].width, 40.0, "start uses cross_size, not inner_width");
+        assert_eq!(
+            result.rects[1].width, 40.0,
+            "start uses cross_size, not inner_width"
+        );
     }
 
     #[test]
     fn vstack_align_center_centers_horizontally() {
-        let stack = VStack::new(0.0)
-            .child(30.0, 40.0).align(CrossAlign::Center);
+        let stack = VStack::new(0.0).child(30.0, 40.0).align(CrossAlign::Center);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_width = 100 (no padding), center = 10 + (100 - 40) / 2 = 40
         assert_eq!(result.rects[1].x, 40.0);
@@ -1037,8 +1072,7 @@ mod tests {
 
     #[test]
     fn vstack_align_end_pins_right() {
-        let stack = VStack::new(0.0)
-            .child(30.0, 40.0).align(CrossAlign::End);
+        let stack = VStack::new(0.0).child(30.0, 40.0).align(CrossAlign::End);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_width = 100, end = 10 + 100 - 40 = 70
         assert_eq!(result.rects[1].x, 70.0);
@@ -1047,8 +1081,10 @@ mod tests {
 
     #[test]
     fn vstack_align_respects_padding() {
-        let stack = VStack::new(0.0).with_padding(10.0)
-            .child(30.0, 40.0).align(CrossAlign::Center);
+        let stack = VStack::new(0.0)
+            .with_padding(10.0)
+            .child(30.0, 40.0)
+            .align(CrossAlign::Center);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_width = 100 - 20 = 80, center x = 10 + 10 + (80 - 40) / 2 = 40
         assert_eq!(result.rects[1].x, 40.0);
@@ -1058,25 +1094,25 @@ mod tests {
     #[test]
     fn vstack_align_clamps_cross_size_to_inner_width() {
         // cross_size larger than inner_width should be clamped.
-        let stack = VStack::new(0.0)
-            .child(30.0, 200.0).align(CrossAlign::Start);
+        let stack = VStack::new(0.0).child(30.0, 200.0).align(CrossAlign::Start);
         let result = stack.layout(Rect::new(0.0, 0.0, 100.0, 100.0));
         assert_eq!(result.rects[1].width, 100.0, "clamped to inner_width");
     }
 
     #[test]
     fn hstack_align_start_pins_top() {
-        let stack = HStack::new(0.0)
-            .child(30.0, 20.0).align(CrossAlign::Start);
+        let stack = HStack::new(0.0).child(30.0, 20.0).align(CrossAlign::Start);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         assert_eq!(result.rects[1].y, 10.0, "start aligns to top edge");
-        assert_eq!(result.rects[1].height, 20.0, "start uses cross_size, not inner_height");
+        assert_eq!(
+            result.rects[1].height, 20.0,
+            "start uses cross_size, not inner_height"
+        );
     }
 
     #[test]
     fn hstack_align_center_centers_vertically() {
-        let stack = HStack::new(0.0)
-            .child(30.0, 20.0).align(CrossAlign::Center);
+        let stack = HStack::new(0.0).child(30.0, 20.0).align(CrossAlign::Center);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_height = 100, center y = 10 + (100 - 20) / 2 = 50
         assert_eq!(result.rects[1].y, 50.0);
@@ -1085,8 +1121,7 @@ mod tests {
 
     #[test]
     fn hstack_align_end_pins_bottom() {
-        let stack = HStack::new(0.0)
-            .child(30.0, 20.0).align(CrossAlign::End);
+        let stack = HStack::new(0.0).child(30.0, 20.0).align(CrossAlign::End);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_height = 100, end y = 10 + 100 - 20 = 90
         assert_eq!(result.rects[1].y, 90.0);
@@ -1096,30 +1131,50 @@ mod tests {
     #[test]
     fn hstack_multiple_children_mixed_alignment() {
         // Two children, each with different cross-axis alignment.
-        let stack = HStack::new(10.0).with_padding(5.0)
-            .child(40.0, 30.0).align(CrossAlign::Start)   // pinned to top
-            .child(40.0, 30.0).align(CrossAlign::End);     // pinned to bottom
+        let stack = HStack::new(10.0)
+            .with_padding(5.0)
+            .child(40.0, 30.0)
+            .align(CrossAlign::Start) // pinned to top
+            .child(40.0, 30.0)
+            .align(CrossAlign::End); // pinned to bottom
         let result = stack.layout(Rect::new(0.0, 0.0, 200.0, 100.0));
         // inner_height = 100 - 10 = 90
         assert_eq!(result.rects[1].height, 30.0, "start child uses cross_size");
         assert_eq!(result.rects[1].y, 5.0, "start child at top edge");
         assert_eq!(result.rects[2].height, 30.0, "end child uses cross_size");
-        assert_eq!(result.rects[2].y, 65.0, "end child at bottom edge (5 + 90 - 30)");
+        assert_eq!(
+            result.rects[2].y, 65.0,
+            "end child at bottom edge (5 + 90 - 30)"
+        );
     }
 
     #[test]
     fn vstack_mixed_alignment_in_stack() {
         // Two fixed children with different alignments + one fill child.
-        let stack = VStack::new(4.0).with_padding(4.0)
-            .child(20.0, 50.0).align(CrossAlign::Center)
-            .child_fill(60.0)   // default Stretch
-            .child(20.0, 40.0).align(CrossAlign::End);
+        let stack = VStack::new(4.0)
+            .with_padding(4.0)
+            .child(20.0, 50.0)
+            .align(CrossAlign::Center)
+            .child_fill(60.0) // default Stretch
+            .child(20.0, 40.0)
+            .align(CrossAlign::End);
         let result = stack.layout(Rect::new(0.0, 0.0, 120.0, 200.0));
         // inner_width = 120 - 8 = 112
         assert_eq!(result.rects[1].width, 50.0, "center child uses cross_size");
-        assert_eq!(result.rects[1].x, 4.0 + (112.0 - 50.0) * 0.5, "center child x");
-        assert_eq!(result.rects[2].width, 112.0, "fill child stretches full width");
+        assert_eq!(
+            result.rects[1].x,
+            4.0 + (112.0 - 50.0) * 0.5,
+            "center child x"
+        );
+        assert_eq!(
+            result.rects[2].width, 112.0,
+            "fill child stretches full width"
+        );
         assert_eq!(result.rects[3].width, 40.0, "end child uses cross_size");
-        assert_eq!(result.rects[3].x, 4.0 + 112.0 - 40.0, "end child at right edge");
+        assert_eq!(
+            result.rects[3].x,
+            4.0 + 112.0 - 40.0,
+            "end child at right edge"
+        );
     }
 }

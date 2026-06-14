@@ -339,6 +339,9 @@ mod tests {
         // rotation preserves area, so uniform_scale stays 1.0
         assert!(approx_eq(Affine2::rotation(0.7).uniform_scale(), 1.0));
         // translation has no effect on the linear part
-        assert!(approx_eq(Affine2::translation(50.0, 50.0).uniform_scale(), 1.0));
+        assert!(approx_eq(
+            Affine2::translation(50.0, 50.0).uniform_scale(),
+            1.0
+        ));
     }
 }

@@ -9,9 +9,7 @@
 //! committed value spliced around the insertion point.
 
 use wgpu_gameui::layout::Rect;
-use wgpu_gameui::{
-    DrawContext, DrawList, FocusState, InputState, TextInput, Theme, UiRenderer,
-};
+use wgpu_gameui::{DrawContext, DrawList, FocusState, InputState, TextInput, Theme, UiRenderer};
 
 const W: u32 = 512;
 const H: u32 = 128;
@@ -47,7 +45,11 @@ fn render_focused_composing_text_input() {
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ime target"),
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -80,9 +82,14 @@ fn render_focused_composing_text_input() {
     let mut list = DrawList::with_font_system(font_system.clone());
 
     // Field rect, leaving margin so the underline band sits well inside the image.
-    let field = Rect { x: 24.0, y: 40.0, width: 460.0, height: 40.0 };
-    let mut input_widget = TextInput::new(field.x, field.y, field.width, field.height)
-        .with_value("abcd");
+    let field = Rect {
+        x: 24.0,
+        y: 40.0,
+        width: 460.0,
+        height: 40.0,
+    };
+    let mut input_widget =
+        TextInput::new(field.x, field.y, field.width, field.height).with_value("abcd");
     // Place the caret between "ab" and "cd" (byte 2) so the preedit splices in
     // the middle: "ab" + preedit(underlined) + "cd".
     input_widget.cursor_pos = 2;
@@ -100,7 +107,12 @@ fn render_focused_composing_text_input() {
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.06, b: 0.08, a: 1.0 }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.05,
+                        g: 0.06,
+                        b: 0.08,
+                        a: 1.0,
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -125,7 +137,11 @@ fn render_focused_composing_text_input() {
                 rows_per_image: Some(H),
             },
         },
-        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
     );
     queue.submit(Some(encoder.finish()));
 
@@ -147,7 +163,10 @@ fn render_focused_composing_text_input() {
             + (p.0[2] as i32 - clear[2] as i32).abs();
         d > 30
     });
-    assert!(rendered, "no pixels rendered — composing TextInput produced an empty frame");
+    assert!(
+        rendered,
+        "no pixels rendered — composing TextInput produced an empty frame"
+    );
 
     // (b) The underline is a thin SOLID horizontal bar beneath the preedit run,
     // unlike the sparse glyph pixels above it. Scan rows in the lower half of

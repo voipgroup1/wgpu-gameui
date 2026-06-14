@@ -9,17 +9,17 @@
 //! Pop is explicit. There is no `Drop`-based auto-pop, mirroring Teardown's
 //! `UiPush`/`UiPop` semantics.
 
+use crate::InputState;
 use crate::affine::Affine2;
 use crate::layer::{LayerKind, LayerStack};
 use crate::layout::Rect;
 use crate::text::{FontHandle, TextBlock};
 use crate::theme::Theme;
+use crate::widgets::DrawList;
 use crate::widgets::{
     Button, Checkbox, DragCapture, DragId, DrawContext, DropdownState, FocusId, FocusState,
     NumberInput, ScrollState, Slider, TextInput, TreeId, TreeNode, TreeNodeOutput, TreeState,
 };
-use crate::widgets::DrawList;
-use crate::InputState;
 use glyphon::{Style, Weight};
 use std::collections::HashMap;
 
@@ -123,6 +123,16 @@ impl Default for FontSpec {
     }
 }
 
+/// Reserved [`FocusId`] the façade's tree occupies in the Tab ring — the whole
+/// tree is a single Tab stop. Picked at the top of the id space to avoid clashing
+/// with caller-supplied ids.
+const TREE_FOCUS_ID: FocusId = u64::MAX;
+
+/// Base for auto-assigned [`FocusId`]s handed to the `text_button`/`checkbox`
+/// façade verbs (which take no explicit id). High enough that it won't collide
+/// with realistic caller ids; the per-frame counter is added on top.
+const AUTO_ID_BASE: u64 = 0xF000_0000_0000_0000;
+
 /// Caller-owned, frame-persistent state backing the interactive `UiContext`
 /// verbs (`text_button`/`slider`/`checkbox`/`text_input`/…). Construct one per UI
 /// surface and thread `&mut` into [`UiContext::interactive`] every frame, the
@@ -150,6 +160,12 @@ pub struct UiState {
     /// Vertical gap inserted between auto-advanced verbs. Re-seeded from
     /// `theme.spacing` each frame by [`UiState::begin_frame`].
     pub item_gap: f32,
+    /// Per-frame counter for auto-assigned focus ids (text_button/checkbox).
+    /// Reset by [`begin_frame`](Self::begin_frame).
+    next_auto_id: u64,
+    /// Whether the tree's single Tab stop has been registered this frame (so it
+    /// joins the Tab ring exactly once even across many tree rows).
+    tree_focus_registered: bool,
 }
 
 impl UiState {
@@ -164,13 +180,28 @@ impl UiState {
     /// the frame's interactive verbs (mirrors [`InputState::end_frame`] timing).
     pub fn begin_frame(&mut self, input: &InputState, theme: &Theme) {
         self.focus.begin_frame(input);
+        self.tree.begin_frame(input);
         self.item_gap = theme.spacing;
+        self.next_auto_id = 0;
+        self.tree_focus_registered = false;
     }
 
-    /// Per-frame teardown: resolve focus navigation against the widgets
+    /// Per-frame teardown: resolve tree arrow-navigation (gated on the tree
+    /// holding focus), then resolve focus/Tab navigation against the widgets
     /// registered this frame. Call after building the frame's verbs.
     pub fn end_frame(&mut self) {
+        // Resolve tree nav before Tab moves focus, using this frame's focus owner.
+        let tree_focused = self.focus.is_focused(TREE_FOCUS_ID);
+        self.tree.end_frame(tree_focused);
         self.focus.end_frame(None);
+    }
+
+    /// Next auto-assigned focus id for an id-less interactive verb. Stable across
+    /// frames only while the call order is stable (the immediate-mode contract).
+    fn auto_id(&mut self) -> FocusId {
+        let id = AUTO_ID_BASE + self.next_auto_id;
+        self.next_auto_id += 1;
+        id
     }
 }
 
@@ -228,6 +259,15 @@ pub struct UiContext<'a> {
     /// Current tree indentation depth, driven by `tree_node`/`tree_pop`. Reset
     /// to 0 each frame because a fresh `UiContext` is built per frame.
     tree_depth: usize,
+    /// When `true` (the default, matching Teardown), the auto-advancing verbs
+    /// (`text`/`text_button`/… and the Lua bindings' per-widget stacking via
+    /// [`advance_cursor`](Self::advance_cursor)) translate the layout cursor down
+    /// after drawing. Set to `false` (via [`set_auto_advance`](Self::set_auto_advance)
+    /// / Lua `UiAutoAdvance(false)`) to position everything explicitly with
+    /// `UiTranslate` instead — convenient for horizontal rows without wrapping
+    /// every widget in `push`/`pop`. A fresh `UiContext` is built per frame, so
+    /// this resets to `true` each frame unless re-disabled.
+    auto_advance: bool,
 }
 
 impl<'a> UiContext<'a> {
@@ -248,6 +288,7 @@ impl<'a> UiContext<'a> {
             state: None,
             theme: None,
             tree_depth: 0,
+            auto_advance: true,
         }
     }
 
@@ -266,6 +307,7 @@ impl<'a> UiContext<'a> {
             state: None,
             theme: None,
             tree_depth: 0,
+            auto_advance: true,
         }
     }
 
@@ -452,7 +494,12 @@ impl<'a> UiContext<'a> {
         let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0) as u8;
         let block = TextBlock::new(text, 0.0, 0.0)
             .with_size(spec.size)
-            .with_rgba(to_u8(color[0]), to_u8(color[1]), to_u8(color[2]), to_u8(color[3]))
+            .with_rgba(
+                to_u8(color[0]),
+                to_u8(color[1]),
+                to_u8(color[2]),
+                to_u8(color[3]),
+            )
             .with_font_opt(spec.font)
             .with_weight(spec.weight)
             .with_style(spec.style);
@@ -595,9 +642,12 @@ impl<'a> UiContext<'a> {
     ) {
         let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         let [ox, oy] = align.offset(w, h);
-        self.backend
-            .list_mut()
-            .rounded_rect_outline(Rect::new(ox, oy, w, h), radius, thickness, color);
+        self.backend.list_mut().rounded_rect_outline(
+            Rect::new(ox, oy, w, h),
+            radius,
+            thickness,
+            color,
+        );
     }
 
     /// Draw a filled circle of the given radius at the aligned origin
@@ -617,9 +667,12 @@ impl<'a> UiContext<'a> {
     pub fn circle_outline(&mut self, radius: f32, thickness: f32, color: [f32; 4]) {
         let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
         let [ox, oy] = align.offset(radius * 2.0, radius * 2.0);
-        self.backend
-            .list_mut()
-            .circle_outline((ox + radius, oy + radius), radius, thickness, color);
+        self.backend.list_mut().circle_outline(
+            (ox + radius, oy + radius),
+            radius,
+            thickness,
+            color,
+        );
     }
 
     /// The current per-axis scale factors of the active transform (Teardown's
@@ -699,9 +752,38 @@ impl<'a> UiContext<'a> {
 
     /// Advance the vertical layout cursor by `height` plus the current
     /// `item_gap` (Teardown-style stacking). No-op gap when state is absent.
+    /// Skipped entirely when [`auto_advance`](Self::auto_advance) is off.
     fn advance(&mut self, height: f32) {
+        if !self.auto_advance {
+            return;
+        }
         let gap = self.state.as_ref().map_or(0.0, |s| s.item_gap);
         self.backend.list_mut().translate(0.0, height + gap);
+    }
+
+    /// Advance the layout cursor by exactly `height` (no theme `item_gap`),
+    /// honoring [`auto_advance`](Self::auto_advance). The public companion to the
+    /// private [`advance`](Self::advance): the Lua bindings call this for
+    /// Teardown's per-widget vertical stacking, so `UiAutoAdvance(false)`
+    /// disables their stacking uniformly with the crate's own verbs.
+    pub fn advance_cursor(&mut self, height: f32) {
+        if self.auto_advance {
+            self.backend.list_mut().translate(0.0, height);
+        }
+    }
+
+    /// Whether auto-advance (Teardown-style vertical stacking after each
+    /// auto-advancing verb) is currently enabled. Defaults to `true`.
+    pub fn auto_advance(&self) -> bool {
+        self.auto_advance
+    }
+
+    /// Enable/disable auto-advance for the rest of this frame's build. When
+    /// disabled, the auto-advancing verbs and [`advance_cursor`](Self::advance_cursor)
+    /// leave the cursor in place so the caller positions widgets explicitly with
+    /// `translate`. Resets to `true` next frame (a fresh `UiContext` per frame).
+    pub fn set_auto_advance(&mut self, enabled: bool) {
+        self.auto_advance = enabled;
     }
 
     /// Default widget width: the inner width of the active `UiWindow`, else
@@ -734,11 +816,21 @@ impl<'a> UiContext<'a> {
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
         let (local, local_input) = Self::localize(inv, world, input);
+        // Auto-assign a focus id so the button is Tab-reachable + Space/Enter
+        // activatable without changing the verb's signature.
+        let fid = self
+            .state
+            .as_mut()
+            .map(|s| s.auto_id())
+            .expect("text_button requires interactive state");
         let clicked = {
             let list = self.backend.list_mut();
-            let state = self.state.as_mut().expect("text_button requires interactive state");
+            let state = self
+                .state
+                .as_mut()
+                .expect("text_button requires interactive state");
             let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0);
-            Button::draw_at(label, local, true, &mut ctx)
+            Button::new(label).focusable(fid).draw(local, &mut ctx)
         };
         self.advance(height);
         clicked
@@ -771,7 +863,10 @@ impl<'a> UiContext<'a> {
                 }
             };
             let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0);
+            // Reuse the DragId value as the FocusId so the slider is also
+            // keyboard-adjustable (arrow keys) through the façade.
             Slider::new(min, max)
+                .focusable(id)
                 .draw(value, id, &mut state.drag, local, &mut ctx)
                 .value
         };
@@ -794,18 +889,24 @@ impl<'a> UiContext<'a> {
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
         let (local, local_input) = Self::localize(inv, world, input);
+        let fid = self
+            .state
+            .as_mut()
+            .map(|s| s.auto_id())
+            .expect("checkbox requires interactive state");
         let toggled = {
             let list = self.backend.list_mut();
-            let state = self.state.as_mut().expect("checkbox requires interactive state");
+            let state = self
+                .state
+                .as_mut()
+                .expect("checkbox requires interactive state");
             let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0);
-            Checkbox::new().draw(checked, label, local, &mut ctx)
+            Checkbox::new()
+                .focusable(fid)
+                .draw(checked, label, local, &mut ctx)
         };
         self.advance(height);
-        if toggled {
-            !checked
-        } else {
-            checked
-        }
+        if toggled { !checked } else { checked }
     }
 
     /// Draw an atlas image (by key) of size `w`×`h` at the aligned origin and
@@ -1050,6 +1151,15 @@ impl<'a> UiContext<'a> {
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
         let (local, local_input) = Self::localize(inv, world, input);
+        // The whole tree is one Tab stop: wire its focus id and register it in
+        // the ring exactly once per frame (the first row drawn).
+        if let Some(s) = self.state.as_mut() {
+            s.tree.set_focus_id(TREE_FOCUS_ID);
+            if !s.tree_focus_registered {
+                s.tree_focus_registered = true;
+                s.focus.register(TREE_FOCUS_ID);
+            }
+        }
         let out = {
             let list = self.backend.list_mut();
             let state = match self.state.as_mut() {
@@ -1061,7 +1171,12 @@ impl<'a> UiContext<'a> {
             };
             let UiState { tree, focus, .. } = &mut **state;
             let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
-            node.with_depth(depth).draw(id, local, tree, &mut ctx)
+            let out = node.with_depth(depth).draw(id, local, tree, &mut ctx);
+            // Focus ring on the selected row while the tree holds keyboard focus.
+            if ctx.focus.is_focused(TREE_FOCUS_ID) && tree.is_selected(id) {
+                ctx.draw_focus_ring(local);
+            }
+            out
         };
         self.advance(height);
         if out.expanded {
@@ -1188,10 +1303,7 @@ impl<'a> UiContext<'a> {
                     s.pop_layer();
                     self.open_layer_kinds.pop();
                 }
-                debug_assert!(
-                    top.is_some(),
-                    "UiContext::*_end called with no open layer"
-                );
+                debug_assert!(top.is_some(), "UiContext::*_end called with no open layer");
                 debug_assert!(
                     top == Some(expected),
                     "UiContext layer kind mismatch: expected to close a {:?}, but the most-recent open layer is a {:?}",
@@ -1241,6 +1353,43 @@ mod tests {
         let mut ui = UiContext::new(&mut list);
         let r = ui.place_rect(10.0, 20.0);
         assert_eq!(r, Rect::new(0.0, 0.0, 10.0, 20.0));
+    }
+
+    #[test]
+    fn advance_cursor_moves_then_off_is_noop() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        assert!(ui.auto_advance(), "defaults to on (Teardown-compatible)");
+        // On: advance_cursor moves the layout cursor down by exactly `height`.
+        ui.advance_cursor(30.0);
+        let after_on = ui.cursor();
+        assert!(approx(after_on[1], 30.0), "cursor advanced to {after_on:?}");
+        // Off: advance_cursor is a no-op — the caller positions explicitly.
+        ui.set_auto_advance(false);
+        assert!(!ui.auto_advance());
+        ui.advance_cursor(30.0);
+        let after_off = ui.cursor();
+        assert!(
+            approx(after_off[1], after_on[1]),
+            "cursor unchanged at {after_off:?}"
+        );
+    }
+
+    #[test]
+    fn auto_advance_off_keeps_text_verbs_at_origin() {
+        // Two `text` verbs with auto-advance off draw at the same baseline
+        // instead of stacking — the whole point of the toggle.
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.set_auto_advance(false);
+        ui.text("a");
+        ui.text("b");
+        drop(ui);
+        assert_eq!(list.texts.len(), 2);
+        assert!(
+            approx(list.texts[0].y, list.texts[1].y),
+            "both lines share a baseline"
+        );
     }
 
     #[test]
@@ -1353,7 +1502,10 @@ mod tests {
         // origin should be at (100 - 10, 100 - 10) = (90, 90).
         assert_eq!(list.chrome_instances.len(), 1);
         assert_eq!(
-            [list.chrome_instances[0].rect[0], list.chrome_instances[0].rect[1]],
+            [
+                list.chrome_instances[0].rect[0],
+                list.chrome_instances[0].rect[1]
+            ],
             [90.0, 90.0]
         );
     }
@@ -1373,7 +1525,10 @@ mod tests {
         // world rect origin is the box top-left (90, 90).
         assert_eq!(list.chrome_instances.len(), 1);
         assert_eq!(
-            [list.chrome_instances[0].rect[0], list.chrome_instances[0].rect[1]],
+            [
+                list.chrome_instances[0].rect[0],
+                list.chrome_instances[0].rect[1]
+            ],
             [90.0, 90.0]
         );
     }
@@ -1391,7 +1546,10 @@ mod tests {
         }
         assert_eq!(list.circle_instances.len(), 1);
         assert_eq!(
-            [list.circle_instances[0].center[0], list.circle_instances[0].center[1]],
+            [
+                list.circle_instances[0].center[0],
+                list.circle_instances[0].center[1]
+            ],
             [50.0, 60.0]
         );
     }
@@ -1408,7 +1566,10 @@ mod tests {
         }
         assert_eq!(list.circle_instances.len(), 1);
         assert_eq!(
-            [list.circle_instances[0].center[0], list.circle_instances[0].center[1]],
+            [
+                list.circle_instances[0].center[0],
+                list.circle_instances[0].center[1]
+            ],
             [60.0, 70.0]
         );
     }
@@ -1485,7 +1646,10 @@ mod tests {
             ui.current_window_rect(),
             Some(Rect::new(200.0, 100.0, 400.0, 200.0))
         );
-        assert_eq!(ui.current_clip(), Some(Rect::new(200.0, 100.0, 400.0, 200.0)));
+        assert_eq!(
+            ui.current_clip(),
+            Some(Rect::new(200.0, 100.0, 400.0, 200.0))
+        );
         ui.pop();
         assert_eq!(ui.current_window_rect(), None);
         assert_eq!(ui.current_clip(), None);

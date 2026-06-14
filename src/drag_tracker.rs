@@ -224,7 +224,11 @@ mod tests {
         let mut small = frame(12.0, 10.0, true, false, false);
         d.update(&mut small);
         assert!(!small.is_dragging);
-        assert_eq!(small.drag_delta, [0.0, 0.0], "sub-threshold delta is suppressed");
+        assert_eq!(
+            small.drag_delta,
+            [0.0, 0.0],
+            "sub-threshold delta is suppressed"
+        );
 
         // Cross the threshold: now dragging, and the per-frame delta is from the
         // previous position (12,10) to the new one (20,10).
@@ -248,7 +252,11 @@ mod tests {
 
         let mut f2 = frame(9.0, 3.0, true, false, false);
         d.update(&mut f2);
-        assert_eq!(f2.drag_delta, [4.0, 0.0], "delta is movement since last frame");
+        assert_eq!(
+            f2.drag_delta,
+            [4.0, 0.0],
+            "delta is movement since last frame"
+        );
 
         // A still frame while held reports zero movement but stays a drag.
         let mut f3 = frame(9.0, 3.0, true, false, false);

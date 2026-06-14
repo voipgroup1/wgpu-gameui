@@ -55,9 +55,29 @@ use std::collections::HashSet;
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::SpriteId;
+use crate::{InputState, SpriteId};
 
-use super::{DrawContext, DrawList};
+use super::{DrawContext, DrawList, FocusId};
+
+/// Edge-detected keyboard-navigation keys captured for one frame.
+#[derive(Debug, Default, Clone, Copy)]
+struct NavKeys {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+    /// Enter or Space — toggles the selected branch.
+    activate: bool,
+}
+
+/// One visible row registered during a frame, in draw (top-to-bottom) order.
+/// Drives arrow-key navigation in [`TreeState::end_frame`].
+#[derive(Debug, Clone, Copy)]
+struct NavRow {
+    id: TreeId,
+    depth: usize,
+    branch: bool,
+}
 
 /// Stable identity for a node within one tree. Any scheme unique per node per
 /// frame works (a hash, an enum discriminant, a stable row index). `0` is a
@@ -93,6 +113,17 @@ pub struct TreeState {
     seen: HashSet<TreeId>,
     /// The single selected node, if any.
     selected: Option<TreeId>,
+    /// Visible rows registered this frame, in draw order (for arrow nav).
+    nav: Vec<NavRow>,
+    /// This frame's rising-edge nav keys (acted on in `end_frame` when focused).
+    keys: NavKeys,
+    /// Previous frame's raw key state, for rising-edge detection (so holding an
+    /// arrow steps once per press, not once per frame).
+    prev_keys: NavKeys,
+    /// The single `FocusId` the whole tree occupies in the Tab ring, if the
+    /// caller wired keyboard focus. Set via [`set_focus_id`](Self::set_focus_id);
+    /// a row interaction requests it so clicking the tree focuses it.
+    focus_id: Option<FocusId>,
 }
 
 impl TreeState {
@@ -164,6 +195,119 @@ impl TreeState {
             self.expanded.insert(id);
         }
         self.expanded.contains(&id)
+    }
+
+    /// Associate the tree with a single [`FocusId`] in the Tab ring. When set, a
+    /// row interaction (select / toggle / action) requests this focus so clicking
+    /// the tree makes arrow-key navigation active. The caller still registers the
+    /// id in [`crate::FocusState`] and passes `focus.is_focused(id)` into
+    /// [`end_frame`](Self::end_frame).
+    pub fn set_focus_id(&mut self, id: FocusId) {
+        self.focus_id = Some(id);
+    }
+
+    /// The tree's keyboard [`FocusId`], if one was set.
+    pub fn focus_id(&self) -> Option<FocusId> {
+        self.focus_id
+    }
+
+    /// Begin a frame: clear the visible-row ring and capture this frame's
+    /// rising-edge navigation keys from `input`. Call once per frame before
+    /// drawing the tree's rows (mirrors [`crate::FocusState::begin_frame`]).
+    pub fn begin_frame(&mut self, input: &InputState) {
+        let raw = NavKeys {
+            up: input.key_up,
+            down: input.key_down,
+            left: input.key_left,
+            right: input.key_right,
+            activate: input.enter_pressed || input.key_space,
+        };
+        // Rising edge only, so a held arrow steps once per press.
+        self.keys = NavKeys {
+            up: raw.up && !self.prev_keys.up,
+            down: raw.down && !self.prev_keys.down,
+            left: raw.left && !self.prev_keys.left,
+            right: raw.right && !self.prev_keys.right,
+            activate: raw.activate && !self.prev_keys.activate,
+        };
+        self.prev_keys = raw;
+        self.nav.clear();
+    }
+
+    /// Register a visible row in this frame's navigation order. Called by
+    /// [`TreeNode::draw`]; rarely needed directly.
+    pub fn register_nav(&mut self, id: TreeId, depth: usize, branch: bool) {
+        self.nav.push(NavRow { id, depth, branch });
+    }
+
+    /// End a frame: when `focused`, resolve this frame's arrow-key navigation
+    /// against the rows registered since [`begin_frame`](Self::begin_frame).
+    ///
+    /// `focused` is whether the tree's [`FocusId`] currently holds keyboard focus
+    /// — pass `focus.is_focused(tree_id)`. Gating on focus keeps the tree from
+    /// hijacking arrow keys meant for a focused text field. Navigation takes
+    /// effect the same frame it is resolved; the moved selection/expansion shows
+    /// on the next draw (one-frame latency, like Tab).
+    ///
+    /// Semantics: Down/Up move the selection to the next/previous visible row;
+    /// Right expands a collapsed branch then descends into the first child; Left
+    /// collapses an expanded branch then ascends to the parent; Enter/Space
+    /// toggle the selected branch.
+    pub fn end_frame(&mut self, focused: bool) {
+        let keys = self.keys;
+        let nav = std::mem::take(&mut self.nav);
+        self.keys = NavKeys::default();
+        if !focused || nav.is_empty() {
+            return;
+        }
+
+        let cur = self
+            .selected
+            .and_then(|s| nav.iter().position(|n| n.id == s));
+
+        if keys.down {
+            let next = match cur {
+                Some(i) => (i + 1).min(nav.len() - 1),
+                None => 0,
+            };
+            self.selected = Some(nav[next].id);
+        } else if keys.up {
+            let prev = match cur {
+                Some(i) => i.saturating_sub(1),
+                None => nav.len() - 1,
+            };
+            self.selected = Some(nav[prev].id);
+        } else if keys.right {
+            if let Some(i) = cur {
+                let NavRow { id, depth, branch } = nav[i];
+                if branch {
+                    if !self.is_expanded(id) {
+                        self.set_expanded(id, true);
+                    } else if nav.get(i + 1).is_some_and(|n| n.depth > depth) {
+                        self.selected = Some(nav[i + 1].id);
+                    }
+                }
+            }
+        } else if keys.left {
+            if let Some(i) = cur {
+                let NavRow { id, depth, branch } = nav[i];
+                if branch && self.is_expanded(id) {
+                    self.set_expanded(id, false);
+                } else if depth > 0 {
+                    // Ascend to the nearest earlier row one level shallower.
+                    if let Some(p) = nav[..i].iter().rposition(|n| n.depth == depth - 1) {
+                        self.selected = Some(nav[p].id);
+                    }
+                }
+            }
+        } else if keys.activate {
+            if let Some(i) = cur {
+                let NavRow { id, branch, .. } = nav[i];
+                if branch {
+                    self.toggle(id);
+                }
+            }
+        }
     }
 }
 
@@ -347,17 +491,25 @@ impl<'a> TreeNode<'a> {
         let input = ctx.input;
 
         let expanded_before = state.resolve_expanded(id, self.default_open);
+        // Register this row in the frame's navigation order (arrow-key nav).
+        state.register_nav(id, self.depth, !self.leaf);
 
         // Honor layer capture so a tree under a modal/popup ignores clicks meant
-        // for the overlay.
+        // for the overlay. Snapshot the click edge so we can request focus (a
+        // `&mut ctx` call) after the `ctx.input` borrow ends.
         let mouse_in = !input.mouse_consumed;
         let mx = input.mouse_x;
         let my = input.mouse_y;
+        let mouse_clicked = input.mouse_clicked;
         let row_hovered = mouse_in && rect.contains(mx, my);
         let selected = state.is_selected(id);
 
         // ---- layout -------------------------------------------------------
-        let slot = self.slot_size.unwrap_or(rect.height).min(rect.height).max(1.0);
+        let slot = self
+            .slot_size
+            .unwrap_or(rect.height)
+            .min(rect.height)
+            .max(1.0);
         let slot_y = rect.y + (rect.height - slot) * 0.5;
         let indent = self.depth as f32 * INDENT;
         let disclosure_left = rect.x + ROW_INSET + indent;
@@ -390,10 +542,16 @@ impl<'a> TreeNode<'a> {
             list.quad(rect.x, rect.y, rect.width, rect.height, theme.button_hover);
         }
 
-        let text_color = self
-            .label_color
-            .unwrap_or(if selected { theme.background } else { theme.text });
-        let arrow_color = if selected { theme.background } else { theme.text_dim };
+        let text_color = self.label_color.unwrap_or(if selected {
+            theme.background
+        } else {
+            theme.text
+        });
+        let arrow_color = if selected {
+            theme.background
+        } else {
+            theme.text_dim
+        };
 
         // ---- disclosure triangle ------------------------------------------
         if !self.leaf {
@@ -406,7 +564,7 @@ impl<'a> TreeNode<'a> {
             let s = leading_slot(i);
             let hov = mouse_in && s.contains(mx, my);
             draw_action(list, s, &a.icon, a.tint, hov);
-            if hov && input.mouse_clicked && action.is_none() {
+            if hov && mouse_clicked && action.is_none() {
                 action = Some(a.id);
             }
         }
@@ -414,14 +572,20 @@ impl<'a> TreeNode<'a> {
             let s = trailing_slot(i);
             let hov = mouse_in && s.contains(mx, my);
             draw_action(list, s, &a.icon, a.tint, hov);
-            if hov && input.mouse_clicked && action.is_none() {
+            if hov && mouse_clicked && action.is_none() {
                 action = Some(a.id);
             }
         }
 
         // ---- label --------------------------------------------------------
         let text_x = label_x;
-        let text_y = rect.y + (rect.height - theme.font_size) * 0.5;
+        let text_y = list.vcentered_text_y(
+            rect.y,
+            rect.height,
+            theme.font_size,
+            theme.font.as_ref(),
+            self.label,
+        );
         let (r, g, b) = rgb(text_color);
         list.text(
             TextBlock::new(self.label, text_x, text_y)
@@ -435,7 +599,7 @@ impl<'a> TreeNode<'a> {
         // ---- interaction precedence: action > disclosure > body -----------
         let mut toggled = false;
         let mut body_clicked = false;
-        if input.mouse_clicked && row_hovered && action.is_none() {
+        if mouse_clicked && row_hovered && action.is_none() {
             let in_disclosure = mx >= disclosure_left && mx < disclosure_right;
             if !self.leaf && in_disclosure {
                 state.toggle(id);
@@ -447,6 +611,15 @@ impl<'a> TreeNode<'a> {
                     state.toggle(id);
                     toggled = true;
                 }
+            }
+        }
+
+        // Any interaction focuses the tree (if a focus id is wired), so arrow-key
+        // navigation activates after a click. Safe here: the `ctx.input` borrow
+        // ended above (we snapshot `mouse_clicked`), so `&mut ctx` is free.
+        if body_clicked || toggled || action.is_some() {
+            if let Some(fid) = state.focus_id {
+                ctx.focus.request(fid);
             }
         }
 
@@ -498,7 +671,13 @@ fn draw_action(list: &mut DrawList, slot: Rect, icon: &TreeIcon, tint: [f32; 4],
         TreeIcon::Key(key) => list.icon(key, r.x, r.y, r.width, r.height),
     }
     if hovered {
-        list.quad(slot.x, slot.y, slot.width, slot.height, [1.0, 1.0, 1.0, 0.12]);
+        list.quad(
+            slot.x,
+            slot.y,
+            slot.width,
+            slot.height,
+            [1.0, 1.0, 1.0, 0.12],
+        );
     }
 }
 
@@ -640,7 +819,10 @@ mod tests {
         let mut s = TreeState::new();
         const RENAME: u32 = 21;
         const DEL: u32 = 22;
-        let acts = [TreeAction::key(RENAME, "pen"), TreeAction::key(DEL, "trash")];
+        let acts = [
+            TreeAction::key(RENAME, "pen"),
+            TreeAction::key(DEL, "trash"),
+        ];
         let node = TreeNode::leaf("leaf").with_trailing(&acts);
         // Trailing slots right-aligned: slot=20, two slots end at x=200-4=196,
         // so [156,176) rename, [176,196) delete. Click the delete slot.
@@ -655,7 +837,9 @@ mod tests {
         let mut s = TreeState::new();
         let lead = [TreeAction::key(1, "eye")];
         let trail = [TreeAction::key(2, "trash")];
-        let node = TreeNode::new("branch").with_leading(&lead).with_trailing(&trail);
+        let node = TreeNode::new("branch")
+            .with_leading(&lead)
+            .with_trailing(&trail);
         // Click in the label area (well clear of both icon columns).
         let (_, out) = draw_node(&node, 5, row(), &mut s, &click_at(90.0, 10.0));
         assert_eq!(out.action, None, "label click is not an action");
@@ -722,7 +906,10 @@ mod tests {
         assert!(s.is_expanded(7));
         // The user collapses it; a later resolve must NOT re-apply the default.
         s.set_expanded(7, false);
-        assert!(!s.resolve_expanded(7, true), "default is applied at most once");
+        assert!(
+            !s.resolve_expanded(7, true),
+            "default is applied at most once"
+        );
         // Repeated calls within/across frames are stable (idempotent), matching
         // what TreeNode::draw does for the same id after an external pre-query.
         assert!(!s.resolve_expanded(7, true));
@@ -759,7 +946,10 @@ mod tests {
         }
         let none = label_max_w(&[]);
         let two = label_max_w(&[TreeAction::key(1, "a"), TreeAction::key(2, "b")]);
-        assert!(two < none, "trailing icons reserve width (none={none}, two={two})");
+        assert!(
+            two < none,
+            "trailing icons reserve width (none={none}, two={two})"
+        );
     }
 
     #[test]
@@ -771,7 +961,11 @@ mod tests {
         let (def_list, _) = draw_node(&TreeNode::leaf("Node"), 1, row(), &mut s, &idle());
         let def_color = def_list.texts.first().expect("label emitted").color;
         let (tr, tg, tb) = rgb(theme().text);
-        assert_eq!(def_color, Color::rgb(tr, tg, tb), "default path uses theme.text");
+        assert_eq!(
+            def_color,
+            Color::rgb(tr, tg, tb),
+            "default path uses theme.text"
+        );
 
         // Overridden path: a distinctive colour wins.
         let mut s2 = TreeState::new();
@@ -780,7 +974,10 @@ mod tests {
         let col = list.texts.first().expect("label emitted").color;
         let (r, g, b) = rgb([0.1, 0.9, 0.3, 1.0]);
         assert_eq!(col, Color::rgb(r, g, b), "label_color is applied verbatim");
-        assert_ne!(col, def_color, "override differs from the default text colour");
+        assert_ne!(
+            col, def_color,
+            "override differs from the default text colour"
+        );
     }
 
     #[test]
@@ -792,6 +989,205 @@ mod tests {
         assert!(
             branch_list.vertices.len() > leaf_list.vertices.len(),
             "branch adds disclosure-triangle geometry the leaf lacks"
+        );
+    }
+
+    // ---- Keyboard arrow navigation ------------------------------------------
+
+    /// An input with a single arrow / activate key edge held.
+    fn nav_input(up: bool, down: bool, left: bool, right: bool, activate: bool) -> InputState {
+        InputState {
+            key_up: up,
+            key_down: down,
+            key_left: left,
+            key_right: right,
+            enter_pressed: activate,
+            ..InputState::default()
+        }
+    }
+
+    /// Register a flat list of `(id, depth, branch)` rows as this frame's nav ring.
+    fn register_rows(s: &mut TreeState, rows: &[(TreeId, usize, bool)]) {
+        for &(id, depth, branch) in rows {
+            s.register_nav(id, depth, branch);
+        }
+    }
+
+    #[test]
+    fn down_moves_selection_to_next_row() {
+        let mut s = TreeState::new();
+        s.select(1);
+        s.begin_frame(&nav_input(false, true, false, false, false));
+        register_rows(&mut s, &[(1, 0, false), (2, 0, false), (3, 0, false)]);
+        s.end_frame(true);
+        assert!(s.is_selected(2), "Down selects the next visible row");
+    }
+
+    #[test]
+    fn up_moves_selection_to_previous_row() {
+        let mut s = TreeState::new();
+        s.select(3);
+        s.begin_frame(&nav_input(true, false, false, false, false));
+        register_rows(&mut s, &[(1, 0, false), (2, 0, false), (3, 0, false)]);
+        s.end_frame(true);
+        assert!(s.is_selected(2), "Up selects the previous visible row");
+    }
+
+    #[test]
+    fn down_clamps_at_last_row() {
+        let mut s = TreeState::new();
+        s.select(3);
+        s.begin_frame(&nav_input(false, true, false, false, false));
+        register_rows(&mut s, &[(1, 0, false), (2, 0, false), (3, 0, false)]);
+        s.end_frame(true);
+        assert!(s.is_selected(3), "Down at the last row stays put");
+    }
+
+    #[test]
+    fn down_with_no_selection_picks_first() {
+        let mut s = TreeState::new();
+        s.begin_frame(&nav_input(false, true, false, false, false));
+        register_rows(&mut s, &[(1, 0, false), (2, 0, false)]);
+        s.end_frame(true);
+        assert!(
+            s.is_selected(1),
+            "Down with nothing selected picks the first row"
+        );
+    }
+
+    #[test]
+    fn right_expands_collapsed_branch_without_descending() {
+        let mut s = TreeState::new();
+        s.select(1);
+        // Branch 1 collapsed: only the branch row is visible.
+        s.begin_frame(&nav_input(false, false, false, true, false));
+        register_rows(&mut s, &[(1, 0, true)]);
+        s.end_frame(true);
+        assert!(s.is_expanded(1), "Right expands a collapsed branch");
+        assert!(s.is_selected(1), "expansion does not move selection yet");
+    }
+
+    #[test]
+    fn right_on_expanded_branch_descends_to_first_child() {
+        let mut s = TreeState::new();
+        s.set_expanded(1, true);
+        s.select(1);
+        // Expanded branch 1 with child 2 visible beneath it.
+        s.begin_frame(&nav_input(false, false, false, true, false));
+        register_rows(&mut s, &[(1, 0, true), (2, 1, false)]);
+        s.end_frame(true);
+        assert!(
+            s.is_selected(2),
+            "Right on an expanded branch descends to the first child"
+        );
+    }
+
+    #[test]
+    fn right_on_leaf_is_noop() {
+        let mut s = TreeState::new();
+        s.select(2);
+        s.begin_frame(&nav_input(false, false, false, true, false));
+        register_rows(&mut s, &[(1, 0, true), (2, 1, false)]);
+        s.end_frame(true);
+        assert!(s.is_selected(2), "Right on a leaf does nothing");
+    }
+
+    #[test]
+    fn left_collapses_expanded_branch() {
+        let mut s = TreeState::new();
+        s.set_expanded(1, true);
+        s.select(1);
+        s.begin_frame(&nav_input(false, false, true, false, false));
+        register_rows(&mut s, &[(1, 0, true), (2, 1, false)]);
+        s.end_frame(true);
+        assert!(!s.is_expanded(1), "Left collapses an expanded branch");
+        assert!(s.is_selected(1), "selection stays on the collapsed branch");
+    }
+
+    #[test]
+    fn left_on_child_ascends_to_parent() {
+        let mut s = TreeState::new();
+        s.set_expanded(1, true);
+        s.select(2); // a child leaf
+        s.begin_frame(&nav_input(false, false, true, false, false));
+        register_rows(&mut s, &[(1, 0, true), (2, 1, false)]);
+        s.end_frame(true);
+        assert!(s.is_selected(1), "Left on a child ascends to its parent");
+    }
+
+    #[test]
+    fn enter_toggles_selected_branch() {
+        let mut s = TreeState::new();
+        s.select(1);
+        // First Enter expands.
+        s.begin_frame(&nav_input(false, false, false, false, true));
+        register_rows(&mut s, &[(1, 0, true)]);
+        s.end_frame(true);
+        assert!(s.is_expanded(1), "Enter toggles a collapsed branch open");
+    }
+
+    #[test]
+    fn enter_on_leaf_is_noop() {
+        let mut s = TreeState::new();
+        s.select(2);
+        s.begin_frame(&nav_input(false, false, false, false, true));
+        register_rows(&mut s, &[(2, 0, false)]);
+        s.end_frame(true);
+        assert!(!s.is_expanded(2), "Enter on a leaf does nothing");
+    }
+
+    #[test]
+    fn nav_is_noop_when_not_focused() {
+        let mut s = TreeState::new();
+        s.select(1);
+        s.begin_frame(&nav_input(false, true, false, false, false));
+        register_rows(&mut s, &[(1, 0, false), (2, 0, false)]);
+        s.end_frame(false); // tree does not hold focus
+        assert!(
+            s.is_selected(1),
+            "arrows must not move selection when unfocused"
+        );
+    }
+
+    #[test]
+    fn held_arrow_steps_once_per_press() {
+        let mut s = TreeState::new();
+        s.select(1);
+        // Frame 1: Down pressed → moves 1 → 2.
+        s.begin_frame(&nav_input(false, true, false, false, false));
+        register_rows(&mut s, &[(1, 0, false), (2, 0, false), (3, 0, false)]);
+        s.end_frame(true);
+        assert!(s.is_selected(2));
+        // Frame 2: Down still held (no rising edge) → no further move.
+        s.begin_frame(&nav_input(false, true, false, false, false));
+        register_rows(&mut s, &[(1, 0, false), (2, 0, false), (3, 0, false)]);
+        s.end_frame(true);
+        assert!(s.is_selected(2), "a held arrow must not auto-repeat");
+        // Frame 3: released then pressed again → steps to 3.
+        s.begin_frame(&nav_input(false, false, false, false, false));
+        register_rows(&mut s, &[(1, 0, false), (2, 0, false), (3, 0, false)]);
+        s.end_frame(true);
+        s.begin_frame(&nav_input(false, true, false, false, false));
+        register_rows(&mut s, &[(1, 0, false), (2, 0, false), (3, 0, false)]);
+        s.end_frame(true);
+        assert!(s.is_selected(3), "a fresh press steps again");
+    }
+
+    #[test]
+    fn click_requests_tree_focus_when_focus_id_set() {
+        let mut s = TreeState::new();
+        s.set_focus_id(77);
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        let th = theme();
+        let input = click_body();
+        {
+            let mut ctx = DrawContext::new(&mut list, &mut focus, &th, &input, 800.0, 600.0);
+            TreeNode::new("branch").draw(1, row(), &mut s, &mut ctx);
+        }
+        assert!(
+            focus.is_focused(77),
+            "clicking a row focuses the tree's FocusId"
         );
     }
 }

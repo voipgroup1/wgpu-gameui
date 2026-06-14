@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use ttf_parser::{Face, GlyphId};
 
 use super::atlas::AtlasRegion;
-use super::glyph_msdf::{generate_glyph_msdf, GlyphMetrics};
+use super::glyph_msdf::{GlyphMetrics, generate_glyph_msdf};
 
 /// Initial atlas dimensions.
 pub(crate) const INITIAL_MSDF_ATLAS_SIZE: u32 = 1024;
@@ -144,11 +144,9 @@ impl MsdfGlyphAtlas {
             return cached.map(|idx| self.tile(idx));
         }
 
-        let generated = Face::parse(font_data, 0)
-            .ok()
-            .and_then(|face| {
-                generate_glyph_msdf(&face, GlyphId(glyph_id), self.ref_px, self.px_range)
-            });
+        let generated = Face::parse(font_data, 0).ok().and_then(|face| {
+            generate_glyph_msdf(&face, GlyphId(glyph_id), self.ref_px, self.px_range)
+        });
 
         match generated {
             Some(g) => {

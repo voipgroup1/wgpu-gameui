@@ -210,7 +210,11 @@ fn instanced_icon_maps_quadrants() {
     assert_eq!(classify(q(0.25, 0.25)), "R", "top-left should be red");
     assert_eq!(classify(q(0.75, 0.25)), "G", "top-right should be green");
     assert_eq!(classify(q(0.25, 0.75)), "B", "bottom-left should be blue");
-    assert_eq!(classify(q(0.75, 0.75)), "Y", "bottom-right should be yellow");
+    assert_eq!(
+        classify(q(0.75, 0.75)),
+        "Y",
+        "bottom-right should be yellow"
+    );
 }
 
 #[test]
@@ -265,7 +269,12 @@ fn instanced_icon_rotation_permutes_quadrants() {
     rot.rotate(std::f32::consts::FRAC_PI_2);
     rot.image(
         sprite,
-        Rect::new(-dest.width / 2.0, -dest.height / 2.0, dest.width, dest.height),
+        Rect::new(
+            -dest.width / 2.0,
+            -dest.height / 2.0,
+            dest.width,
+            dest.height,
+        ),
         [1.0; 4],
     );
     rot.pop_transform();

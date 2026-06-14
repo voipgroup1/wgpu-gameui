@@ -62,7 +62,11 @@ fn render_text_to_png() {
     });
 
     let mut list = DrawList::with_font_system(font_system.clone());
-    list.text(TextBlock::new("Ag", 16.0, 4.0).with_size(64.0).with_color(255, 255, 255));
+    list.text(
+        TextBlock::new("Ag", 16.0, 4.0)
+            .with_size(64.0)
+            .with_color(255, 255, 255),
+    );
     // Outlined (white fill, black 2px outline).
     list.text(
         TextBlock::new("Outlined", 150.0, 20.0)
@@ -176,5 +180,8 @@ fn render_text_to_png() {
             + (p.0[2] as i32 - clear[2] as i32).abs();
         d > 30
     });
-    assert!(drew, "no text pixels rendered — pipeline produced an empty frame");
+    assert!(
+        drew,
+        "no text pixels rendered — pipeline produced an empty frame"
+    );
 }

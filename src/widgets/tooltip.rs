@@ -147,9 +147,10 @@ impl TooltipLayer {
     /// and frame `dt` in seconds. Must be called once per frame *after*
     /// registering regions for that frame.
     pub fn tick(&mut self, dt_seconds: f32, input: &InputState) {
-        let new_idx = self.regions.iter().position(|r| {
-            !input.mouse_consumed && r.rect.contains(input.mouse_x, input.mouse_y)
-        });
+        let new_idx = self
+            .regions
+            .iter()
+            .position(|r| !input.mouse_consumed && r.rect.contains(input.mouse_x, input.mouse_y));
 
         if new_idx != self.hovered_idx {
             // Hover target changed — reset, then count this frame as the
@@ -163,8 +164,7 @@ impl TooltipLayer {
 
     /// Whether the hovered tooltip is currently visible (delay satisfied).
     pub fn is_visible(&self) -> bool {
-        self.hovered_idx.is_some()
-            && self.hover_seconds * 1000.0 >= self.hover_delay_ms as f32
+        self.hovered_idx.is_some() && self.hover_seconds * 1000.0 >= self.hover_delay_ms as f32
     }
 
     /// Render the active tooltip onto a fresh tooltip layer of `layers`.

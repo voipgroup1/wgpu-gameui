@@ -4,8 +4,8 @@ use crate::layout::Rect;
 use crate::text::TextBlock;
 use crate::{InputState, Theme};
 
-use super::scroll_view::{ScrollState, ScrollView};
 use super::DrawList;
+use super::scroll_view::{ScrollState, ScrollView};
 
 /// Column width specification.
 #[derive(Debug, Clone, Copy)]
@@ -193,8 +193,8 @@ impl<'a> Table<'a> {
         let mut hovered_row = None;
         let font_size = theme.font_size * 0.75;
 
-        let mouse_over_content = content_rect.contains(input.mouse_x, input.mouse_y)
-            && !input.mouse_consumed;
+        let mouse_over_content =
+            content_rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
 
         // Snapshot offset for use inside the closure — scroll is borrowed
         // mutably by ScrollView::draw, so we read once up front. Same for
@@ -205,16 +205,18 @@ impl<'a> Table<'a> {
         let mouse_y = input.mouse_y;
         let mouse_clicked = input.mouse_clicked;
 
-        ScrollView::new(content_rect)
-            .vertical_only()
-            .draw(scroll, list, theme, input, |list, vp| {
+        ScrollView::new(content_rect).vertical_only().draw(
+            scroll,
+            list,
+            theme,
+            input,
+            |list, vp| {
                 // The ScrollView has translated by -scroll.offset and clipped
                 // to `vp`. Draw rows in vp-local world coordinates: row N lives
                 // at y = vp.y + N * row_height (pre-translation), which the
                 // ScrollView shifts by -offset for us.
                 let first_visible = (scroll_y / self.row_height).floor() as usize;
-                let visible_count =
-                    (vp.height / self.row_height).ceil() as usize + 1;
+                let visible_count = (vp.height / self.row_height).ceil() as usize + 1;
 
                 let end = (first_visible + visible_count).min(rows.len());
                 for (row_idx, row) in rows
@@ -278,7 +280,8 @@ impl<'a> Table<'a> {
                         x += col_width;
                     }
                 }
-            });
+            },
+        );
 
         TableOutput {
             rect,
@@ -361,18 +364,21 @@ impl<'a> Table<'a> {
                 }
             };
 
-            let text = TextBlock::new(
+            let text_y = list.vcentered_text_y(
+                rect.y,
+                self.header_height,
+                font_size,
+                theme.font.as_ref(),
                 &col.label,
-                text_x,
-                rect.y + (self.header_height - font_size) / 2.0,
-            )
-            .with_size(font_size)
-            .with_color(
-                (theme.text_dim[0] * 255.0) as u8,
-                (theme.text_dim[1] * 255.0) as u8,
-                (theme.text_dim[2] * 255.0) as u8,
-            )
-            .with_font_opt(theme.font.clone());
+            );
+            let text = TextBlock::new(&col.label, text_x, text_y)
+                .with_size(font_size)
+                .with_color(
+                    (theme.text_dim[0] * 255.0) as u8,
+                    (theme.text_dim[1] * 255.0) as u8,
+                    (theme.text_dim[2] * 255.0) as u8,
+                )
+                .with_font_opt(theme.font.clone());
             list.text(text);
 
             x += col_width;
@@ -389,7 +395,13 @@ impl<'a> Table<'a> {
         theme: &Theme,
     ) {
         let padding = 4.0;
-        let text_y = rect.y + (rect.height - font_size) / 2.0;
+        let text_y = list.vcentered_text_y(
+            rect.y,
+            rect.height,
+            font_size,
+            theme.font.as_ref(),
+            &cell.text,
+        );
 
         let text_x = match column.align {
             Align::Left => rect.x + padding,
@@ -429,7 +441,12 @@ mod tests {
 
     fn rows(n: usize) -> Vec<Vec<TableCell>> {
         (0..n)
-            .map(|i| vec![TableCell::new(format!("a{}", i)), TableCell::new(format!("b{}", i))])
+            .map(|i| {
+                vec![
+                    TableCell::new(format!("a{}", i)),
+                    TableCell::new(format!("b{}", i)),
+                ]
+            })
             .collect()
     }
 
@@ -442,7 +459,9 @@ mod tests {
         // row 5: viewport.y + 5*24 - 100 = 20.
         let columns = cols();
         let row_data = rows(50);
-        let table = Table::new(&columns).with_row_height(24.0).with_header(false);
+        let table = Table::new(&columns)
+            .with_row_height(24.0)
+            .with_header(false);
 
         let mut scroll = ScrollState::default();
         scroll.content_size = [200.0, 50.0 * 24.0];
@@ -465,7 +484,14 @@ mod tests {
 
         let mut list = DrawList::new();
         let theme = Theme::default();
-        let out = table.draw(viewport, &row_data, &mut scroll, &mut list, &theme, &mut input);
+        let out = table.draw(
+            viewport,
+            &row_data,
+            &mut scroll,
+            &mut list,
+            &theme,
+            &mut input,
+        );
         assert_eq!(
             out.clicked_row,
             Some(row_idx),
@@ -484,7 +510,9 @@ mod tests {
         // the math could otherwise land on a content-space row position.
         let columns = cols();
         let row_data = rows(50);
-        let table = Table::new(&columns).with_row_height(24.0).with_header(false);
+        let table = Table::new(&columns)
+            .with_row_height(24.0)
+            .with_header(false);
 
         let mut scroll = ScrollState::default();
         scroll.content_size = [200.0, 50.0 * 24.0];
@@ -498,7 +526,14 @@ mod tests {
         };
         let mut list = DrawList::new();
         let theme = Theme::default();
-        let out = table.draw(viewport, &row_data, &mut scroll, &mut list, &theme, &mut input);
+        let out = table.draw(
+            viewport,
+            &row_data,
+            &mut scroll,
+            &mut list,
+            &theme,
+            &mut input,
+        );
         assert_eq!(out.clicked_row, None);
         assert_eq!(out.hovered_row, None);
     }

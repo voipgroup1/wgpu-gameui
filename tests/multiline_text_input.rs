@@ -49,7 +49,11 @@ fn render_field(
 ) -> image::RgbaImage {
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("multiline target"),
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -84,7 +88,12 @@ fn render_field(
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.06, b: 0.08, a: 1.0 }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.05,
+                        g: 0.06,
+                        b: 0.08,
+                        a: 1.0,
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -109,7 +118,11 @@ fn render_field(
                 rows_per_image: Some(H),
             },
         },
-        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
     );
     queue.submit(Some(encoder.finish()));
 
@@ -132,13 +145,23 @@ fn render_focused_multiline_text_input() {
     let mut ui = UiRenderer::new(&device, &queue, format, font_system.clone());
 
     const FIELD_ID: u64 = 0;
-    let field_rect = Rect { x: 16.0, y: 16.0, width: 320.0, height: 100.0 };
+    let field_rect = Rect {
+        x: 16.0,
+        y: 16.0,
+        width: 320.0,
+        height: 100.0,
+    };
 
     // A focused multiline field with two hard newlines and a long line that
     // wraps at the field width.
-    let mut field = TextInput::new(field_rect.x, field_rect.y, field_rect.width, field_rect.height)
-        .with_multiline(true)
-        .with_value("line one\nsecond line\nthis third line is long enough to wrap onto another row");
+    let mut field = TextInput::new(
+        field_rect.x,
+        field_rect.y,
+        field_rect.width,
+        field_rect.height,
+    )
+    .with_multiline(true)
+    .with_value("line one\nsecond line\nthis third line is long enough to wrap onto another row");
     field.cursor_pos = 0; // caret at the very top first
 
     let mut focus = FocusState::new();
@@ -146,11 +169,20 @@ fn render_focused_multiline_text_input() {
 
     let input = InputState::default();
     let img = render_field(
-        &device, &queue, &mut ui, format, &font_system, &mut field, &mut focus, FIELD_ID, &input,
+        &device,
+        &queue,
+        &mut ui,
+        format,
+        &font_system,
+        &mut field,
+        &mut focus,
+        FIELD_ID,
+        &input,
     );
 
     std::fs::create_dir_all("test_output").unwrap();
-    img.save("test_output/multiline_text_input.png").expect("save png");
+    img.save("test_output/multiline_text_input.png")
+        .expect("save png");
     eprintln!("wrote test_output/multiline_text_input.png");
 
     // (a) Text rendered across MULTIPLE vertical bands — count rows (inside the
@@ -167,7 +199,9 @@ fn render_focused_multiline_text_input() {
     let mut bands = 0u32;
     let mut in_band = false;
     for y in y0..y1 {
-        let count = (x0..x1).filter(|&x| is_textish(img.get_pixel(x, y))).count();
+        let count = (x0..x1)
+            .filter(|&x| is_textish(img.get_pixel(x, y)))
+            .count();
         let row_has_text = count >= 4;
         if row_has_text && !in_band {
             bands += 1;
@@ -191,7 +225,14 @@ fn render_focused_multiline_text_input() {
     // A handful of Enter presses (each one frame) to push the caret below the box.
     for _ in 0..6 {
         let _ = render_field(
-            &device, &queue, &mut ui, format, &font_system, &mut field, &mut focus, FIELD_ID,
+            &device,
+            &queue,
+            &mut ui,
+            format,
+            &font_system,
+            &mut field,
+            &mut focus,
+            FIELD_ID,
             &typed,
         );
     }

@@ -54,10 +54,10 @@
 //!
 //! Tooltips never block input — they're purely visual.
 
+use crate::InputState;
 use crate::layout::Rect;
 use crate::text::FontSystemHandle;
 use crate::widgets::DrawList;
-use crate::InputState;
 
 /// What kind of overlay this layer is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

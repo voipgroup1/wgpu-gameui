@@ -210,8 +210,8 @@ impl ScrollView {
         // Re-clamp against inner viewport (now that we know which bars take space).
         state.clamp([inner_w, inner_h]);
 
-        let mouse_over_inner = inner.contains(input.mouse_x, input.mouse_y)
-            && !input.mouse_consumed;
+        let mouse_over_inner =
+            inner.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
 
         // Wheel input — consumed when over the inner viewport, regardless of
         // whether the offset actually changed (e.g. at a clamp boundary the
@@ -730,13 +730,7 @@ mod tests {
         let mut input = input_at(-10.0, -10.0);
 
         let viewport = Rect::new(0.0, 0.0, 100.0, 100.0);
-        ScrollView::new(viewport).draw(
-            &mut state,
-            &mut list,
-            &theme,
-            &mut input,
-            |_, _| {},
-        );
+        ScrollView::new(viewport).draw(&mut state, &mut list, &theme, &mut input, |_, _| {});
 
         // The corner quad should sit at (viewport.x + width - bar, y + height - bar)
         // = (100 - 6, 100 - 6) = (94, 94). `quad` now records a chrome instance

@@ -94,7 +94,8 @@ impl ProgressBar {
             let font_size = rect.height * 0.7;
             let (text_width, _) = list.measure_text(&text, font_size, None);
             let text_x = rect.x + (rect.width - text_width) / 2.0;
-            let text_y = rect.y + (rect.height - font_size) / 2.0;
+            let text_y =
+                list.vcentered_text_y(rect.y, rect.height, font_size, theme.font.as_ref(), &text);
 
             let block = TextBlock::new(&text, text_x, text_y)
                 .with_size(font_size)
@@ -119,7 +120,8 @@ impl ProgressBar {
     ) {
         // Label on the left
         let font_size = theme.font_size * 0.75;
-        let label_y = rect.y + (rect.height - font_size) / 2.0;
+        let label_y =
+            list.vcentered_text_y(rect.y, rect.height, font_size, theme.font.as_ref(), label);
         let label_block = TextBlock::new(label, rect.x, label_y)
             .with_size(font_size)
             .with_color(

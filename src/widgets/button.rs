@@ -16,11 +16,11 @@
 //! if Button::new("Cancel").bare().draw(rect2, &mut list, &theme, &input) { … }
 //! ```
 
+use crate::Theme;
 use crate::layout::Rect;
-use crate::text::TextBlock;
-use crate::{InputState, Theme};
+use crate::text::{TextAlign, TextBlock};
 
-use super::{DrawContext, DrawList};
+use super::{DrawContext, DrawList, FocusId};
 
 /// Resolved interaction state of a button, shared by the chrome/overlay helpers.
 pub(crate) struct ButtonVisual {
@@ -51,7 +51,13 @@ impl ButtonVisual {
 /// Shared by [`Button`] and [`ImageButton`](super::ImageButton) so both get the
 /// same rounded chrome from a single place. Honors [`Theme::border_radius`]
 /// (0 => square) via [`DrawList::rounded_rect`]/[`DrawList::rounded_rect_outline`].
-pub(crate) fn draw_chrome(list: &mut DrawList, theme: &Theme, rect: Rect, v: &ButtonVisual) {
+pub(crate) fn draw_chrome(
+    list: &mut DrawList,
+    theme: &Theme,
+    rect: Rect,
+    radius: f32,
+    v: &ButtonVisual,
+) {
     let bg = v.bg_color(theme);
     let border_color = if v.hovered && v.enabled {
         theme.accent
@@ -67,13 +73,7 @@ pub(crate) fn draw_chrome(list: &mut DrawList, theme: &Theme, rect: Rect, v: &Bu
     } else {
         [0.0, 0.0, 0.0, 0.0]
     };
-    list.chrome_rect(
-        rect,
-        theme.border_radius,
-        theme.border_width,
-        bg,
-        border,
-    );
+    list.chrome_rect(rect, radius, theme.border_width, bg, border);
 }
 
 /// Draw the bare-button feedback overlay (no background/border): a dim for
@@ -92,23 +92,34 @@ pub(crate) fn draw_bare_overlay(list: &mut DrawList, rect: Rect, v: &ButtonVisua
     list.quad(rect.x, rect.y, rect.width, rect.height, overlay);
 }
 
-/// Centered, vertically-aligned button label clipped to the inner width.
+/// Horizontally- and vertically-centered button label, clipped to the inner
+/// width. The horizontal inset is the theme padding, but capped relative to the
+/// button width so a small button (e.g. a spin-box `+`/`-` stepper) still leaves
+/// room for the glyph instead of pushing it off the edge.
 fn draw_label(list: &mut DrawList, theme: &Theme, rect: Rect, label: &str, enabled: bool) {
     let text_color = if enabled { theme.text } else { theme.text_dim };
+    let inset = theme.padding.min(rect.width * 0.15);
+    // Optically centre the label band (x-height for mixed case, cap height for
+    // all-caps/numeric) — centring by font_size alone leaves the glyph low,
+    // drifting to the bottom on short buttons like spin-box steppers.
+    let text_y = list.vcentered_text_y(
+        rect.y,
+        rect.height,
+        theme.font_size,
+        theme.font.as_ref(),
+        label,
+    );
     list.text(
-        TextBlock::new(
-            label,
-            rect.x + theme.padding,
-            rect.y + (rect.height - theme.font_size) / 2.0,
-        )
-        .with_size(theme.font_size)
-        .with_color(
-            (text_color[0] * 255.0) as u8,
-            (text_color[1] * 255.0) as u8,
-            (text_color[2] * 255.0) as u8,
-        )
-        .with_max_width(rect.width - theme.padding * 2.0)
-        .with_font_opt(theme.font.clone()),
+        TextBlock::new(label, rect.x + inset, text_y)
+            .with_size(theme.font_size)
+            .with_color(
+                (text_color[0] * 255.0) as u8,
+                (text_color[1] * 255.0) as u8,
+                (text_color[2] * 255.0) as u8,
+            )
+            .with_max_width((rect.width - inset * 2.0).max(0.0))
+            .with_align(TextAlign::Center)
+            .with_font_opt(theme.font.clone()),
     );
 }
 
@@ -119,6 +130,13 @@ pub struct Button {
     enabled: bool,
     /// Draw the background + rounded border (default true). `false` => bare.
     chrome: bool,
+    /// Corner radius override for the chrome. `None` uses [`Theme::border_radius`];
+    /// `Some(r)` forces that radius (e.g. `0.0` for square spin-box steppers that
+    /// must sit flush against an adjacent field without rounded inner edges).
+    radius: Option<f32>,
+    /// When set, the button joins the Tab ring under this [`FocusId`] and can be
+    /// activated by Space/Enter while focused.
+    focus_id: Option<FocusId>,
 }
 
 impl Button {
@@ -128,7 +146,25 @@ impl Button {
             label: label.into(),
             enabled: true,
             chrome: true,
+            radius: None,
+            focus_id: None,
         }
+    }
+
+    /// Override the chrome corner radius (default: [`Theme::border_radius`]). Use
+    /// `0.0` for square corners — e.g. spin-box `+`/`-` steppers that abut a
+    /// field and should not round their inner edges.
+    pub fn with_radius(mut self, radius: f32) -> Self {
+        self.radius = Some(radius);
+        self
+    }
+
+    /// Make the button keyboard-focusable under `id`: it joins the Tab ring,
+    /// draws a focus ring while focused, and activates on Space/Enter (in
+    /// addition to mouse clicks). Clicking it also moves focus to it.
+    pub fn focusable(mut self, id: FocusId) -> Self {
+        self.focus_id = Some(id);
+        self
     }
 
     /// Enable/disable the button (disabled => dimmed, no hover/click).
@@ -149,39 +185,56 @@ impl Button {
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return false;
         }
-        let list = &mut *ctx.draw_list;
-        let theme = ctx.theme;
         let input = ctx.input;
+        let theme = ctx.theme;
 
-        let hovered = self.enabled && rect.contains(input.mouse_x, input.mouse_y);
+        // Honor layer capture so a button under a modal/popup doesn't react to
+        // clicks meant for the overlay.
+        let hovered =
+            self.enabled && !input.mouse_consumed && rect.contains(input.mouse_x, input.mouse_y);
         let pressed = hovered && input.mouse_down;
         let clicked = hovered && input.mouse_clicked;
+        let key_activate = input.enter_pressed || input.key_space;
         let v = ButtonVisual {
             enabled: self.enabled,
             hovered,
             pressed,
         };
 
-        if self.chrome {
-            draw_chrome(list, theme, rect, &v);
-        } else {
-            draw_bare_overlay(list, rect, &v);
+        {
+            let list = &mut *ctx.draw_list;
+            if self.chrome {
+                let radius = self.radius.unwrap_or(theme.border_radius);
+                draw_chrome(list, theme, rect, radius, &v);
+            } else {
+                draw_bare_overlay(list, rect, &v);
+            }
+            draw_label(list, theme, rect, &self.label, self.enabled);
         }
-        draw_label(list, theme, rect, &self.label, self.enabled);
 
-        clicked
+        // Keyboard focus + Space/Enter activation (opt-in via `focusable`).
+        let mut activated = clicked;
+        if let Some(id) = self.focus_id {
+            ctx.register_focus(id);
+            if clicked {
+                ctx.focus.request(id);
+            }
+            if ctx.focus.is_focused(id) {
+                if self.enabled && key_activate {
+                    activated = true;
+                }
+                ctx.draw_focus_ring(rect);
+            }
+        }
+
+        activated
     }
 
     /// Draw a chrome button at a layout-computed rect. Returns true if clicked.
     ///
     /// Convenience for the common case; equivalent to
     /// `Button::new(label).enabled(enabled).draw(rect, ctx)`.
-    pub fn draw_at(
-        label: &str,
-        rect: Rect,
-        enabled: bool,
-        ctx: &mut DrawContext,
-    ) -> bool {
+    pub fn draw_at(label: &str, rect: Rect, enabled: bool, ctx: &mut DrawContext) -> bool {
         Button::new(label).enabled(enabled).draw(rect, ctx)
     }
 
@@ -196,7 +249,8 @@ impl Button {
         let list = &mut *ctx.draw_list;
         let theme = ctx.theme;
         let input = ctx.input;
-        let hovered = enabled && rect.contains(input.mouse_x, input.mouse_y);
+        let hovered =
+            enabled && !input.mouse_consumed && rect.contains(input.mouse_x, input.mouse_y);
         let pressed = hovered && input.mouse_down;
         let clicked = hovered && input.mouse_clicked;
 
@@ -219,7 +273,7 @@ impl Button {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FocusState;
+    use crate::{FocusState, InputState};
 
     fn input_at(x: f32, y: f32, down: bool, clicked: bool) -> InputState {
         InputState {
@@ -250,7 +304,9 @@ mod tests {
         let mut focus = FocusState::new();
         let theme = Theme::default();
         let input = input_at(50.0, 25.0, true, true);
-        assert!(Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)));
+        assert!(
+            Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input))
+        );
     }
 
     #[test]
@@ -259,7 +315,9 @@ mod tests {
         let mut focus = FocusState::new();
         let theme = Theme::default();
         let input = input_at(500.0, 500.0, true, true);
-        assert!(!Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)));
+        assert!(
+            !Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input))
+        );
     }
 
     #[test]
@@ -268,9 +326,11 @@ mod tests {
         let mut focus = FocusState::new();
         let theme = Theme::default();
         let input = input_at(50.0, 25.0, true, true);
-        assert!(!Button::new("Go")
-            .enabled(false)
-            .draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)));
+        assert!(
+            !Button::new("Go")
+                .enabled(false)
+                .draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input))
+        );
     }
 
     #[test]
@@ -291,12 +351,19 @@ mod tests {
         let input = input_at(0.0, 0.0, false, false);
         let mut focus = FocusState::new();
         let mut chrome = DrawList::new();
-        Button::new("Go").draw(rect(), &mut with_ctx(&mut chrome, &mut focus, &theme, &input));
+        Button::new("Go").draw(
+            rect(),
+            &mut with_ctx(&mut chrome, &mut focus, &theme, &input),
+        );
         let mut bare = DrawList::new();
         Button::new("Go")
             .bare()
             .draw(rect(), &mut with_ctx(&mut bare, &mut focus, &theme, &input));
-        assert_eq!(chrome.chrome_instances.len(), 1, "chrome draws one instance");
+        assert_eq!(
+            chrome.chrome_instances.len(),
+            1,
+            "chrome draws one instance"
+        );
         assert!(bare.chrome_instances.is_empty(), "bare draws no chrome");
         assert!(
             bare.vertices.is_empty(),
@@ -309,13 +376,25 @@ mod tests {
         let theme = Theme::default();
         let mut focus = FocusState::new();
         let mut idle = DrawList::new();
-        Button::new("Go")
-            .bare()
-            .draw(rect(), &mut with_ctx(&mut idle, &mut focus, &theme, &input_at(0.0, 0.0, false, false)));
+        Button::new("Go").bare().draw(
+            rect(),
+            &mut with_ctx(
+                &mut idle,
+                &mut focus,
+                &theme,
+                &input_at(0.0, 0.0, false, false),
+            ),
+        );
         let mut hot = DrawList::new();
-        Button::new("Go")
-            .bare()
-            .draw(rect(), &mut with_ctx(&mut hot, &mut focus, &theme, &input_at(50.0, 25.0, false, false)));
+        Button::new("Go").bare().draw(
+            rect(),
+            &mut with_ctx(
+                &mut hot,
+                &mut focus,
+                &theme,
+                &input_at(50.0, 25.0, false, false),
+            ),
+        );
         assert!(
             hot.chrome_instances.len() > idle.chrome_instances.len(),
             "bare hover should add an overlay quad (instanced)"
@@ -328,10 +407,160 @@ mod tests {
         let input = input_at(50.0, 25.0, true, true);
         let mut focus = FocusState::new();
         let mut a = DrawList::new();
-        let ra = Button::draw_at("Go", rect(), true, &mut with_ctx(&mut a, &mut focus, &theme, &input));
+        let ra = Button::draw_at(
+            "Go",
+            rect(),
+            true,
+            &mut with_ctx(&mut a, &mut focus, &theme, &input),
+        );
         let mut b = DrawList::new();
         let rb = Button::new("Go").draw(rect(), &mut with_ctx(&mut b, &mut focus, &theme, &input));
         assert_eq!(ra, rb);
         assert_eq!(a.vertices.len(), b.vertices.len());
+    }
+
+    // ---- Keyboard focus / activation ----
+
+    /// An input with a keyboard edge but no mouse activity.
+    fn key_input(space: bool, enter: bool) -> InputState {
+        InputState {
+            key_space: space,
+            enter_pressed: enter,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn space_activates_only_when_focused() {
+        let theme = Theme::default();
+        let input = key_input(true, false);
+        // Unfocused: Space does nothing.
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        assert!(
+            !Button::new("Go")
+                .focusable(1)
+                .draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)),
+            "Space must not activate an unfocused button"
+        );
+        // Focused: Space activates.
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        focus.focus(1);
+        assert!(
+            Button::new("Go")
+                .focusable(1)
+                .draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)),
+            "Space activates the focused button"
+        );
+    }
+
+    #[test]
+    fn enter_activates_only_when_focused() {
+        let theme = Theme::default();
+        let input = key_input(false, true);
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        assert!(
+            !Button::new("Go")
+                .focusable(1)
+                .draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input))
+        );
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        focus.focus(1);
+        assert!(
+            Button::new("Go")
+                .focusable(1)
+                .draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input))
+        );
+    }
+
+    #[test]
+    fn disabled_button_ignores_keyboard() {
+        let theme = Theme::default();
+        let input = key_input(true, true);
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        focus.focus(1);
+        assert!(
+            !Button::new("Go")
+                .enabled(false)
+                .focusable(1)
+                .draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input))
+        );
+    }
+
+    #[test]
+    fn keyboard_ignored_without_focusable() {
+        // A plain (non-focusable) button never reacts to the keyboard.
+        let theme = Theme::default();
+        let input = key_input(true, true);
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        focus.focus(1);
+        assert!(
+            !Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input))
+        );
+    }
+
+    #[test]
+    fn focus_ring_only_when_focused() {
+        let theme = Theme::default();
+        let idle = input_at(0.0, 0.0, false, false);
+        // Unfocused focusable button: chrome only, no ring.
+        let mut unfocused = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go").focusable(1).draw(
+            rect(),
+            &mut with_ctx(&mut unfocused, &mut focus, &theme, &idle),
+        );
+        // Focused: ring adds outline geometry.
+        let mut focused = DrawList::new();
+        let mut focus = FocusState::new();
+        focus.focus(1);
+        Button::new("Go").focusable(1).draw(
+            rect(),
+            &mut with_ctx(&mut focused, &mut focus, &theme, &idle),
+        );
+        assert!(
+            focused.chrome_instances.len() > unfocused.chrome_instances.len(),
+            "focus ring should add outline geometry when focused"
+        );
+    }
+
+    #[test]
+    fn click_registers_and_requests_focus() {
+        let theme = Theme::default();
+        let input = input_at(50.0, 25.0, true, true);
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go")
+            .focusable(7)
+            .draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input));
+        assert!(
+            focus.is_focused(7),
+            "clicking a focusable button focuses it"
+        );
+    }
+
+    #[test]
+    fn mouse_consumed_suppresses_hover() {
+        // A consumed click (e.g. a modal above) must not let the button hover/click.
+        let theme = Theme::default();
+        let input = InputState {
+            mouse_x: 50.0,
+            mouse_y: 25.0,
+            mouse_down: true,
+            mouse_clicked: true,
+            mouse_consumed: true,
+            ..Default::default()
+        };
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        assert!(
+            !Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)),
+            "mouse_consumed must suppress the click"
+        );
     }
 }

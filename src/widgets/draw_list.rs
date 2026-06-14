@@ -3,7 +3,9 @@
 use crate::affine::Affine2;
 use crate::layout::Rect;
 use crate::render::SpriteId;
-use crate::text::{FontSystemHandle, TextBlock, TextMeasurer};
+#[cfg(feature = "phosphor-icons")]
+use crate::render::{PhosphorIcon, phosphor_glyph_id};
+use crate::text::{FontHandle, FontSystemHandle, FontVMetrics, TextBlock, TextMeasurer};
 
 pub(crate) const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
 
@@ -149,6 +151,26 @@ pub struct NineSliceDraw {
     pub clip: Option<Rect>,
 }
 
+/// A vector icon drawn through the MSDF icon atlas (Phosphor).
+///
+/// Like [`NineSliceDraw`], this stores the **local rect + transform** rather than
+/// pre-baked corners: the renderer fits-and-centers the glyph tile inside `local`
+/// (so placement is bearing-independent) and then transforms the resulting quad
+/// corners, giving rotation/scale support for free.
+#[cfg(feature = "phosphor-icons")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IconMsdf {
+    /// Local-space rect (pre-transform) the icon is fit-centered into.
+    pub local: Rect,
+    /// Affine applied to each fitted quad corner during tessellation.
+    pub transform: Affine2,
+    /// Resolved Phosphor glyph index (from [`PhosphorIcon`] at push time).
+    pub glyph_id: u16,
+    /// Multiplied with the sampled field's fill color. Default white.
+    pub tint: [f32; 4],
+    pub clip: Option<Rect>,
+}
+
 /// Draw list for collecting render commands.
 ///
 /// Owns a transform stack and a tint stack: every primitive method consults
@@ -160,6 +182,9 @@ pub struct DrawList {
     pub texts: Vec<TextBlock>,
     pub icons: Vec<IconDraw>,
     pub nine_slices: Vec<NineSliceDraw>,
+    /// MSDF vector icons (Phosphor), rendered by the text renderer's icon pass.
+    #[cfg(feature = "phosphor-icons")]
+    pub icons_msdf: Vec<IconMsdf>,
     /// Instanced chrome rects (button backgrounds/borders, plus rect/rounded-rect
     /// fills and outlines). Drawn by the chrome pipeline; interleaved with soup
     /// geometry via [`DrawList::color_cmds`].
@@ -191,6 +216,8 @@ impl Default for DrawList {
             texts: Vec::new(),
             icons: Vec::new(),
             nine_slices: Vec::new(),
+            #[cfg(feature = "phosphor-icons")]
+            icons_msdf: Vec::new(),
             chrome_instances: Vec::new(),
             circle_instances: Vec::new(),
             color_cmds: Vec::new(),
@@ -229,6 +256,8 @@ impl DrawList {
             texts: Vec::new(),
             icons: Vec::new(),
             nine_slices: Vec::new(),
+            #[cfg(feature = "phosphor-icons")]
+            icons_msdf: Vec::new(),
             chrome_instances: Vec::new(),
             circle_instances: Vec::new(),
             color_cmds: Vec::new(),
@@ -247,6 +276,8 @@ impl DrawList {
         self.texts.clear();
         self.icons.clear();
         self.nine_slices.clear();
+        #[cfg(feature = "phosphor-icons")]
+        self.icons_msdf.clear();
         self.chrome_instances.clear();
         self.circle_instances.clear();
         self.color_cmds.clear();
@@ -269,6 +300,40 @@ impl DrawList {
         max_width: Option<f32>,
     ) -> (f32, f32) {
         self.text_measurer.measure(text, font_size, max_width)
+    }
+
+    /// Per-font vertical metrics for optical (cap-height) centring, for the given
+    /// font at Normal weight/style (the only combination widget labels centre).
+    /// Cached per font. Exposed mainly so debug tooling can draw the band; most
+    /// callers want [`Self::vcentered_text_y`].
+    pub fn font_vmetrics(&mut self, font: Option<&FontHandle>) -> FontVMetrics {
+        self.text_measurer
+            .vmetrics(font, glyphon::Weight::NORMAL, glyphon::Style::Normal)
+    }
+
+    /// Top `y` for a single-line text block of `font_size` so the label `text` is
+    /// *optically* centred over the span `[top, top + height]`, using the font's
+    /// real metrics.
+    ///
+    /// This is the font-aware counterpart of [`crate::text::vcentered_line_y`]:
+    /// where that centres the em box (ascent+descent, biased low by the empty
+    /// descent space), this centres the band the label's visual mass occupies.
+    /// Which band that is depends on the text — labels with lowercase letters
+    /// centre on the **x-height** body, all-caps/numeric labels on the taller
+    /// **cap-height** band, and labels containing **CJK** on the ideographic ink
+    /// centre (see [`FontVMetrics::center_offset_ratio`]) — so text reads as
+    /// centred across scripts and case. Pass the same `font` the block renders
+    /// with. Degrades to em-box centring when the metrics are unavailable.
+    pub fn vcentered_text_y(
+        &mut self,
+        top: f32,
+        height: f32,
+        font_size: f32,
+        font: Option<&FontHandle>,
+        text: &str,
+    ) -> f32 {
+        let m = self.font_vmetrics(font);
+        top + height / 2.0 - font_size * m.visual_center_ratio(text)
     }
 
     /// Compute per-character cursor x-positions for the given text.
@@ -579,13 +644,7 @@ impl DrawList {
             color,
         );
         // Top side strip
-        self.quad(
-            x0 + radius,
-            y0,
-            rect.width - radius * 2.0,
-            radius,
-            color,
-        );
+        self.quad(x0 + radius, y0, rect.width - radius * 2.0, radius, color);
         // Bottom side strip
         self.quad(
             x0 + radius,
@@ -889,9 +948,9 @@ impl DrawList {
             Some(ColorCmd::Chrome { instances }) if instances.end == idx => {
                 instances.end = idx + 1;
             }
-            _ => self
-                .color_cmds
-                .push(ColorCmd::Chrome { instances: idx..idx + 1 }),
+            _ => self.color_cmds.push(ColorCmd::Chrome {
+                instances: idx..idx + 1,
+            }),
         }
     }
 
@@ -942,9 +1001,9 @@ impl DrawList {
             Some(ColorCmd::Circle { instances }) if instances.end == idx => {
                 instances.end = idx + 1;
             }
-            _ => self
-                .color_cmds
-                .push(ColorCmd::Circle { instances: idx..idx + 1 }),
+            _ => self.color_cmds.push(ColorCmd::Circle {
+                instances: idx..idx + 1,
+            }),
         }
     }
 
@@ -1042,7 +1101,15 @@ impl DrawList {
         let inner = (radius - half).max(0.0);
         let outer = radius + half;
         let segs = Self::circle_segments(outer);
-        self.stroked_arc(center, inner, outer, 0.0, std::f32::consts::TAU, segs, color);
+        self.stroked_arc(
+            center,
+            inner,
+            outer,
+            0.0,
+            std::f32::consts::TAU,
+            segs,
+            color,
+        );
     }
 
     /// Add text. The block's origin is transformed through the current
@@ -1165,6 +1232,27 @@ impl DrawList {
         self.texts.push(block);
     }
 
+    /// Add a vector [`PhosphorIcon`], fit-centered into `rect` and rendered crisp
+    /// at any size through the MSDF icon atlas. `tint` multiplies the fill (use
+    /// `[1.0; 4]` for the icon's natural color). Honors the current transform,
+    /// tint stack, and clip. No-op for a zero-area rect or an unresolvable glyph.
+    #[cfg(feature = "phosphor-icons")]
+    pub fn icon_msdf(&mut self, rect: Rect, icon: PhosphorIcon, tint: [f32; 4]) {
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let Some(glyph_id) = phosphor_glyph_id(icon) else {
+            return;
+        };
+        self.icons_msdf.push(IconMsdf {
+            local: rect,
+            transform: self.current_transform(),
+            glyph_id,
+            tint: self.apply_tint(tint),
+            clip: self.current_clip(),
+        });
+    }
+
     /// Add a textured icon by name. The renderer will resolve `icon_key` against
     /// its `SpriteAtlas` at render time.
     pub fn icon(&mut self, icon_key: &str, x: f32, y: f32, width: f32, height: f32) {
@@ -1225,13 +1313,7 @@ impl DrawList {
         self.push_image(sprite, dest, Some(src_uv), tint);
     }
 
-    fn push_image(
-        &mut self,
-        sprite: SpriteId,
-        dest: Rect,
-        src: Option<[f32; 4]>,
-        tint: [f32; 4],
-    ) {
+    fn push_image(&mut self, sprite: SpriteId, dest: Rect, src: Option<[f32; 4]>, tint: [f32; 4]) {
         let corners = self.current_transform().transform_rect_corners(dest);
         self.icons.push(IconDraw {
             corners,
@@ -1407,7 +1489,10 @@ mod tests {
         let hi = r + t * 0.5 + 1e-3;
         for v in &list.vertices {
             let d = (v.position[0] * v.position[0] + v.position[1] * v.position[1]).sqrt();
-            assert!(d >= lo && d <= hi, "vertex dist {d} outside band [{lo},{hi}]");
+            assert!(
+                d >= lo && d <= hi,
+                "vertex dist {d} outside band [{lo},{hi}]"
+            );
         }
     }
 
@@ -1469,6 +1554,39 @@ mod tests {
         assert_eq!(list.icons[0].tint, [0.5, 0.6, 0.7, 1.0]);
         assert!(list.icons[0].icon_key.is_empty());
         assert_eq!(list.icons[0].src, None);
+    }
+
+    #[cfg(feature = "phosphor-icons")]
+    #[test]
+    fn icon_msdf_records_glyph_tint_transform_and_clip() {
+        use crate::render::PhosphorIcon;
+        let mut list = DrawList::new();
+        list.push_transform();
+        list.translate(40.0, 60.0);
+        list.set_tint([1.0, 1.0, 1.0, 0.5]);
+        list.icon_msdf(
+            Rect::new(0.0, 0.0, 20.0, 20.0),
+            PhosphorIcon::Plus,
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        assert_eq!(list.icons_msdf.len(), 1);
+        let rec = list.icons_msdf[0];
+        // Glyph resolved to a real (non-notdef) id.
+        assert_ne!(rec.glyph_id, 0);
+        // Tint is multiplied by the active tint stack (alpha 1.0 * 0.5).
+        assert_eq!(rec.tint, [1.0, 0.0, 0.0, 0.5]);
+        // The translate transform is carried (origin maps to (40, 60)).
+        let o = rec.transform.transform_point([0.0, 0.0]);
+        assert!((o[0] - 40.0).abs() < 1e-4 && (o[1] - 60.0).abs() < 1e-4);
+    }
+
+    #[cfg(feature = "phosphor-icons")]
+    #[test]
+    fn icon_msdf_skips_zero_rect() {
+        use crate::render::PhosphorIcon;
+        let mut list = DrawList::new();
+        list.icon_msdf(Rect::new(0.0, 0.0, 0.0, 20.0), PhosphorIcon::X, [1.0; 4]);
+        assert!(list.icons_msdf.is_empty());
     }
 
     #[test]
@@ -1583,7 +1701,10 @@ mod tests {
                 }
             }
         }
-        assert!(has_offdiag, "rotated rounded rect should have off-axis vertices");
+        assert!(
+            has_offdiag,
+            "rotated rounded rect should have off-axis vertices"
+        );
     }
 
     #[test]
@@ -1690,7 +1811,13 @@ mod tests {
     fn chrome_rect_bakes_translation_into_world_rect() {
         let mut list = DrawList::new();
         list.translate(100.0, 50.0);
-        list.chrome_rect(Rect::new(5.0, 5.0, 20.0, 10.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        list.chrome_rect(
+            Rect::new(5.0, 5.0, 20.0, 10.0),
+            0.0,
+            0.0,
+            [1.0; 4],
+            [0.0; 4],
+        );
         assert_eq!(list.chrome_instances[0].rect, [105.0, 55.0, 20.0, 10.0]);
     }
 
@@ -1757,7 +1884,13 @@ mod tests {
     fn chrome_rect_falls_back_to_soup_under_rotation() {
         let mut list = DrawList::new();
         list.rotate(std::f32::consts::FRAC_PI_4);
-        list.chrome_rect(Rect::new(0.0, 0.0, 40.0, 20.0), 6.0, 2.0, [1.0; 4], [0.5; 4]);
+        list.chrome_rect(
+            Rect::new(0.0, 0.0, 40.0, 20.0),
+            6.0,
+            2.0,
+            [1.0; 4],
+            [0.5; 4],
+        );
         // No instance recorded; geometry went into the soup, transformed.
         assert!(list.chrome_instances.is_empty());
         assert!(list.color_cmds.is_empty());
@@ -1784,7 +1917,13 @@ mod tests {
     fn chrome_rect_records_active_clip() {
         let mut list = DrawList::new();
         list.push_clip(Rect::new(5.0, 6.0, 30.0, 40.0));
-        list.chrome_rect(Rect::new(0.0, 0.0, 10.0, 10.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        list.chrome_rect(
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            0.0,
+            0.0,
+            [1.0; 4],
+            [0.0; 4],
+        );
         let inst = list.chrome_instances[0];
         assert_eq!(inst.clip, [5.0, 6.0, 30.0, 40.0]);
         assert_eq!(inst.params[2], 1.0); // clip_enabled

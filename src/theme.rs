@@ -21,6 +21,9 @@ pub struct Theme {
     pub text_highlight: [f32; 4],
     pub accent: [f32; 4],
     pub error: [f32; 4],
+    /// Outline color drawn around the keyboard-focused widget. Bright by design
+    /// so the focus ring reads clearly against any widget chrome.
+    pub focus_ring: [f32; 4],
 
     // Tab colors
     pub tab_inactive: [f32; 4],
@@ -31,7 +34,7 @@ pub struct Theme {
     // Progress bar colors
     pub progress_background: [f32; 4],
     pub progress_fill: [f32; 4],
-    pub progress_fill_low: [f32; 4],    // For low values (e.g., hunger critical)
+    pub progress_fill_low: [f32; 4], // For low values (e.g., hunger critical)
     pub progress_fill_medium: [f32; 4], // For medium values
 
     // Sizing
@@ -71,6 +74,7 @@ impl Default for Theme {
             text_highlight: [0.6, 0.8, 1.0, 1.0],
             accent: [0.3, 0.5, 0.9, 1.0],
             error: [0.9, 0.3, 0.3, 1.0],
+            focus_ring: [0.45, 0.62, 1.0, 1.0],
 
             // Tab colors
             tab_inactive: [0.15, 0.15, 0.20, 1.0],
@@ -80,8 +84,8 @@ impl Default for Theme {
 
             // Progress bar colors
             progress_background: [0.10, 0.10, 0.15, 1.0],
-            progress_fill: [0.3, 0.7, 0.4, 1.0],        // Green for good
-            progress_fill_low: [0.8, 0.3, 0.3, 1.0],    // Red for critical
+            progress_fill: [0.3, 0.7, 0.4, 1.0], // Green for good
+            progress_fill_low: [0.8, 0.3, 0.3, 1.0], // Red for critical
             progress_fill_medium: [0.8, 0.7, 0.2, 1.0], // Yellow for medium
 
             // Sizing

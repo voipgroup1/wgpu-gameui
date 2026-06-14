@@ -44,7 +44,11 @@ fn render_span_colours_and_underline() {
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("span target"),
-        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -130,7 +134,12 @@ fn render_span_colours_and_underline() {
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.06, b: 0.08, a: 1.0 }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.05,
+                        g: 0.06,
+                        b: 0.08,
+                        a: 1.0,
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -155,7 +164,11 @@ fn render_span_colours_and_underline() {
                 rows_per_image: Some(H),
             },
         },
-        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
     );
     queue.submit(Some(encoder.finish()));
 
@@ -177,7 +190,10 @@ fn render_span_colours_and_underline() {
             + (p.0[2] as i32 - clear[2] as i32).abs();
         d > 30
     });
-    assert!(rendered, "no pixels rendered — span text pipeline produced an empty frame");
+    assert!(
+        rendered,
+        "no pixels rendered — span text pipeline produced an empty frame"
+    );
 
     // The first row contains red text: verify that somewhere in the top half
     // of the image (rows 0–60) there is a pixel with R channel clearly dominant.
@@ -190,15 +206,22 @@ fn render_span_colours_and_underline() {
             let b = p.0[2] as i32;
             r > 60 && r > g + 30 && r > b + 30
         });
-    assert!(has_red_dominant, "no red-dominant pixel found in the top rows — colour spans may not be working");
+    assert!(
+        has_red_dominant,
+        "no red-dominant pixel found in the top rows — colour spans may not be working"
+    );
 
     // The underline row (y ≈ 100–115) should have yellow pixels (R≈G≫B).
     // We look for any pixel with R>100, G>80, B<50 in that band.
-    let has_yellow_underline = (95..120_u32)
-        .flat_map(|y| (0..W).map(move |x| (x, y)))
-        .any(|(x, y)| {
-            let p = img.get_pixel(x, y);
-            p.0[0] > 100 && p.0[1] > 70 && (p.0[2] as i32) < 50
-        });
-    assert!(has_yellow_underline, "no yellow underline pixels found — underline may not be rendering");
+    let has_yellow_underline =
+        (95..120_u32)
+            .flat_map(|y| (0..W).map(move |x| (x, y)))
+            .any(|(x, y)| {
+                let p = img.get_pixel(x, y);
+                p.0[0] > 100 && p.0[1] > 70 && (p.0[2] as i32) < 50
+            });
+    assert!(
+        has_yellow_underline,
+        "no yellow underline pixels found — underline may not be rendering"
+    );
 }

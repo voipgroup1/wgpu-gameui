@@ -25,7 +25,7 @@
 //! - `render_text_only` — N bare text blocks, identical vs unique labels, to
 //!   attribute how much of `frame_render` is cosmic-text shaping.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use wgpu_gameui::layout::{Anchor, Positioned, Rect, Size, VStack};
 use wgpu_gameui::{
@@ -140,8 +140,15 @@ impl Harness {
                 occlusion_query_set: None,
             });
         }
-        self.ui
-            .render(&self.device, &self.queue, &mut encoder, &self.view, (W, H), 1.0, list);
+        self.ui.render(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &self.view,
+            (W, H),
+            1.0,
+            list,
+        );
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Poll);
     }
@@ -304,11 +311,9 @@ fn bench_render_text_only(c: &mut Criterion) {
 
             let kind = if unique { "unique" } else { "same" };
             group.throughput(Throughput::Elements(count as u64));
-            group.bench_with_input(
-                BenchmarkId::new(kind, count),
-                &count,
-                |b, _| b.iter(|| harness.render_frame(&list)),
-            );
+            group.bench_with_input(BenchmarkId::new(kind, count), &count, |b, _| {
+                b.iter(|| harness.render_frame(&list))
+            });
         }
     }
     group.finish();

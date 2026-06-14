@@ -242,13 +242,50 @@ impl NumberInput {
             let up_rect = Rect::new(rect.x + field_w, rect.y, btn_w, half);
             let down_rect = Rect::new(rect.x + field_w, rect.y + half, btn_w, rect.height - half);
             let can_click = !mouse_consumed;
-            if Button::draw_at("+", up_rect, true, ctx) && can_click {
-                value = self.clamp(value + self.step);
-                stepped = true;
+            // Square corners so the steppers sit flush against the field and each
+            // other without rounded inner edges.
+            #[cfg(feature = "phosphor-icons")]
+            {
+                // Vector +/- icons centred in each stepper. The Button draws only
+                // chrome (empty label); the icon is overlaid on top. The icon
+                // placement is em-scaled (1 em → the button's smaller dimension),
+                // which already leaves ~25% margin, so no extra inset is needed —
+                // and crucially the minus renders as a short bar the width of the
+                // plus's arm, not stretched to the (wider) button.
+                let tint = ctx.theme.text;
+                if Button::new("").with_radius(0.0).draw(up_rect, ctx) && can_click {
+                    value = self.clamp(value + self.step);
+                    stepped = true;
+                }
+                super::Icon::new(crate::render::PhosphorIcon::Plus)
+                    .tint(tint)
+                    .draw(up_rect, ctx.draw_list);
+                if Button::new("").with_radius(0.0).draw(down_rect, ctx) && can_click {
+                    value = self.clamp(value - self.step);
+                    stepped = true;
+                }
+                super::Icon::new(crate::render::PhosphorIcon::Minus)
+                    .tint(tint)
+                    .draw(down_rect, ctx.draw_list);
             }
-            if Button::draw_at("-", down_rect, true, ctx) && can_click {
-                value = self.clamp(value - self.step);
-                stepped = true;
+            // Text fallback when the icon font is compiled out. The label is
+            // centred by Button. Use the typographic MINUS SIGN (U+2212), drawn
+            // on the same math axis as "+" — the ASCII hyphen-minus sits low and
+            // looks bottom-aligned next to the centred plus.
+            #[cfg(not(feature = "phosphor-icons"))]
+            {
+                if Button::new("+").with_radius(0.0).draw(up_rect, ctx) && can_click {
+                    value = self.clamp(value + self.step);
+                    stepped = true;
+                }
+                if Button::new("\u{2212}")
+                    .with_radius(0.0)
+                    .draw(down_rect, ctx)
+                    && can_click
+                {
+                    value = self.clamp(value - self.step);
+                    stepped = true;
+                }
             }
         }
 
@@ -504,7 +541,10 @@ mod tests {
         let input = InputState::default();
         let out = draw_number(&ni, 4.0, 0, &mut ti, rect(), &mut focus, &input);
         assert_eq!(out.value, 4.0);
-        assert_eq!(ti.value, "4.0", "unfocused text is rewritten from the value");
+        assert_eq!(
+            ti.value, "4.0",
+            "unfocused text is rewritten from the value"
+        );
     }
 
     #[test]
@@ -515,6 +555,9 @@ mod tests {
         let input = InputState::default();
         let out = draw_number(&ni, 50.0, 0, &mut ti, rect(), &mut focus, &input);
         assert_eq!(out.value, 10.0);
-        assert!(out.changed, "an out-of-range input clamps and reports changed");
+        assert!(
+            out.changed,
+            "an out-of-range input clamps and reports changed"
+        );
     }
 }

@@ -224,9 +224,15 @@ mod tests {
 
         let (mut i2, t2) = click_at(0.3); // 0.3s < 0.45s
         advance(&mut ct, &mut i2, t2);
-        assert!(i2.mouse_double_clicked, "second click within window must be a double");
+        assert!(
+            i2.mouse_double_clicked,
+            "second click within window must be a double"
+        );
         // Left button click edge still fires on a double-click frame.
-        assert!(i2.mouse_clicked, "mouse_clicked is also true on a double-click frame");
+        assert!(
+            i2.mouse_clicked,
+            "mouse_clicked is also true on a double-click frame"
+        );
     }
 
     #[test]
@@ -255,7 +261,10 @@ mod tests {
         // Third click — very quick, but window was reset.
         let (mut i3, _) = click_at(0.21);
         advance(&mut ct, &mut i3, 0.21);
-        assert!(!i3.mouse_double_clicked, "third click after double must NOT be another double");
+        assert!(
+            !i3.mouse_double_clicked,
+            "third click after double must NOT be another double"
+        );
     }
 
     #[test]
@@ -273,12 +282,18 @@ mod tests {
         // after (0.06s) is 0.06 - NEG_INFINITY = ∞ > threshold → fresh single.
         let (mut i3, _) = click_at(0.06);
         advance(&mut ct, &mut i3, 0.06);
-        assert!(!i3.mouse_double_clicked, "click just after double-reset must be a fresh single");
+        assert!(
+            !i3.mouse_double_clicked,
+            "click just after double-reset must be a fresh single"
+        );
 
         // Two new clicks within the threshold of each other DO produce a double.
         let (mut i4, _) = click_at(0.06 + 0.07); // 0.07s < 0.1s
         advance(&mut ct, &mut i4, 0.06 + 0.07);
-        assert!(i4.mouse_double_clicked, "two quick clicks after reset produce another double");
+        assert!(
+            i4.mouse_double_clicked,
+            "two quick clicks after reset produce another double"
+        );
     }
 
     // ---- Hold detection ----

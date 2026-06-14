@@ -74,6 +74,16 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [x] **P1 — Nine-slice border metadata.** `register_nine_slice(name, sprite,
       border)` on `UiRenderer` records source rect (via SpriteId) + per-side
       borders, with tint per draw.
+- [x] **P1 — Vector icon library (Phosphor, MSDF).** Curated `PhosphorIcon`
+      enum (regular/line weight, MIT TTF vendored under `assets/fonts/phosphor/`)
+      rendered through a dedicated MSDF icon atlas that reuses the text MSDF
+      generator/pipeline (extracted `MsdfTextureGpu` GPU mirror; icon atlas keyed
+      `PHOSPHOR_FONT_ID`, `ref_px = 64`). API: `DrawList::icon_msdf(rect, icon,
+      tint)` (fit-centred into the rect via `fit_centered`, transform/tint/clip
+      aware, rotation-capable) and the stateless `Icon::new(PhosphorIcon).tint(..)
+      .draw(rect, list)` widget. Adopted by the `NumberInput` `+`/`−` steppers.
+      Behind the default-on `phosphor-icons` feature; widgets fall back to text
+      glyphs when it's off.
 - [ ] **P2 — Gradient helpers** (linear/radial). Per-vertex color exists but
       no constructor.
 - [ ] **P2 — Text outline / shadow** (`UiTextOutline`, `UiTextShadow`).
@@ -139,7 +149,8 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `tree_node`/`tree_node_open` (whole-row toggle) + `tree_leaf` are the
       no-icon convenience path, all with automatic per-depth indentation +
       auto-advance and `tree_pop`, backed by `UiState::tree`. Keyboard arrow-nav
-      deferred to the separate keyboard-navigation P1.
+      landed with the keyboard-navigation P1 (see below): `TreeState` nav-ring +
+      `begin_frame`/`register_nav`/`end_frame(focused)`.
 - [x] **P1 — Number input / spin box** with validation. `NumberInput`
       (`src/widgets/number_input.rs`) wraps a `TextInput` (inheriting cursor /
       selection / clipboard) around an `f64` value: parses + clamps to
@@ -150,8 +161,42 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       characters while editing; the value owns the text when unfocused (external
       changes win), and `Enter` canonicalises. Façade
       `UiContext::number_input(id, &mut f64, min, max, step, decimals, w)`.
-- [ ] **P1 — Drag handle / window-mover.**
-- [ ] **P1 — List / grid / virtualized list.** Table is the only iterator.
+- [x] **P1 — Drag handle / window-mover.** `DragHandle`
+      (`src/widgets/drag_handle.rs`) is a draggable grab-zone drawn against a
+      `Rect`/`DrawContext`. It claims a caller-owned `DragCapture` (keyed by a
+      stable `DragId`) on press so it can't fight sliders/scroll-thumbs/adjacent
+      handles, and reports the per-frame pointer movement as
+      `DragHandleOutput { dragging, started, released, delta }`. The delta is
+      *consumed from* `InputState::drag_delta` — i.e. it composes with a
+      caller-owned `DragTracker` (the "uses both" pattern the drag modules
+      describe): run `DragTracker::update` each frame, then thread one shared
+      `DragCapture` into every handle. `DragHandle::new()` draws title-bar chrome
+      (panel background + hover/drag highlight + a centred grip glyph or a
+      left-aligned `with_label`); `bare()` is a chrome-less pure hit-zone.
+      `drag_rect(id, cap, handle_rect, &mut target, ctx)` is the convenience that
+      applies the delta straight to a target `Rect`. Honors `mouse_consumed`.
+      (No `UiContext` flow verb: a free-moving window is absolute-positioned, so
+      it doesn't fit the auto-advance layout flow — use the widget directly with
+      `UiState::drag` as the shared capture.)
+- [x] **P1 — List / grid / virtualized list.** `List` (`src/widgets/list.rs`)
+      is a general virtualized iterator over a flat `count` of items: it sets
+      `ScrollState::content_size` and drives `ScrollView` (vertical), culling to
+      the visible index range so a 10k-item collection costs a screenful. `List`
+      owns no data — the caller passes `count` and a content closure
+      `FnMut(&mut DrawList, Rect, ListItem)`; the widget draws the row chrome
+      (selection/hover/zebra) and handles interaction, the closure fills the
+      cell. Single column is a list; `.columns(n)` packs an `n`-wide grid
+      (left-to-right, top-to-bottom) with `.with_gap(col, row)`. Selection is
+      caller-owned in `ListState` (scroll + selected set + keyboard cursor):
+      `SelectionMode::{None, Single, Multi}` — plain click replaces, Ctrl-click
+      toggles, Shift-click selects the inclusive range from the anchor. With
+      `.focused(true)`, arrow keys move the cursor (Up/Down by a column, Left/
+      Right within a grid row), Home/End jump, Enter/Space activate, and the
+      cursor auto-scrolls into view; edges are debounced like `Tree`. Returns
+      `ListOutput { clicked, activated, hovered, mouse_over_content }`. Honors
+      `mouse_consumed`. Like `Table`/`ScrollView` it takes a raw `&mut
+      InputState` (it consumes the wheel), not a `DrawContext`. No `UiContext`
+      façade yet (raw widget first, as Tree shipped).
 - [ ] **P2 — Color picker.**
 - [ ] **P2 — Separator / divider.**
 - [ ] **P2 — Toast / notification / banner.**
@@ -265,7 +310,22 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `src/widgets/text_input.rs`). Game-side winit plumbing
       (`WindowEvent::Ime` → preedit, `set_ime_allowed`/`set_ime_cursor_area`)
       is a follow-up — the game feeds no keyboard/text input to the UI yet.
-- [ ] **P1 — Keyboard navigation** (Tab/Space-to-activate, arrows in lists).
+- [x] **P1 — Keyboard navigation** (Tab/Space-to-activate, arrows in lists).
+      Opt-in `.focusable(FocusId)` on `Button` / `Checkbox` / `Slider`: when set
+      the widget joins the Tab ring (`ctx.register_focus`), draws a focus ring
+      (new `Theme::focus_ring` + `DrawContext::draw_focus_ring`), requests focus
+      on click, and is keyboard-operable while focused — Button/Checkbox activate
+      on Space/Enter, Slider adjusts on arrows (Left/Down decrement, Right/Up
+      increment by `step` or 1/20 range, clamped). `Slider::focusable` takes a
+      `FocusId` distinct from its `DragId`. `Tree` gets arrow navigation via a
+      `TreeState` nav-ring mirroring `FocusState`: `begin_frame(&InputState)`
+      (rising-edge capture), `register_nav` per row, `end_frame(focused: bool)`
+      — Down/Up move selection, Right expand-then-descend, Left collapse-then-
+      ascend, Enter/Space toggle; gated on `focused` so it can't fight a focused
+      text field. The whole tree is one Tab-stop (`TreeState::set_focus_id`). The
+      `UiContext` façade wires it all: `text_button`/`checkbox` get auto-ids,
+      `slider` reuses its DragId, tree verbs register one reserved `FocusId` and
+      draw the ring on the selected row.
 - [ ] **P2 — Controller / gamepad** input abstraction.
 - [ ] **P2 — Explicit `Frame`/`Ui` builder** that consumes input and produces
       a draw list, instead of implicit `end_frame` that callers can forget.

@@ -15,14 +15,21 @@ mod atlas;
 mod glyph_msdf;
 mod image_cache;
 mod msdf_atlas;
+#[cfg(feature = "phosphor-icons")]
+mod phosphor;
 mod ui_renderer;
 
-pub use glyph_msdf::{generate_glyph_msdf, GlyphMetrics, GlyphMsdf};
-pub use msdf_atlas::{GlyphTile, MsdfGlyphAtlas, DEFAULT_PX_RANGE, DEFAULT_REF_PX};
+pub use glyph_msdf::{GlyphMetrics, GlyphMsdf, generate_glyph_msdf};
+pub use msdf_atlas::{DEFAULT_PX_RANGE, DEFAULT_REF_PX, GlyphTile, MsdfGlyphAtlas};
+
+#[cfg(feature = "phosphor-icons")]
+pub use phosphor::PhosphorIcon;
+#[cfg(feature = "phosphor-icons")]
+pub(crate) use phosphor::{PHOSPHOR_FONT_ID, phosphor_font_data, phosphor_glyph_id};
 
 pub use atlas::{AtlasRegion, SpriteAtlas, SpriteId};
 pub use image_cache::{ImageCache, ImageEntry, ImageError};
-pub use ui_renderer::{NineSliceMeta, UiRenderer};
 pub(crate) use ui_renderer::ortho_matrix;
+pub use ui_renderer::{NineSliceMeta, UiRenderer};
 
 pub use crate::widgets::NineSliceId;

@@ -56,13 +56,7 @@ impl Panel {
             border,
             theme.panel_border,
         );
-        list.quad(
-            self.x,
-            self.y + border,
-            border,
-            inner_h,
-            theme.panel_border,
-        );
+        list.quad(self.x, self.y + border, border, inner_h, theme.panel_border);
         list.quad(
             self.x + self.width - border,
             self.y + border,
@@ -95,13 +89,7 @@ impl Panel {
             border,
             theme.panel_border,
         );
-        list.quad(
-            rect.x,
-            rect.y + border,
-            border,
-            inner_h,
-            theme.panel_border,
-        );
+        list.quad(rect.x, rect.y + border, border, inner_h, theme.panel_border);
         list.quad(
             rect.x + rect.width - border,
             rect.y + border,
@@ -124,7 +112,13 @@ pub fn label(list: &mut DrawList, theme: &Theme, text: &str, x: f32, y: f32) {
 
 /// Label at a layout-computed rect (vertically centered).
 pub fn label_at(list: &mut DrawList, theme: &Theme, text: &str, rect: Rect) {
-    let y = rect.y + (rect.height - theme.font_size) / 2.0;
+    let y = list.vcentered_text_y(
+        rect.y,
+        rect.height,
+        theme.font_size,
+        theme.font.as_ref(),
+        text,
+    );
     list.text(theme.text(text, rect.x + theme.padding, y));
 }
 
@@ -132,7 +126,13 @@ pub fn label_at(list: &mut DrawList, theme: &Theme, text: &str, rect: Rect) {
 pub fn label_centered_at(list: &mut DrawList, theme: &Theme, text: &str, rect: Rect) {
     let (text_width, _) = list.measure_text(text, theme.font_size, None);
     let x = rect.x + (rect.width - text_width) / 2.0;
-    let y = rect.y + (rect.height - theme.font_size) / 2.0;
+    let y = list.vcentered_text_y(
+        rect.y,
+        rect.height,
+        theme.font_size,
+        theme.font.as_ref(),
+        text,
+    );
     list.text(theme.text(text, x, y));
 }
 
@@ -143,6 +143,12 @@ pub fn title(list: &mut DrawList, theme: &Theme, text: &str, x: f32, y: f32) {
 
 /// Title at a layout-computed rect (vertically centered).
 pub fn title_at(list: &mut DrawList, theme: &Theme, text: &str, rect: Rect) {
-    let y = rect.y + (rect.height - theme.font_size_title) / 2.0;
+    let y = list.vcentered_text_y(
+        rect.y,
+        rect.height,
+        theme.font_size_title,
+        theme.font.as_ref(),
+        text,
+    );
     list.text(theme.title(text, rect.x + theme.padding, y));
 }

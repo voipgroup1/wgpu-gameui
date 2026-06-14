@@ -224,9 +224,7 @@ impl DropdownState {
         // Scrolling for long lists.
         let content_h = geom.items.len() as f32 * geom.item_h;
         let max_scroll = (content_h - list_rect.height).max(0.0);
-        if max_scroll > 0.0
-            && li.scroll_delta != 0.0
-            && list_rect.contains(li.mouse_x, li.mouse_y)
+        if max_scroll > 0.0 && li.scroll_delta != 0.0 && list_rect.contains(li.mouse_x, li.mouse_y)
         {
             self.scroll_offset -= li.scroll_delta * geom.item_h;
         }
@@ -316,16 +314,14 @@ impl DropdownState {
                 } else {
                     (txt_r, txt_g, txt_b)
                 };
+                let text_y =
+                    l.vcentered_text_y(iy, geom.item_h, theme.font_size, theme.font.as_ref(), item);
                 l.text(
-                    TextBlock::new(
-                        item.clone(),
-                        list_rect.x + theme.padding,
-                        iy + (geom.item_h - theme.font_size) / 2.0,
-                    )
-                    .with_size(theme.font_size)
-                    .with_color(r, g, b)
-                    .with_max_width(list_rect.width - theme.padding * 2.0)
-                    .with_font_opt(theme.font.clone()),
+                    TextBlock::new(item.clone(), list_rect.x + theme.padding, text_y)
+                        .with_size(theme.font_size)
+                        .with_color(r, g, b)
+                        .with_max_width(list_rect.width - theme.padding * 2.0)
+                        .with_font_opt(theme.font.clone()),
                 );
             }
             l.pop_clip();
@@ -370,7 +366,13 @@ impl DropdownState {
     /// renders immediately (skips the one-frame open latency). Used by the
     /// gallery to snapshot an open dropdown.
     #[doc(hidden)]
-    pub fn open_for_test(&mut self, id: DropdownId, button_rect: Rect, items: &[&str], selected: usize) {
+    pub fn open_for_test(
+        &mut self,
+        id: DropdownId,
+        button_rect: Rect,
+        items: &[&str],
+        selected: usize,
+    ) {
         let geom = OpenGeom {
             id,
             button_rect,
@@ -451,8 +453,7 @@ impl<'a> Dropdown<'a> {
             } else {
                 state.open = Some(id);
                 state.highlighted = self.selected;
-                state.scroll_offset = (self.selected as f32 * ITEM_HEIGHT)
-                    .max(0.0);
+                state.scroll_offset = (self.selected as f32 * ITEM_HEIGHT).max(0.0);
                 state.click_claimed = true;
             }
         } else if keyboard_activate {
@@ -462,8 +463,7 @@ impl<'a> Dropdown<'a> {
             } else {
                 state.open = Some(id);
                 state.highlighted = self.selected;
-                state.scroll_offset = (self.selected as f32 * ITEM_HEIGHT)
-                    .max(0.0);
+                state.scroll_offset = (self.selected as f32 * ITEM_HEIGHT).max(0.0);
                 let geom = OpenGeom {
                     id,
                     button_rect: rect,
@@ -504,16 +504,19 @@ impl<'a> Dropdown<'a> {
         } else {
             theme.text
         });
+        let text_y = list.vcentered_text_y(
+            rect.y,
+            rect.height,
+            theme.font_size,
+            theme.font.as_ref(),
+            label,
+        );
         list.text(
-            TextBlock::new(
-                label,
-                rect.x + theme.padding,
-                rect.y + (rect.height - theme.font_size) / 2.0,
-            )
-            .with_size(theme.font_size)
-            .with_color(r, g, b)
-            .with_max_width(rect.width - theme.padding * 2.0 - CHEVRON * 3.0)
-            .with_font_opt(theme.font.clone()),
+            TextBlock::new(label, rect.x + theme.padding, text_y)
+                .with_size(theme.font_size)
+                .with_color(r, g, b)
+                .with_max_width(rect.width - theme.padding * 2.0 - CHEVRON * 3.0)
+                .with_font_opt(theme.font.clone()),
         );
 
         // Chevron at the right edge: down when closed, up when open.
@@ -597,10 +600,20 @@ mod tests {
         let mut s = DropdownState::new();
         let mut focus = FocusState::new();
         // Click inside button A.
-        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0)));
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &input(true, false, (20.0, 20.0)),
+        );
         assert!(s.is_open(1));
         // Click it again → closes.
-        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0)));
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &input(true, false, (20.0, 20.0)),
+        );
         assert!(!s.is_open(1));
         assert_eq!(s.open(), None);
     }
@@ -610,9 +623,19 @@ mod tests {
         let theme = Theme::default();
         let mut s = DropdownState::new();
         let mut focus = FocusState::new();
-        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0))); // open A
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &input(true, false, (20.0, 20.0)),
+        ); // open A
         assert!(s.is_open(1));
-        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 90.0))); // click B
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &input(true, false, (20.0, 90.0)),
+        ); // click B
         assert!(s.is_open(2));
         assert!(!s.is_open(1));
     }
@@ -622,9 +645,19 @@ mod tests {
         let theme = Theme::default();
         let mut s = DropdownState::new();
         let mut focus = FocusState::new();
-        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0))); // open A
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &input(true, false, (20.0, 20.0)),
+        ); // open A
         assert!(s.is_open(1));
-        frame(&mut s, &mut focus, &theme, &input(false, true, (20.0, 20.0))); // Esc
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &input(false, true, (20.0, 20.0)),
+        ); // Esc
         assert!(!s.is_open(1));
     }
 
@@ -633,10 +666,20 @@ mod tests {
         let theme = Theme::default();
         let mut s = DropdownState::new();
         let mut focus = FocusState::new();
-        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0))); // open A
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &input(true, false, (20.0, 20.0)),
+        ); // open A
         assert!(s.is_open(1));
         // Click far from any button → unclaimed → end_frame closes.
-        frame(&mut s, &mut focus, &theme, &input(true, false, (500.0, 500.0)));
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &input(true, false, (500.0, 500.0)),
+        );
         assert!(!s.is_open(1));
     }
 
@@ -645,7 +688,12 @@ mod tests {
         let theme = Theme::default();
         let mut s = DropdownState::new();
         let mut focus = FocusState::new();
-        frame(&mut s, &mut focus, &theme, &input(true, false, (20.0, 20.0))); // open A
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &input(true, false, (20.0, 20.0)),
+        ); // open A
         frame(&mut s, &mut focus, &theme, &input(false, false, (0.0, 0.0))); // idle
         assert!(s.is_open(1));
     }

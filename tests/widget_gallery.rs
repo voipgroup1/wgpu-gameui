@@ -13,13 +13,14 @@
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    Button, Checkbox, ColumnWidth, DragCapture, DrawContext, DrawList, Dropdown, DropdownState,
-    FocusState, ImageButton, ImageFit, InputState, LayerStack, NumberInput, ProgressBar, ScrollState,
-    ScrollView, Slider, Table, TableCell, TableColumn, Tabs,
-    TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer, TreeAction,
-    TreeNode, TreeState, UiContext, UiRenderer, UiState, SLIDER_SCRUBBER_ICON,
-    SLIDER_TRACK_NINE_SLICE,
+    Button, Checkbox, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList, Dropdown,
+    DropdownState, FocusState, ImageButton, ImageFit, InputState, LayerStack, List, ListItem,
+    ListState, NumberInput, ProgressBar, ScrollState, ScrollView, SelectionMode, Slider, Table,
+    TableCell, TableColumn, Tabs, TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent,
+    TooltipLayer, TreeAction, TreeNode, TreeState, UiContext, UiRenderer, UiState,
 };
+#[cfg(feature = "phosphor-icons")]
+use wgpu_gameui::{Icon, PhosphorIcon};
 
 /// Convenience: build a DrawContext for a single draw call in the gallery.
 fn ctx<'a>(
@@ -170,14 +171,7 @@ fn render_widget_gallery() {
     let frame_sprite = ui.load_sprite_rgba8("frame", 32, 32, &frame_pixels);
     let nine_slice_id = ui.register_nine_slice("frame", frame_sprite, [4, 4, 4, 4]);
 
-    // Slider assets: it draws its track via the `SLIDER_TRACK_NINE_SLICE` key
-    // ("track") and its knob via the `SLIDER_SCRUBBER_ICON` key. Register
-    // placeholders so the slider shows in the gallery (the game ships real art).
-    let track_pixels = solid_with_border(16, [40, 42, 55, 255], [90, 95, 120, 255], 2);
-    let track_sprite = ui.load_sprite_rgba8("slider_track", 16, 16, &track_pixels);
-    ui.register_nine_slice(SLIDER_TRACK_NINE_SLICE, track_sprite, [4, 4, 4, 4]);
-    let knob_pixels = solid_with_border(16, [200, 205, 220, 255], [110, 115, 140, 255], 2);
-    ui.load_sprite_rgba8(SLIDER_SCRUBBER_ICON, 16, 16, &knob_pixels);
+    // (Slider needs no assets — it renders procedurally from the theme.)
 
     let mut layers = LayerStack::new();
     let theme = Theme::default();
@@ -294,6 +288,43 @@ fn render_widget_gallery() {
         let r = flow.cell(list, "Rect outline", 100.0, 32.0);
         list.rect_outline(r, 2.0, [0.70, 0.30, 0.40, 1.0]);
 
+        // ---- Phosphor MSDF icons ---------------------------------------
+        #[cfg(feature = "phosphor-icons")]
+        {
+            flow.section(list, "Icons (Phosphor MSDF)");
+
+            // The full curated set at a single readable size.
+            let set = [
+                ("Plus", PhosphorIcon::Plus),
+                ("Minus", PhosphorIcon::Minus),
+                ("Check", PhosphorIcon::Check),
+                ("X", PhosphorIcon::X),
+                ("CaretUp", PhosphorIcon::CaretUp),
+                ("CaretDown", PhosphorIcon::CaretDown),
+                ("Eye", PhosphorIcon::Eye),
+                ("EyeSlash", PhosphorIcon::EyeSlash),
+                ("Trash", PhosphorIcon::Trash),
+                ("Pencil", PhosphorIcon::PencilSimple),
+                ("Gear", PhosphorIcon::Gear),
+            ];
+            for (label, icon) in set {
+                let r = flow.cell(list, label, 32.0, 32.0);
+                Icon::new(icon).draw(r, list);
+            }
+
+            // A few sizes of one icon to eyeball crispness across scales.
+            for px in [16.0_f32, 24.0, 48.0] {
+                let r = flow.cell(list, &format!("Gear {}px", px as u32), px, px);
+                Icon::new(PhosphorIcon::Gear).draw(r, list);
+            }
+
+            // Tinted.
+            let r = flow.cell(list, "Trash (red)", 32.0, 32.0);
+            Icon::new(PhosphorIcon::Trash)
+                .tint([0.90, 0.25, 0.25, 1.0])
+                .draw(r, list);
+        }
+
         // ---- Text -------------------------------------------------------
         flow.section(list, "Text");
 
@@ -348,6 +379,119 @@ fn render_widget_gallery() {
                 .with_align(TextAlign::Center),
         );
 
+        // ---- Vertical centering (debug) --------------------------------
+        // Visualises the per-label optical centerer (`DrawList::vcentered_text_y`).
+        // The band it centres is chosen from the *text*: a label with lowercase
+        // letters centres on the x-height body; an all-caps/numeric label centres
+        // on the taller cap height. For each sample we draw the container box, the
+        // centred text, and guide lines:
+        //   • GREEN  = the box's geometric centre.
+        //   • RED (two lines) = the band the centerer actually chose (its top and
+        //     the baseline) — its midpoint should sit on the green line.
+        //   • dim GREY = the *other*, non-chosen band top (reference only).
+        // Correct centring ⇒ the red band straddles the green line: for "Hxngy"
+        // the lowercase body sits centred (caps overshoot up, descenders hang
+        // below); for "HX100%" the cap/digit body sits centred.
+        flow.section(list, "Vertical centering (debug)");
+        let samples: [&str; 2] = ["Hxngy", "HX100%"];
+        for sample in samples {
+            for size in [15.0f32, 24.0] {
+                let box_h = (size * 1.25 + 20.0).max(36.0);
+                let has_lc = sample.chars().any(|c| c.is_lowercase());
+                let label = format!(
+                    "{sample} ({}) @ {size:.0}px",
+                    if has_lc { "x" } else { "cap" }
+                );
+                let r = flow.cell(list, &label, 150.0, box_h);
+                // Container.
+                list.rect_outline(r, 1.0, [0.30, 0.34, 0.42, 1.0]);
+                // Centre this exact sample, then recover the band it chose.
+                let ty = list.vcentered_text_y(r.y, r.height, size, theme.font.as_ref(), sample);
+                let m = list.font_vmetrics(theme.font.as_ref());
+                let baseline = ty + m.baseline_ratio * size;
+                let chosen = if has_lc { m.x_ratio } else { m.cap_ratio };
+                let other = if has_lc { m.cap_ratio } else { m.x_ratio };
+                let chosen_top = baseline - chosen * size;
+                let other_top = baseline - other * size;
+                // Green: box centre.
+                list.quad(
+                    r.x,
+                    r.y + r.height / 2.0 - 0.5,
+                    r.width,
+                    1.0,
+                    [0.25, 1.0, 0.45, 0.7],
+                );
+                // Grey (reference): the non-chosen band top.
+                list.quad(r.x, other_top - 0.5, r.width, 1.0, [0.55, 0.58, 0.64, 0.6]);
+                // Red: the chosen band (its top + the baseline) — the centring target.
+                list.quad(r.x, chosen_top - 0.5, r.width, 1.0, [1.0, 0.25, 0.25, 0.95]);
+                list.quad(r.x, baseline - 0.5, r.width, 1.0, [1.0, 0.25, 0.25, 0.95]);
+                list.text(
+                    TextBlock::new(sample, r.x + 6.0, ty)
+                        .with_size(size)
+                        .with_color(228, 232, 240),
+                );
+            }
+        }
+        // CJK centres on the ideographic ink centre: ideographs overhang the em
+        // square and dip below the baseline, so neither the x- nor cap-band
+        // applies. Here RED = the computed visual centre, which should land on the
+        // GREEN box centre with the ideograph optically centred on it. (If no CJK
+        // font is installed the glyphs render as tofu and this falls back to the
+        // cap-band centre.)
+        for sample in ["中字", "あ漢A"] {
+            for size in [15.0f32, 24.0] {
+                let box_h = (size * 1.25 + 20.0).max(36.0);
+                let label = format!("{sample} (cjk) @ {size:.0}px");
+                let r = flow.cell(list, &label, 150.0, box_h);
+                list.rect_outline(r, 1.0, [0.30, 0.34, 0.42, 1.0]);
+                let ty = list.vcentered_text_y(r.y, r.height, size, theme.font.as_ref(), sample);
+                let m = list.font_vmetrics(theme.font.as_ref());
+                let visual_center = ty + m.visual_center_ratio(sample) * size;
+                // Green: box centre.
+                list.quad(
+                    r.x,
+                    r.y + r.height / 2.0 - 0.5,
+                    r.width,
+                    1.0,
+                    [0.25, 1.0, 0.45, 0.7],
+                );
+                // Red: computed ideographic visual centre (should coincide with green).
+                list.quad(
+                    r.x,
+                    visual_center - 0.5,
+                    r.width,
+                    1.0,
+                    [1.0, 0.25, 0.25, 0.95],
+                );
+                list.text(
+                    TextBlock::new(sample, r.x + 6.0, ty)
+                        .with_size(size)
+                        .with_color(228, 232, 240),
+                );
+            }
+        }
+        // Numeric readout of the resolved per-font ratios.
+        let font_name = theme
+            .font
+            .as_ref()
+            .map(|f| f.family().to_string())
+            .unwrap_or_else(|| "default sans (Noto Sans)".to_string());
+        let m = list.font_vmetrics(theme.font.as_ref());
+        let r = flow.cell(list, "resolved ratios", 440.0, 36.0);
+        list.text(
+            TextBlock::new(
+                format!(
+                    "{font_name}: baseline {:.3} · x-height {:.3} · cap {:.3} · cjk-baseline {:.3} · cjk-centre {:.3}  (×font_size)",
+                    m.baseline_ratio, m.x_ratio, m.cap_ratio, m.cjk_baseline_ratio, m.cjk_center_ratio
+                ),
+                r.x,
+                r.y + 9.0,
+            )
+            .with_size(13.0)
+            .with_color(200, 210, 230),
+        );
+
         // ---- Fonts ------------------------------------------------------
         // The bundled Noto Sans family (registered by `shared_font_system`)
         // resolves the default sans-serif and provides real bold/italic faces.
@@ -394,11 +538,31 @@ fn render_widget_gallery() {
                 .with_size(20.0)
                 .with_color(255, 255, 255)
                 .with_spans(vec![
-                    TextSpan { text: "Red".into(), color: Some([1.0, 0.2, 0.2, 1.0]), underline: None },
-                    TextSpan { text: " · ".into(), color: Some([0.8, 0.8, 0.8, 1.0]), underline: None },
-                    TextSpan { text: "Green".into(), color: Some([0.2, 1.0, 0.4, 1.0]), underline: None },
-                    TextSpan { text: " · ".into(), color: Some([0.8, 0.8, 0.8, 1.0]), underline: None },
-                    TextSpan { text: "Blue".into(), color: Some([0.3, 0.6, 1.0, 1.0]), underline: None },
+                    TextSpan {
+                        text: "Red".into(),
+                        color: Some([1.0, 0.2, 0.2, 1.0]),
+                        underline: None,
+                    },
+                    TextSpan {
+                        text: " · ".into(),
+                        color: Some([0.8, 0.8, 0.8, 1.0]),
+                        underline: None,
+                    },
+                    TextSpan {
+                        text: "Green".into(),
+                        color: Some([0.2, 1.0, 0.4, 1.0]),
+                        underline: None,
+                    },
+                    TextSpan {
+                        text: " · ".into(),
+                        color: Some([0.8, 0.8, 0.8, 1.0]),
+                        underline: None,
+                    },
+                    TextSpan {
+                        text: "Blue".into(),
+                        color: Some([0.3, 0.6, 1.0, 1.0]),
+                        underline: None,
+                    },
                 ]),
         );
 
@@ -408,13 +572,21 @@ fn render_widget_gallery() {
                 .with_size(20.0)
                 .with_color(220, 225, 235)
                 .with_spans(vec![
-                    TextSpan { text: "normal ".into(), color: None, underline: None },
+                    TextSpan {
+                        text: "normal ".into(),
+                        color: None,
+                        underline: None,
+                    },
                     TextSpan {
                         text: "underlined".into(),
                         color: Some([1.0, 0.9, 0.3, 1.0]),
                         underline: Some([1.0, 0.8, 0.0, 1.0]),
                     },
-                    TextSpan { text: " end".into(), color: None, underline: None },
+                    TextSpan {
+                        text: " end".into(),
+                        color: None,
+                        underline: None,
+                    },
                 ]),
         );
 
@@ -452,13 +624,43 @@ fn render_widget_gallery() {
         flow.section(list, "Widgets");
 
         let r = flow.cell(list, "Button", 100.0, 32.0);
-        Button::draw_at("Button", r, true, &mut ctx(list, &mut focus, &theme, &input));
+        Button::draw_at(
+            "Button",
+            r,
+            true,
+            &mut ctx(list, &mut focus, &theme, &input),
+        );
 
         let r = flow.cell(list, "Button (bare)", 100.0, 32.0);
-        Button::new("Bare").bare().draw(r, &mut ctx(list, &mut focus, &theme, &input));
+        Button::new("Bare")
+            .bare()
+            .draw(r, &mut ctx(list, &mut focus, &theme, &input));
 
         let r = flow.cell(list, "Button (disabled)", 110.0, 32.0);
-        Button::draw_at("Disabled", r, false, &mut ctx(list, &mut focus, &theme, &input));
+        Button::draw_at(
+            "Disabled",
+            r,
+            false,
+            &mut ctx(list, &mut focus, &theme, &input),
+        );
+
+        // Keyboard-focused button: seed a local focus owner so the focus ring is
+        // visible in the PNG without disturbing the shared focus state.
+        let r = flow.cell(list, "Button (focused)", 110.0, 32.0);
+        {
+            const FOCUSED_BTN: u64 = 300;
+            let btn_idle = InputState {
+                mouse_x: -1.0,
+                mouse_y: -1.0,
+                ..InputState::default()
+            };
+            let mut btn_focus = FocusState::new();
+            btn_focus.focus(FOCUSED_BTN);
+            Button::new("Focused").focusable(FOCUSED_BTN).draw(
+                r,
+                &mut DrawContext::new(list, &mut btn_focus, &theme, &btn_idle, W as f32, 600.0),
+            );
+        }
 
         let cb = Checkbox::new();
         let r = flow.cell(list, "Checkbox", 120.0, 20.0);
@@ -472,7 +674,32 @@ fn render_widget_gallery() {
 
         let r = flow.cell(list, "Slider", 160.0, 24.0);
         let mut capture = DragCapture::default();
-        Slider::new(0.0, 100.0).draw(40.0, 0, &mut capture, r, &mut ctx(list, &mut focus, &theme, &input));
+        Slider::new(0.0, 100.0).draw(
+            40.0,
+            0,
+            &mut capture,
+            r,
+            &mut ctx(list, &mut focus, &theme, &input),
+        );
+
+        // Drag handle / window-mover: a labelled title bar and a bare grip
+        // handle. Static (idle) here — the live delta comes from a DragTracker.
+        let r = flow.cell(list, "Drag handle (title bar)", 200.0, 24.0);
+        let mut dh_cap = DragCapture::default();
+        DragHandle::new().with_label("Inspector").draw(
+            10,
+            &mut dh_cap,
+            r,
+            &mut ctx(list, &mut focus, &theme, &input),
+        );
+
+        let r = flow.cell(list, "Drag handle (grip)", 64.0, 24.0);
+        DragHandle::new().draw(
+            11,
+            &mut dh_cap,
+            r,
+            &mut ctx(list, &mut focus, &theme, &input),
+        );
 
         let r = flow.cell(list, "Tabs", 240.0, 30.0);
         Tabs::new(&["Tab A", "Tab B", "Tab C"]).draw(r, 0, list, &theme, &input);
@@ -552,7 +779,14 @@ fn render_widget_gallery() {
                     NUM_ID,
                     &mut field,
                     r,
-                    &mut DrawContext::new(list, &mut num_focus, &theme, &num_input, W as f32, 600.0),
+                    &mut DrawContext::new(
+                        list,
+                        &mut num_focus,
+                        &theme,
+                        &num_input,
+                        W as f32,
+                        600.0,
+                    ),
                 );
         }
 
@@ -627,9 +861,11 @@ fn render_widget_gallery() {
                     } else {
                         [0.10, 0.12, 0.18, 1.0]
                     };
-                    list.quad(vp.x + 4.0, y + 2.0, vp.width - 12.0, 18.0, bg);
+                    // `vp` already excludes the scrollbar gutter, so fill it
+                    // edge-to-edge; the row only pads its own text.
+                    list.quad(vp.x, y + 2.0, vp.width, 18.0, bg);
                     list.text(
-                        TextBlock::new(&format!("Item #{:02}", i), vp.x + 10.0, y + 3.0)
+                        TextBlock::new(&format!("Item #{:02}", i), vp.x + 8.0, y + 3.0)
                             .with_size(12.0)
                             .with_color(180, 190, 210),
                     );
@@ -661,7 +897,14 @@ fn render_widget_gallery() {
         ];
         let r = flow.cell(list, "Table", 270.0, 88.0);
         list.rounded_rect(r, 4.0, [0.06, 0.07, 0.10, 1.0]);
-        Table::new(columns).draw(r, &rows, &mut ScrollState::default(), list, &theme, &mut input);
+        Table::new(columns).draw(
+            r,
+            &rows,
+            &mut ScrollState::default(),
+            list,
+            &theme,
+            &mut input,
+        );
 
         let r = flow.cell(list, "Image button", 40.0, 40.0);
         ImageButton::sprite(duck)
@@ -682,6 +925,151 @@ fn render_widget_gallery() {
             .fit(ImageFit::Contain)
             .natural_size(48.0, 48.0)
             .draw(r, list, &theme, &input);
+
+        // ---- Lists / Grids (virtualized) --------------------------------
+        flow.section(list, "Lists / Grids");
+
+        // (a) Vertical list: 12 rows, one selected + one hovered (seeded by
+        // pointing the idle mouse at row 4 so the hover background shows).
+        {
+            let items: [&str; 12] = [
+                "Sword", "Shield", "Potion", "Bow", "Arrow", "Helmet", "Gauntlet", "Boots", "Ring",
+                "Amulet", "Scroll", "Torch",
+            ];
+            let r = flow.cell(list, "List (selectable)", 150.0, 150.0);
+            list.rounded_rect(r, 4.0, [0.06, 0.07, 0.10, 1.0]);
+            let hover = InputState {
+                mouse_x: r.x + 20.0,
+                mouse_y: r.y + 22.0 * 4.0 + 8.0,
+                ..InputState::default()
+            };
+            let mut state = ListState::new();
+            state.select_one(1); // "Shield" selected
+            let mut hover_in = hover;
+            List::new()
+                .with_item_height(22.0)
+                .with_zebra(true)
+                .selection(SelectionMode::Single)
+                .draw(
+                    r,
+                    items.len(),
+                    &mut state,
+                    list,
+                    &theme,
+                    &mut hover_in,
+                    |list, cell, it: ListItem| {
+                        // Debug: outline the cell rect handed to the closure, so
+                        // the item's content padding is visible.
+                        list.rect_outline(cell, 1.0, [1.0, 0.25, 0.8, 0.9]);
+                        let c = if it.selected {
+                            (20, 24, 34)
+                        } else {
+                            (200, 210, 230)
+                        };
+                        list.text(
+                            TextBlock::new(items[it.index], cell.x + 8.0, cell.y + 4.0)
+                                .with_size(13.0)
+                                .with_color(c.0, c.1, c.2),
+                        );
+                    },
+                );
+        }
+
+        // (b) Grid: 4 columns of colored tiles with an index label.
+        {
+            let r = flow.cell(list, "Grid (4 cols)", 150.0, 150.0);
+            list.rounded_rect(r, 4.0, [0.06, 0.07, 0.10, 1.0]);
+            let mut state = ListState::new();
+            state.select_one(5);
+            let mut idle_in = InputState {
+                mouse_x: -1.0,
+                mouse_y: -1.0,
+                ..InputState::default()
+            };
+            List::new()
+                .with_item_height(32.0)
+                .columns(4)
+                .with_gap(6.0, 6.0)
+                .selection(SelectionMode::Multi)
+                .draw(
+                    r,
+                    24,
+                    &mut state,
+                    list,
+                    &theme,
+                    &mut idle_in,
+                    |list, cell, it: ListItem| {
+                        // Debug: outline the cell rect handed to the closure.
+                        list.rect_outline(cell, 1.0, [1.0, 0.25, 0.8, 0.9]);
+                        // Tile fill: a hue ramp so the grid reads as distinct cells.
+                        let t = it.index as f32 / 24.0;
+                        let fill = if it.selected {
+                            [0.95, 0.85, 0.30, 1.0]
+                        } else {
+                            [0.20 + 0.5 * t, 0.30, 0.55 - 0.3 * t, 1.0]
+                        };
+                        list.rounded_rect(
+                            Rect::new(
+                                cell.x + 2.0,
+                                cell.y + 2.0,
+                                cell.width - 4.0,
+                                cell.height - 4.0,
+                            ),
+                            3.0,
+                            fill,
+                        );
+                        list.text(
+                            TextBlock::new(&format!("{}", it.index), cell.x + 6.0, cell.y + 9.0)
+                                .with_size(12.0)
+                                .with_color(240, 245, 255),
+                        );
+                    },
+                );
+        }
+
+        // (c) Tall list in a short cell: shows the scrollbar + virtualization
+        // (1000 items, scrolled partway down).
+        {
+            let r = flow.cell(list, "Virtualized (1000)", 150.0, 110.0);
+            list.rounded_rect(r, 4.0, [0.06, 0.07, 0.10, 1.0]);
+            let mut state = ListState::new();
+            state.scroll.offset[1] = 420.0; // scrolled partway
+            let mut idle_in = InputState {
+                mouse_x: -1.0,
+                mouse_y: -1.0,
+                ..InputState::default()
+            };
+            List::new().with_item_height(20.0).draw(
+                r,
+                1000,
+                &mut state,
+                list,
+                &theme,
+                &mut idle_in,
+                |list, cell, it: ListItem| {
+                    // Debug: outline the cell rect handed to the closure. The
+                    // cell already excludes the scrollbar gutter (ScrollView
+                    // reserves it), so the item fills the cell edge-to-edge and
+                    // only pads its *own* text.
+                    list.rect_outline(cell, 1.0, [1.0, 0.25, 0.8, 0.9]);
+                    let bg = if it.index % 2 == 0 {
+                        [0.13, 0.15, 0.20, 1.0]
+                    } else {
+                        [0.09, 0.11, 0.16, 1.0]
+                    };
+                    list.quad(cell.x, cell.y, cell.width, cell.height, bg);
+                    list.text(
+                        TextBlock::new(
+                            &format!("Row #{:04}", it.index),
+                            cell.x + 8.0,
+                            cell.y + 3.0,
+                        )
+                        .with_size(12.0)
+                        .with_color(180, 190, 210),
+                    );
+                },
+            );
+        }
 
         // ---- Instanced chrome (SDF rounded-rect) ------------------------
         // Every `Button` already routes its background+border through the
@@ -842,7 +1230,8 @@ fn render_widget_gallery() {
 
     std::fs::create_dir_all("test_output").unwrap();
     let img = image::RgbaImage::from_raw(W, h, pixels).expect("image from raw");
-    img.save("test_output/widget_gallery.png").expect("save png");
+    img.save("test_output/widget_gallery.png")
+        .expect("save png");
     eprintln!("wrote test_output/widget_gallery.png ({W}x{h})");
 
     // Sanity: at least some pixels are not the clear color.

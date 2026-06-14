@@ -4,7 +4,7 @@ use crate::layout::Rect;
 use crate::text::TextBlock;
 use crate::{SpriteId, Theme};
 
-use super::{DrawContext, DrawList};
+use super::{DrawContext, DrawList, FocusId};
 
 /// Icon keys for checkbox textures. Only used by the string-keyed
 /// [`Checkbox::with_icon_keys`] path; the default rendering is vector-drawn and
@@ -21,7 +21,10 @@ enum BoxStyle {
     /// Pre-resolved sprite handles `(unchecked, checked)`. A `SpriteId` is only
     /// obtained from [`crate::UiRenderer::sprite_id`] *after* the texture is
     /// registered, so this path can never reference a missing sprite.
-    Sprites { unchecked: SpriteId, checked: SpriteId },
+    Sprites {
+        unchecked: SpriteId,
+        checked: SpriteId,
+    },
     /// String-keyed textures `(unchecked, checked)`. Resolved by name at render
     /// time; if the atlas lacks the key the renderer skips it, so this path can
     /// render blank — kept only for callers that knowingly preload these keys.
@@ -48,6 +51,9 @@ enum BoxStyle {
 #[derive(Clone)]
 pub struct Checkbox {
     style: BoxStyle,
+    /// When set, the checkbox joins the Tab ring under this [`FocusId`] and can
+    /// be toggled by Space/Enter while focused.
+    focus_id: Option<FocusId>,
 }
 
 impl Default for Checkbox {
@@ -61,7 +67,16 @@ impl Checkbox {
     pub fn new() -> Self {
         Self {
             style: BoxStyle::Vector,
+            focus_id: None,
         }
+    }
+
+    /// Make the checkbox keyboard-focusable under `id`: it joins the Tab ring,
+    /// draws a focus ring while focused, and toggles on Space/Enter (in addition
+    /// to mouse clicks). Clicking it also moves focus to it.
+    pub fn focusable(mut self, id: FocusId) -> Self {
+        self.focus_id = Some(id);
+        self
     }
 
     /// Render with pre-resolved sprite textures instead of the vector fallback.
@@ -79,11 +94,7 @@ impl Checkbox {
     /// Only use this if you have definitely registered `unchecked`/`checked`
     /// into the atlas — a missing key renders nothing. Prefer
     /// [`Checkbox::with_icons`] (resolved handles) or the vector default.
-    pub fn with_icon_keys(
-        mut self,
-        unchecked: &'static str,
-        checked: &'static str,
-    ) -> Self {
+    pub fn with_icon_keys(mut self, unchecked: &'static str, checked: &'static str) -> Self {
         self.style = BoxStyle::Keys { unchecked, checked };
         self
     }
@@ -92,59 +103,91 @@ impl Checkbox {
     ///
     /// The box is drawn at the left of the rect (square, fitted to rect height),
     /// with the label to its right.
-    pub fn draw(
-        &self,
-        checked: bool,
-        label: &str,
-        rect: Rect,
-        ctx: &mut DrawContext,
-    ) -> bool {
-        let list = &mut *ctx.draw_list;
-        let theme = ctx.theme;
+    pub fn draw(&self, checked: bool, label: &str, rect: Rect, ctx: &mut DrawContext) -> bool {
         let input = ctx.input;
+        let theme = ctx.theme;
         // Honor layer capture (`mouse_consumed`) so a checkbox under a
         // modal/popup doesn't react to clicks meant for the overlay.
         let hovered = rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
         let clicked = hovered && input.mouse_clicked;
+        let key_activate = input.enter_pressed || input.key_space;
 
         // Checkbox box (square, fitted to rect height).
         let size = rect.height;
         let box_rect = Rect::new(rect.x, rect.y, size, size);
 
-        match &self.style {
-            BoxStyle::Vector => draw_vector_box(list, theme, box_rect, checked),
-            BoxStyle::Sprites { unchecked, checked: checked_id } => {
-                let sprite = if checked { *checked_id } else { *unchecked };
-                list.icon_sprite(sprite, box_rect.x, box_rect.y, size, size, [1.0, 1.0, 1.0, 1.0]);
+        {
+            let list = &mut *ctx.draw_list;
+            match &self.style {
+                BoxStyle::Vector => draw_vector_box(list, theme, box_rect, checked),
+                BoxStyle::Sprites {
+                    unchecked,
+                    checked: checked_id,
+                } => {
+                    let sprite = if checked { *checked_id } else { *unchecked };
+                    list.icon_sprite(
+                        sprite,
+                        box_rect.x,
+                        box_rect.y,
+                        size,
+                        size,
+                        [1.0, 1.0, 1.0, 1.0],
+                    );
+                }
+                BoxStyle::Keys {
+                    unchecked,
+                    checked: checked_key,
+                } => {
+                    let key = if checked { *checked_key } else { *unchecked };
+                    list.icon(key, box_rect.x, box_rect.y, size, size);
+                }
             }
-            BoxStyle::Keys { unchecked, checked: checked_key } => {
-                let key = if checked { *checked_key } else { *unchecked };
-                list.icon(key, box_rect.x, box_rect.y, size, size);
+
+            // Hover highlight over the box area.
+            if hovered {
+                list.quad(box_rect.x, box_rect.y, size, size, [1.0, 1.0, 1.0, 0.08]);
+            }
+
+            // Label to the right of the checkbox.
+            if !label.is_empty() {
+                let text_x = rect.x + size + 6.0;
+                let text_y = list.vcentered_text_y(
+                    rect.y,
+                    rect.height,
+                    theme.font_size,
+                    theme.font.as_ref(),
+                    label,
+                );
+                let text_color = theme.text;
+                let text = TextBlock::new(label, text_x, text_y)
+                    .with_size(theme.font_size)
+                    .with_color(
+                        (text_color[0] * 255.0) as u8,
+                        (text_color[1] * 255.0) as u8,
+                        (text_color[2] * 255.0) as u8,
+                    )
+                    .with_font_opt(theme.font.clone());
+                list.text(text);
             }
         }
 
-        // Hover highlight over the box area.
-        if hovered {
-            list.quad(box_rect.x, box_rect.y, size, size, [1.0, 1.0, 1.0, 0.08]);
+        // Keyboard focus + Space/Enter toggle (opt-in via `focusable`). The ring
+        // hugs the box (the control), not the wide label area.
+        let mut toggled = clicked;
+        if let Some(id) = self.focus_id {
+            ctx.register_focus(id);
+            if clicked {
+                ctx.focus.request(id);
+            }
+            if ctx.focus.is_focused(id) {
+                if key_activate {
+                    toggled = true;
+                }
+                ctx.draw_focus_ring(box_rect);
+            }
         }
 
-        // Label to the right of the checkbox.
-        if !label.is_empty() {
-            let text_x = rect.x + size + 6.0;
-            let text_y = rect.y + (rect.height - theme.font_size) / 2.0;
-            let text_color = theme.text;
-            let text = TextBlock::new(label, text_x, text_y)
-                .with_size(theme.font_size)
-                .with_color(
-                    (text_color[0] * 255.0) as u8,
-                    (text_color[1] * 255.0) as u8,
-                    (text_color[2] * 255.0) as u8,
-                )
-                .with_font_opt(theme.font.clone());
-            list.text(text);
-        }
-
-        clicked
+        toggled
     }
 }
 
@@ -270,13 +313,25 @@ mod tests {
 
     #[test]
     fn click_inside_toggles() {
-        let (_, clicked) = draw_cb(&Checkbox::new(), false, "Label", rect(), &click_at(5.0, 10.0));
+        let (_, clicked) = draw_cb(
+            &Checkbox::new(),
+            false,
+            "Label",
+            rect(),
+            &click_at(5.0, 10.0),
+        );
         assert!(clicked, "a click inside the rect should report a toggle");
     }
 
     #[test]
     fn click_outside_does_not_toggle() {
-        let (_, clicked) = draw_cb(&Checkbox::new(), false, "Label", rect(), &click_at(500.0, 500.0));
+        let (_, clicked) = draw_cb(
+            &Checkbox::new(),
+            false,
+            "Label",
+            rect(),
+            &click_at(500.0, 500.0),
+        );
         assert!(!clicked);
     }
 
@@ -300,5 +355,92 @@ mod tests {
     fn contrast_color_picks_black_on_light_and_white_on_dark() {
         assert_eq!(contrast_color([1.0, 1.0, 1.0, 1.0]), [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(contrast_color([0.0, 0.0, 0.0, 1.0]), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    // ---- Keyboard focus / activation ----
+
+    fn key_input(space: bool, enter: bool) -> InputState {
+        InputState {
+            key_space: space,
+            enter_pressed: enter,
+            ..Default::default()
+        }
+    }
+
+    /// Draw with an explicitly seeded focus state.
+    fn draw_focused(cb: &Checkbox, focus: &mut FocusState, input: &InputState) -> (DrawList, bool) {
+        let mut list = DrawList::new();
+        let theme = theme();
+        let toggled = {
+            let mut ctx = DrawContext::new(&mut list, focus, &theme, input, 800.0, 600.0);
+            cb.draw(false, "Label", rect(), &mut ctx)
+        };
+        (list, toggled)
+    }
+
+    #[test]
+    fn space_toggles_only_when_focused() {
+        let cb = Checkbox::new().focusable(1);
+        // Unfocused: Space does nothing.
+        let mut focus = FocusState::new();
+        let (_, t) = draw_focused(&cb, &mut focus, &key_input(true, false));
+        assert!(!t, "Space must not toggle an unfocused checkbox");
+        // Focused: Space toggles.
+        let mut focus = FocusState::new();
+        focus.focus(1);
+        let (_, t) = draw_focused(&cb, &mut focus, &key_input(true, false));
+        assert!(t, "Space toggles the focused checkbox");
+    }
+
+    #[test]
+    fn enter_toggles_only_when_focused() {
+        let cb = Checkbox::new().focusable(1);
+        let mut focus = FocusState::new();
+        let (_, t) = draw_focused(&cb, &mut focus, &key_input(false, true));
+        assert!(!t);
+        let mut focus = FocusState::new();
+        focus.focus(1);
+        let (_, t) = draw_focused(&cb, &mut focus, &key_input(false, true));
+        assert!(t);
+    }
+
+    #[test]
+    fn keyboard_ignored_without_focusable() {
+        let mut focus = FocusState::new();
+        focus.focus(1);
+        let (_, t) = draw_focused(&Checkbox::new(), &mut focus, &key_input(true, true));
+        assert!(!t, "non-focusable checkbox ignores the keyboard");
+    }
+
+    #[test]
+    fn focus_ring_only_when_focused() {
+        let cb = Checkbox::new().focusable(1);
+        let idle = input_at(-1.0, -1.0);
+        let mut focus = FocusState::new();
+        let (unfocused, _) = draw_focused(&cb, &mut focus, &idle);
+        let mut focus = FocusState::new();
+        focus.focus(1);
+        let (focused, _) = draw_focused(&cb, &mut focus, &idle);
+        assert!(
+            focused.chrome_instances.len() > unfocused.chrome_instances.len(),
+            "focus ring should add outline geometry when focused"
+        );
+    }
+
+    #[test]
+    fn click_requests_focus() {
+        let cb = Checkbox::new().focusable(5);
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = theme();
+        let input = click_at(5.0, 10.0);
+        {
+            let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &input, 800.0, 600.0);
+            cb.draw(false, "Label", rect(), &mut ctx);
+        }
+        assert!(
+            focus.is_focused(5),
+            "clicking a focusable checkbox focuses it"
+        );
     }
 }

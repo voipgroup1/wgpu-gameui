@@ -39,8 +39,8 @@
 //! while a modal is open. Click-to-focus already respects `mouse_consumed`,
 //! so a modal won't mis-focus a base-layer widget on click either.
 
-use crate::layout::Rect;
 use crate::InputState;
+use crate::layout::Rect;
 
 /// Stable identity for a focusable widget within one UI surface.
 ///
@@ -110,11 +110,7 @@ impl FocusState {
     pub fn begin_frame(&mut self, input: &InputState) {
         self.order.clear();
         self.tab = if input.key_tab {
-            if input.shift_pressed {
-                -1
-            } else {
-                1
-            }
+            if input.shift_pressed { -1 } else { 1 }
         } else {
             0
         };
@@ -439,7 +435,10 @@ mod tests {
         // End frame with active layer = 2 — Tab should only cycle through
         // [100, 200], ignoring 10 and 20.
         f.end_frame(Some(2));
-        assert!(f.is_focused(100), "Tab jumped to first focusable in layer 2");
+        assert!(
+            f.is_focused(100),
+            "Tab jumped to first focusable in layer 2"
+        );
 
         // Next frame: Tab again, stays within layer 2.
         f.begin_frame(&input(true, false, false, false));
@@ -448,7 +447,10 @@ mod tests {
         f.register_layer(100, 2);
         f.register_layer(200, 2);
         f.end_frame(Some(2));
-        assert!(f.is_focused(200), "Tab cycled to second focusable in layer 2");
+        assert!(
+            f.is_focused(200),
+            "Tab cycled to second focusable in layer 2"
+        );
 
         // Next frame: Tab goes back to 100 (wraps within layer 2).
         f.begin_frame(&input(true, false, false, false));
@@ -472,7 +474,10 @@ mod tests {
         f.register_layer(100, 2);
         f.register_layer(200, 2);
         f.end_frame(None);
-        assert!(f.is_focused(20), "Tab cycled within base order, ignoring layer");
+        assert!(
+            f.is_focused(20),
+            "Tab cycled within base order, ignoring layer"
+        );
     }
 
     #[test]
@@ -485,7 +490,10 @@ mod tests {
         f.register(20);
         // Layer 99 has nothing registered.
         f.end_frame(Some(99));
-        assert!(f.is_focused(20), "falls back to base order when layer has no focusables");
+        assert!(
+            f.is_focused(20),
+            "falls back to base order when layer has no focusables"
+        );
     }
 
     #[test]
@@ -511,6 +519,10 @@ mod tests {
         f.register_layer(200, 2);
         // No request comes in — end_frame should blur due to unclaimed click.
         f.end_frame(Some(2));
-        assert_eq!(f.focused(), None, "unclaimed click blurs even with active layer");
+        assert_eq!(
+            f.focused(),
+            None,
+            "unclaimed click blurs even with active layer"
+        );
     }
 }

@@ -128,7 +128,10 @@ mod tests {
         // Above (+Y world) and ahead: Y-down screen → smaller sy than center.
         let p = Point3::new(0.0, 2.0, -10.0);
         let (_sx, sy, _w) = world_to_screen_na(p, &vp, 800.0, 600.0).expect("in front");
-        assert!(sy < 300.0, "expected above center (smaller sy), got sy={sy}");
+        assert!(
+            sy < 300.0,
+            "expected above center (smaller sy), got sy={sy}"
+        );
     }
 
     #[test]

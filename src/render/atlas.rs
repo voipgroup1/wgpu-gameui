@@ -263,10 +263,20 @@ impl SpriteAtlas {
                 let left_src = (row * r.w * 4) as usize;
                 let right_src = (row * r.w * 4 + (r.w - 1) * 4) as usize;
                 if r.x >= 1 {
-                    put(&mut buf, r.x - 1, r.y + row, &sprite.pixels[left_src..left_src + 4]);
+                    put(
+                        &mut buf,
+                        r.x - 1,
+                        r.y + row,
+                        &sprite.pixels[left_src..left_src + 4],
+                    );
                 }
                 if r.x + r.w < self.width {
-                    put(&mut buf, r.x + r.w, r.y + row, &sprite.pixels[right_src..right_src + 4]);
+                    put(
+                        &mut buf,
+                        r.x + r.w,
+                        r.y + row,
+                        &sprite.pixels[right_src..right_src + 4],
+                    );
                 }
             }
 

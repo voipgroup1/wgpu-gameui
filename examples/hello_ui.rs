@@ -11,9 +11,9 @@ use std::time::Instant;
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    ClickTracker, DragTracker, DrawContext, Dropdown, DropdownState, FocusState, FontHandle,
-    InputState, LayerStack, ScrollState, ScrollView, TextAlign, TextBlock, TextInput, Theme,
-    UiContext, UiRenderer,
+    Button, ClickTracker, DragCapture, DragHandle, DragTracker, DrawContext, Dropdown,
+    DropdownState, FocusState, FontHandle, InputState, LayerStack, ScrollState, ScrollView,
+    TextAlign, TextBlock, TextInput, Theme, UiContext, UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -57,10 +57,8 @@ fn solid_with_border(size: u32, fill: [u8; 4], border: [u8; 4], thickness: u32) 
     let mut out = vec![0u8; (size * size * 4) as usize];
     for y in 0..size {
         for x in 0..size {
-            let on_border = x < thickness
-                || y < thickness
-                || x >= size - thickness
-                || y >= size - thickness;
+            let on_border =
+                x < thickness || y < thickness || x >= size - thickness || y >= size - thickness;
             let c = if on_border { border } else { fill };
             let idx = ((y * size + x) * 4) as usize;
             out[idx..idx + 4].copy_from_slice(&c);
@@ -86,6 +84,12 @@ const TEXT_ID_A: u64 = 0;
 const TEXT_ID_B: u64 = 1;
 /// Focus-independent id for the dropdown.
 const DROPDOWN_ID: u64 = 2;
+/// Drag-capture id for the movable demo box.
+const DRAG_BOX_ID: u64 = 3;
+/// Focus ids for the two keyboard-operable demo buttons (Tab to reach them,
+/// Space/Enter to activate).
+const BTN_A_ID: u64 = 4;
+const BTN_B_ID: u64 = 5;
 
 const DROPDOWN_ITEMS: [&str; 5] = ["Fire", "Water", "Earth", "Air", "Aether"];
 
@@ -104,6 +108,9 @@ struct UiState {
     dropdowns: DropdownState,
     /// Currently selected dropdown option index.
     dropdown_sel: usize,
+    /// Activation count for the two keyboard-operable demo buttons, so the live
+    /// example shows Space/Enter activation working.
+    button_clicks: u32,
 }
 
 struct App {
@@ -116,8 +123,9 @@ struct App {
     drag: DragTracker,
     /// Top-left of the draggable demo box.
     drag_box: Rect,
-    /// True while the demo box is the thing being dragged (press started on it).
-    dragging_box: bool,
+    /// Drag-ownership arbiter for the movable box (so it can't fight other
+    /// draggables for a single pointer gesture).
+    drag_capture: DragCapture,
     /// Double-click and hold detection feeding `input.mouse_double_clicked`/`mouse_held`.
     clicks: ClickTracker,
     /// App start time, for wall-clock timestamps fed to `ClickTracker::update`.
@@ -185,11 +193,7 @@ impl ApplicationHandler for App {
         let mut ui = UiRenderer::new(&device, &queue, format, font_system);
 
         // Upload some sprites.
-        let icon_pixels = checkerboard_pixels(
-            CHECKER_SIZE,
-            [220, 80, 80, 255],
-            [40, 40, 40, 255],
-        );
+        let icon_pixels = checkerboard_pixels(CHECKER_SIZE, [220, 80, 80, 255], [40, 40, 40, 255]);
         let icon_sprite = ui.load_sprite_rgba8("icon", CHECKER_SIZE, CHECKER_SIZE, &icon_pixels);
 
         let frame_pixels = solid_with_border(32, [180, 180, 200, 255], [60, 60, 90, 255], 4);
@@ -221,14 +225,11 @@ impl ApplicationHandler for App {
         window.request_redraw();
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gpu) = self.gpu.as_mut() else { return };
-        let Some(window) = self.window.as_ref() else { return };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -236,7 +237,8 @@ impl ApplicationHandler for App {
                 gpu.config.width = size.width.max(1);
                 gpu.config.height = size.height.max(1);
                 gpu.surface.configure(&gpu.device, &gpu.config);
-                gpu.ui.resize(&gpu.queue, gpu.config.width, gpu.config.height);
+                gpu.ui
+                    .resize(&gpu.queue, gpu.config.width, gpu.config.height);
                 window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -283,10 +285,7 @@ impl ApplicationHandler for App {
                 self.input.scroll_delta = dy;
                 window.request_redraw();
             }
-            WindowEvent::KeyboardInput {
-                event: ref ke,
-                ..
-            } => {
+            WindowEvent::KeyboardInput { event: ref ke, .. } => {
                 use winit::keyboard::{KeyCode, PhysicalKey};
                 let pressed = ke.state == ElementState::Pressed;
                 // Map physical keys to our input fields.
@@ -294,6 +293,13 @@ impl ApplicationHandler for App {
                     match code {
                         KeyCode::ArrowLeft => self.input.key_left = pressed,
                         KeyCode::ArrowRight => self.input.key_right = pressed,
+                        KeyCode::ArrowUp => self.input.key_up = pressed,
+                        KeyCode::ArrowDown => self.input.key_down = pressed,
+                        KeyCode::Space => {
+                            if pressed {
+                                self.input.key_space = true;
+                            }
+                        }
                         KeyCode::Home => self.input.key_home = pressed,
                         KeyCode::End => self.input.key_end = pressed,
                         KeyCode::Delete => self.input.key_delete = pressed,
@@ -463,13 +469,9 @@ impl ApplicationHandler for App {
                             };
                             list.quad(vp.x + 4.0, y + 2.0, vp.width - 12.0, 20.0, bg);
                             list.text(
-                                TextBlock::new(
-                                    &format!("Row #{:02}", i),
-                                    vp.x + 12.0,
-                                    y + 4.0,
-                                )
-                                .with_size(14.0)
-                                .with_color(200, 210, 230),
+                                TextBlock::new(&format!("Row #{:02}", i), vp.x + 12.0, y + 4.0)
+                                    .with_size(14.0)
+                                    .with_color(200, 210, 230),
                             );
                         }
                     },
@@ -509,6 +511,44 @@ impl ApplicationHandler for App {
                         );
                         self.state.text_input.draw(TEXT_ID_A, &mut ctx);
                         self.state.text_input2.draw(TEXT_ID_B, &mut ctx);
+                    }
+
+                    // Two keyboard-operable buttons sharing the same focus ring
+                    // as the text inputs: Tab/Shift-Tab cycle through inputs and
+                    // buttons; Space/Enter activates a focused button.
+                    {
+                        list.text(
+                            TextBlock::new(
+                                &format!(
+                                    "Buttons (Tab to focus, Space/Enter to click): {} clicks",
+                                    self.state.button_clicks
+                                ),
+                                80.0,
+                                372.0,
+                            )
+                            .with_size(12.0)
+                            .with_color(180, 190, 210),
+                        );
+                        let mut ctx = DrawContext::new(
+                            list,
+                            &mut self.state.focus,
+                            &self.theme,
+                            &base_input,
+                            gpu.config.width as f32,
+                            gpu.config.height as f32,
+                        );
+                        if Button::new("Click A")
+                            .focusable(BTN_A_ID)
+                            .draw(Rect::new(80.0, 390.0, 100.0, 28.0), &mut ctx)
+                        {
+                            self.state.button_clicks += 1;
+                        }
+                        if Button::new("Click B")
+                            .focusable(BTN_B_ID)
+                            .draw(Rect::new(190.0, 390.0, 100.0, 28.0), &mut ctx)
+                        {
+                            self.state.button_clicks += 1;
+                        }
                     }
 
                     self.state.focus.end_frame(None);
@@ -687,27 +727,33 @@ impl ApplicationHandler for App {
                     ui.pop();
                 }
 
-                // ---------- Draggable box demo (DragTracker) ----------
-                // Press starts the grab only if it lands on the box; the box
-                // then follows the per-frame `drag_delta` until the button is
-                // released. `is_dragging` gates out a plain click (no movement).
+                // ---------- Draggable box demo (DragHandle + DragTracker) ----------
+                // `DragHandle::bare()` arbitrates the grab through a shared
+                // `DragCapture` (so it can't fight other draggables) and returns
+                // the per-frame delta sourced from the `DragTracker`. We use the
+                // bare handle as a pure hit-zone and keep the box's own visuals.
                 {
-                    let on_box = !base_input.mouse_consumed
-                        && self
-                            .drag_box
-                            .contains(base_input.mouse_x, base_input.mouse_y);
-                    if base_input.mouse_clicked && on_box {
-                        self.dragging_box = true;
-                    }
-                    if !base_input.mouse_down {
-                        self.dragging_box = false;
-                    }
-                    if self.dragging_box && base_input.is_dragging {
-                        self.drag_box.x += base_input.drag_delta[0];
-                        self.drag_box.y += base_input.drag_delta[1];
-                    }
+                    let handle_rect = self.drag_box;
+                    let out = {
+                        let mut ctx = DrawContext::new(
+                            layers.base_mut(),
+                            &mut self.state.focus,
+                            &self.theme,
+                            &base_input,
+                            gpu.config.width as f32,
+                            gpu.config.height as f32,
+                        );
+                        DragHandle::bare().draw(
+                            DRAG_BOX_ID,
+                            &mut self.drag_capture,
+                            handle_rect,
+                            &mut ctx,
+                        )
+                    };
+                    self.drag_box.x += out.delta[0];
+                    self.drag_box.y += out.delta[1];
 
-                    let color = if self.dragging_box {
+                    let color = if out.dragging {
                         [0.95, 0.75, 0.30, 1.0]
                     } else {
                         [0.30, 0.70, 0.55, 1.0]
@@ -715,13 +761,9 @@ impl ApplicationHandler for App {
                     let list = layers.base_mut();
                     list.rounded_rect(self.drag_box, 8.0, color);
                     list.text(
-                        TextBlock::new(
-                            "drag me",
-                            self.drag_box.x + 18.0,
-                            self.drag_box.y + 18.0,
-                        )
-                        .with_size(16.0)
-                        .with_color(20, 24, 28),
+                        TextBlock::new("drag me", self.drag_box.x + 18.0, self.drag_box.y + 18.0)
+                            .with_size(16.0)
+                            .with_color(20, 24, 28),
                     );
                 }
 
@@ -756,9 +798,10 @@ impl ApplicationHandler for App {
                 }
 
                 let mut encoder =
-                    gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("hello_ui encoder"),
-                    });
+                    gpu.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("hello_ui encoder"),
+                        });
 
                 // Clear the frame manually (UiRenderer always loads).
                 {
@@ -814,7 +857,7 @@ fn main() {
         state: UiState::default(),
         drag: DragTracker::new(),
         drag_box: Rect::new(340.0, 360.0, 150.0, 56.0),
-        dragging_box: false,
+        drag_capture: DragCapture::new(),
         clicks: ClickTracker::new(),
         start: Instant::now(),
     };

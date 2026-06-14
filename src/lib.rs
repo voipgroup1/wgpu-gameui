@@ -29,11 +29,11 @@
 mod text;
 
 pub use text::{
-    CaretPos, FontHandle, FontSystemHandle, TextAlign, TextBlock, TextGlow, TextMeasurer,
-    TextOutline, TextRenderer, TextShadow, TextSpan, WrapMode, byte_at_point,
-    byte_on_adjacent_line, caret_for_byte, load_font_bytes, load_font_file,
-    register_bundled_fonts, resolve_span_color, shared_font_system, text_caret_layout,
-    text_cursor_positions,
+    CaretPos, FontHandle, FontSystemHandle, FontVMetrics, TextAlign, TextBlock, TextGlow,
+    TextMeasurer, TextOutline, TextRenderer, TextShadow, TextSpan, WrapMode, byte_at_point,
+    byte_on_adjacent_line, caret_for_byte, load_font_bytes, load_font_file, register_bundled_fonts,
+    resolve_span_color, shared_font_system, text_caret_layout, text_cursor_positions,
+    vcentered_line_y,
 };
 
 /// Font weight and style selectors (re-exported from `glyphon`/`cosmic-text`)
@@ -53,9 +53,11 @@ mod widgets;
 
 pub use affine::Affine2;
 pub use click_tracker::{ClickTracker, DEFAULT_DOUBLE_CLICK_THRESHOLD, DEFAULT_HOLD_THRESHOLD};
-pub use drag_tracker::{DragTracker, DEFAULT_DRAG_THRESHOLD};
-pub use projection::{world_to_screen, world_to_screen_na};
+pub use drag_tracker::{DEFAULT_DRAG_THRESHOLD, DragTracker};
 pub use layer::{Layer, LayerKind, LayerStack};
+pub use projection::{world_to_screen, world_to_screen_na};
+#[cfg(feature = "phosphor-icons")]
+pub use render::PhosphorIcon;
 pub use render::{NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
 pub use theme::Theme;
 pub use ui_context::{AlignH, AlignV, FontSpec, UiContext, UiState};
@@ -220,8 +222,10 @@ impl InputState {
         if self.mouse_consumed {
             return false;
         }
-        self.mouse_x >= x && self.mouse_x < x + width &&
-        self.mouse_y >= y && self.mouse_y < y + height
+        self.mouse_x >= x
+            && self.mouse_x < x + width
+            && self.mouse_y >= y
+            && self.mouse_y < y + height
     }
 
     /// Return a clone of this input that lower layers should see when a
@@ -311,7 +315,10 @@ mod input_state_tests {
         let i = right_pressed();
         let c = i.consumed();
         assert!(c.mouse_consumed);
-        assert!(!c.mouse_right_clicked, "consumed must zero right click edge");
+        assert!(
+            !c.mouse_right_clicked,
+            "consumed must zero right click edge"
+        );
         assert!(!c.mouse_right_released);
         // held-state passes through so other logic can see the button is down
         assert!(c.mouse_right_down, "consumed preserves down-state");

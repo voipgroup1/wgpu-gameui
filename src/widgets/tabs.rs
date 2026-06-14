@@ -125,7 +125,13 @@ impl<'a> Tabs<'a> {
                 theme.text
             };
             let font_size = theme.font_size * 0.8;
-            let text_y = rect.y + (self.tab_height - font_size) / 2.0;
+            let text_y = list.vcentered_text_y(
+                rect.y,
+                self.tab_height,
+                font_size,
+                theme.font.as_ref(),
+                label,
+            );
             let (text_width, _) = list.measure_text(label, font_size, None);
             let text_x = tab_x + (tab_width - text_width) / 2.0;
 

@@ -6,15 +6,15 @@ use std::collections::{HashMap, HashSet};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::TextRenderer;
 use crate::layer::LayerStack;
 use crate::render::atlas::{SpriteAtlas, SpriteId};
-use crate::render::image_cache::{decode_rgba8, ImageCache, ImageEntry, ImageError};
+use crate::render::image_cache::{ImageCache, ImageEntry, ImageError, decode_rgba8};
 use crate::text::FontSystemHandle;
 use crate::widgets::{
     ChromeInstance, CircleInstance, ColorCmd, DrawList, IconDraw, NineSliceDraw, NineSliceId,
     Vertex,
 };
-use crate::TextRenderer;
 
 const SHADER: &str = include_str!("ui.wgsl");
 
@@ -522,11 +522,13 @@ impl UiRenderer {
             mapped_at_creation: false,
         });
 
-        let mut text_renderer =
-            TextRenderer::with_font_system(device, queue, format, font_system);
+        let mut text_renderer = TextRenderer::with_font_system(device, queue, format, font_system);
         // Generate the printable-ASCII MSDF set up front so the first frame that
         // shows text doesn't hitch on per-glyph generation.
         text_renderer.prewarm_ascii(device, queue);
+        // Same for the curated Phosphor icon set.
+        #[cfg(feature = "phosphor-icons")]
+        text_renderer.prewarm_icons(device, queue);
 
         let current_atlas_size = atlas.width();
 
@@ -613,13 +615,7 @@ impl UiRenderer {
     /// The pixels are buffered CPU-side; the atlas texture is re-uploaded lazily
     /// in [`UiRenderer::render`] (or eagerly via [`UiRenderer::flush_atlas`])
     /// so back-to-back loads coalesce into a single GPU upload.
-    pub fn load_sprite_rgba8(
-        &mut self,
-        name: &str,
-        w: u32,
-        h: u32,
-        pixels: &[u8],
-    ) -> SpriteId {
+    pub fn load_sprite_rgba8(&mut self, name: &str, w: u32, h: u32, pixels: &[u8]) -> SpriteId {
         self.atlas.insert(Some(name), w, h, pixels)
     }
 
@@ -747,7 +743,9 @@ impl UiRenderer {
     }
 
     fn create_texture_bg(&self, device: &wgpu::Device) -> wgpu::BindGroup {
-        let view = self.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = self
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ui atlas bg"),
             layout: &self.texture_bind_group_layout,
@@ -850,7 +848,11 @@ impl UiRenderer {
         // in logical pixels. Project logical → NDC by dividing the physical size
         // by the scale factor: a logical point still maps to the same NDC, while
         // the GPU rasterizes onto the full physical target (text self-sharpens).
-        let scale = if scale_factor > 0.0 { scale_factor } else { 1.0 };
+        let scale = if scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
         let logical_w = viewport.0 as f32 / scale;
         let logical_h = viewport.1 as f32 / scale;
         let uniforms = Uniforms {
@@ -924,6 +926,17 @@ impl UiRenderer {
             if !instances.is_empty() {
                 self.draw_icons(device, queue, encoder, view, &instances);
             }
+        }
+
+        // ---------- 3b. MSDF vector icons (Phosphor) ----------
+        // After sprite icons, before text — icons sit under text just like sprite
+        // icons do. Shares the text renderer's MSDF pipeline/uniform/vbo.
+        #[cfg(feature = "phosphor-icons")]
+        {
+            #[cfg(feature = "tracy")]
+            let _s = tracing::info_span!("gameui_icons_msdf").entered();
+            self.text_renderer
+                .render_icons(device, queue, encoder, view, &draw_list.icons_msdf);
         }
 
         // ---------- 4. Text ----------
@@ -1166,7 +1179,11 @@ impl UiRenderer {
         // Upload all chrome instances once.
         let inst_off = if !instances.is_empty() {
             let off = self.ensure_chrome_capacity(device, instances.len());
-            queue.write_buffer(&self.chrome_inst_buffer, off, bytemuck::cast_slice(instances));
+            queue.write_buffer(
+                &self.chrome_inst_buffer,
+                off,
+                bytemuck::cast_slice(instances),
+            );
             self.chrome_inst_offset =
                 off + (instances.len() * std::mem::size_of::<ChromeInstance>()) as u64;
             off
@@ -1562,10 +1579,16 @@ mod tests {
         let m = ortho_matrix(800.0, 600.0);
         // Top-left logical origin → NDC top-left (-1, +1); Y is down in pixels.
         let (x0, y0) = project(&m, 0.0, 0.0);
-        assert!((x0 + 1.0).abs() < 1e-5 && (y0 - 1.0).abs() < 1e-5, "{x0},{y0}");
+        assert!(
+            (x0 + 1.0).abs() < 1e-5 && (y0 - 1.0).abs() < 1e-5,
+            "{x0},{y0}"
+        );
         // Bottom-right logical extent → NDC (+1, -1).
         let (x1, y1) = project(&m, 800.0, 600.0);
-        assert!((x1 - 1.0).abs() < 1e-5 && (y1 + 1.0).abs() < 1e-5, "{x1},{y1}");
+        assert!(
+            (x1 - 1.0).abs() < 1e-5 && (y1 + 1.0).abs() < 1e-5,
+            "{x1},{y1}"
+        );
         // Center → origin.
         let (xc, yc) = project(&m, 400.0, 300.0);
         assert!(xc.abs() < 1e-5 && yc.abs() < 1e-5, "{xc},{yc}");
@@ -1583,8 +1606,10 @@ mod tests {
         for &(px, py) in &[(0.0, 0.0), (250.0, 700.0), (800.0, 800.0)] {
             let (ax, ay) = project(&a, px, py);
             let (bx, by) = project(&b, px, py);
-            assert!((ax - bx).abs() < 1e-6 && (ay - by).abs() < 1e-6,
-                "logical point ({px},{py}) projected differently: a=({ax},{ay}) b=({bx},{by})");
+            assert!(
+                (ax - bx).abs() < 1e-6 && (ay - by).abs() < 1e-6,
+                "logical point ({px},{py}) projected differently: a=({ax},{ay}) b=({bx},{by})"
+            );
         }
     }
 
@@ -1636,7 +1661,17 @@ mod tests {
         // the offset. clip None => clip_enabled 0.
         let t = crate::affine::Affine2::translation(7.0, 11.0);
         let inst = build_nine_slice_instance(
-            5.0, 6.0, 100.0, 80.0, &t, [1.0; 4], None, region, [4, 4, 4, 4], 64, 64,
+            5.0,
+            6.0,
+            100.0,
+            80.0,
+            &t,
+            [1.0; 4],
+            None,
+            region,
+            [4, 4, 4, 4],
+            64,
+            64,
         );
         assert_eq!(inst.lin, [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(inst.translate, [7.0, 11.0, 0.0, 0.0]);
@@ -1654,7 +1689,17 @@ mod tests {
         };
         let identity = crate::affine::Affine2::IDENTITY;
         let inst = build_nine_slice_instance(
-            0.0, 0.0, 100.0, 80.0, &identity, [1.0; 4], None, region, [8, 8, 8, 8], 64, 64,
+            0.0,
+            0.0,
+            100.0,
+            80.0,
+            &identity,
+            [1.0; 4],
+            None,
+            region,
+            [8, 8, 8, 8],
+            64,
+            64,
         );
         // Outer UV origin = region origin (0,0); far edge = 32/64 = 0.5.
         approx4(inst.uv_outer, [0.0, 0.0, 0.5, 0.5]);

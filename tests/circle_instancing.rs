@@ -165,7 +165,10 @@ fn instanced_circle_fill_is_a_disc() {
         .and_then(|i| i.save("test_output/circle_fill.png").ok().map(|_| i));
 
     // Center is filled.
-    assert!(is_red(px(&img, CX as u32, CY as u32)), "center should be red");
+    assert!(
+        is_red(px(&img, CX as u32, CY as u32)),
+        "center should be red"
+    );
     // Well inside the radius is filled.
     assert!(
         is_red(px(&img, (CX + R * 0.5) as u32, CY as u32)),
