@@ -13,13 +13,14 @@
 
 use wgpu_gameui::layout::{Flow as LayoutFlow, HStack, LayoutNode, MainAlign, Rect};
 use wgpu_gameui::{
-    Button, Checkbox, ColorPicker, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList,
-    Dropdown, DropdownState, Easing, FocusState, HitZone, Hsva, ImageButton, ImageFit, InputState,
-    LayerStack, List,
+    Banner, Button, Checkbox, ColorPicker, ColumnWidth, Corner, DragCapture, DragHandle,
+    DrawContext, DrawList, Dropdown, DropdownState, Easing, FocusState, Group, HitZone, Hsva,
+    ImageButton, ImageFit, InputState, LayerStack, List,
     ListItem, ListState, NumberInput, ProgressBar, RadioGroup, ScrollState, ScrollView,
-    SelectionMode, Separator, Slider, StyleKey, StyleOverlay, StyleResolver, Table, TableCell,
-    TableColumn,
-    Tabs, TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer,
+    SelectionMode, Separator, Severity, Slider, StyleKey, StyleOverlay, StyleResolver, Table,
+    TableCell, TableColumn,
+    Tabs, TextAlign, TextBlock, TextInput, Toast, ToastStack, TextSpan, Theme, TooltipContent,
+    TooltipLayer,
     TreeAction, TreeNode, TreeState, UiContext, UiRenderer, UiState, ease, lerp_color,
 };
 #[cfg(feature = "phosphor-icons")]
@@ -1377,6 +1378,70 @@ fn render_widget_gallery() {
                     &mut c,
                 );
             }
+        }
+
+        // --- Group / titled panel ------------------------------------------
+        // A bordered container with a header strip; `draw` returns the inner
+        // content rect, which we fill with a couple of child widgets.
+        flow.section(list, "Group / titled panel");
+        {
+            let style = StyleResolver::new(&theme);
+            let r = flow.cell(list, "Group", 240.0, 130.0);
+            let content = Group::new("Inventory").draw(r, list, &style);
+            // Place children inside the returned content rect.
+            Separator::horizontal().draw(
+                Rect::new(content.x, content.y + 24.0, content.width, 2.0),
+                list,
+                &style,
+            );
+            list.text(
+                TextBlock::new("12 items · 3.4 kg", content.x, content.y)
+                    .with_size(13.0)
+                    .with_color(190, 200, 220),
+            );
+            list.text(
+                TextBlock::new("Capacity: 60%", content.x, content.y + 34.0)
+                    .with_size(13.0)
+                    .with_color(150, 160, 180),
+            );
+        }
+
+        // --- Banners & toasts ----------------------------------------------
+        // Severity banners (info/success/warning/error) and a corner toast stack.
+        // The toast stack normally anchors to the screen; here we translate it
+        // into a reserved cell so it shows inline.
+        flow.section(list, "Banners & toasts");
+        {
+            let style = StyleResolver::new(&theme);
+
+            let banners: [(Banner, f32); 4] = [
+                (Banner::info("A new version is available."), 0.0),
+                (Banner::success("Your settings were saved.").with_title("Saved"), 0.0),
+                (Banner::warning("Low disk space (1.2 GB left)."), 0.0),
+                (Banner::error("Connection lost. Retrying…").with_title("Error"), 0.0),
+            ];
+            for (banner, _) in banners {
+                let h = 52.0;
+                let r = flow.cell(list, "", 300.0, h);
+                banner.draw(r, list, &style);
+            }
+
+            // Inline toast stack: a faint backdrop stands in for the screen, and
+            // a transform maps the stack's (0,0) corner origin into the cell.
+            let r = flow.cell(list, "Toast stack (top-right)", 320.0, 250.0);
+            list.quad(r.x, r.y, r.width, r.height, [0.09, 0.10, 0.13, 1.0]);
+            list.rect_outline(r, 1.0, [0.25, 0.28, 0.34, 1.0]);
+            let mut stack = ToastStack::new()
+                .with_corner(Corner::TopRight)
+                .with_width(232.0)
+                .with_margin(10.0);
+            stack.push(Toast::new(Severity::Success, "Settings saved").with_title("Saved"));
+            stack.push(Toast::new(Severity::Info, "New update available (v1.2)"));
+            stack.push(Toast::new(Severity::Warning, "Low disk space"));
+            list.push_transform();
+            list.translate(r.x, r.y);
+            stack.draw(r.width, r.height, list, &style);
+            list.pop_transform();
         }
 
         // --- Hover animation (easing) --------------------------------------

@@ -234,8 +234,29 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       cell and it sits mid-line), inset trims both ends, and length ≤ 0 draws
       nothing. Defaults are theme-relative: thickness = `StyleKey::BorderWidth`
       (min 1px), color = `StyleKey::PanelBorder`.
-- [ ] **P2 — Toast / notification / banner.**
-- [ ] **P2 — Group / titled panel** (workshop equivalent of `UiWindow`).
+- [x] **P2 — Toast / notification / banner.** `Banner<'a>` is a stateless,
+      non-interactive severity strip (`Severity::{Info,Success,Warning,Error}`):
+      tinted background + left accent bar + optional bold title + wrapped
+      message. Ctors `new/info/success/warning/error`, `.with_title(..)`,
+      `measure_height(list, style, width)` for auto-sizing, `draw(rect, list,
+      style)`. Accent colors are fixed RGBA (theme has no success/warning yet).
+      `ToastStack` is the caller-owned transient layer (mirrors `TooltipLayer`'s
+      `push`/`tick(dt)`/`draw` lifecycle): `push(Toast)`, `tick(dt)` ages and
+      drops past-`ttl` toasts, `draw(screen_w, screen_h, list, style)` renders
+      newest-nearest-corner banners with a last-`fade`-seconds alpha ramp via the
+      draw list's tint stack (no animation state needed). Builders
+      `with_corner(Corner::{Top,Bottom}{Left,Right})/with_width/with_max/
+      with_fade/with_gap/with_margin`; `Toast::new(..).with_title(..).with_ttl(..)`
+      (`DEFAULT_TTL` = 4s).
+- [x] **P2 — Group / titled panel** (workshop equivalent of `UiWindow`).
+      `Group<'a>` is a stateless titled container drawing through a
+      `StyleResolver`: reuses `Panel::draw_at` for the bg+border, adds a
+      lightened header strip (`header_h = FontSize + 2*pad`) with a `PanelBorder`
+      separator and a `TextHighlight`-colored, vertically-centered title.
+      `Group::new(title).with_padding(px)`; `draw(rect, list, style) -> Rect`
+      **returns the inner content rect** (below the header, inset by padding,
+      clamped ≥0) so callers lay children inside; `content_rect(rect, style)`
+      computes it without drawing.
 - [x] **P1 — Tooltip hover delay actually works.** `TooltipLayer::tick(dt,
       input)` accumulates hover time per region; `is_visible()` only
       returns true once the configured `with_delay_ms` has elapsed.

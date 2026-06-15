@@ -1,5 +1,6 @@
 //! UI widgets - buttons, text inputs, panels, etc.
 
+mod banner;
 mod button;
 mod checkbox;
 mod color_picker;
@@ -8,6 +9,7 @@ mod drag_handle;
 mod draw_list;
 mod dropdown;
 mod focus;
+mod group;
 mod hit_zone;
 #[cfg(feature = "phosphor-icons")]
 mod icon;
@@ -23,10 +25,12 @@ mod separator;
 mod slider;
 mod table;
 mod tabs;
+mod toast;
 mod text_input;
 mod tooltip;
 mod tree;
 
+pub use banner::{Banner, Severity};
 pub use button::Button;
 pub use checkbox::{CHECKBOX_CHECKED_ICON, CHECKBOX_ICON, Checkbox};
 pub use color_picker::{ColorPicker, ColorPickerOutput};
@@ -40,6 +44,7 @@ pub use draw_list::{
 };
 pub use dropdown::{Dropdown, DropdownId, DropdownOutput, DropdownState};
 pub use focus::{FocusId, FocusState};
+pub use group::Group;
 pub use hit_zone::{HitZone, HitZoneOutput};
 #[cfg(feature = "phosphor-icons")]
 pub use icon::Icon;
@@ -56,6 +61,7 @@ pub use slider::{Slider, SliderOutput};
 pub use table::{Align, ColumnWidth, Table, TableCell, TableColumn, TableOutput};
 pub use tabs::{Tabs, TabsOutput};
 pub use text_input::TextInput;
+pub use toast::{Corner, DEFAULT_TTL, Toast, ToastStack};
 pub use tooltip::{TooltipContent, TooltipLayer};
 pub use tree::{TreeAction, TreeIcon, TreeId, TreeNode, TreeNodeOutput, TreeState};
 
