@@ -248,8 +248,20 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [x] **P1 — Z-order / layers** (required for popups/modals). `LayerStack`
       provides ordered Modal/Popup/Tooltip layers; `UiRenderer::render_layers`
       renders base → layers in order.
-- [ ] **P2 — Weighted children** beyond equal-share `Fill`.
-- [ ] **P2 — Wrap / flow layout** (inventory grids, mod lists).
+- [x] **P2 — Weighted children** beyond equal-share `Fill`. `StackChild` gained a
+      `pub weight: f32` (default 1.0) and both stacks a `.weight(f32)` last-child
+      builder: `VStack::new(8.0).child_fill(0.0).weight(2.0).child_fill(0.0).weight(1.0)`
+      splits remaining space 2:1. Each `Fill` child gets
+      `remaining * (weight / sum_of_fill_weights)`; default weight 1.0 reduces to
+      the old `remaining / fill_count` byte-identically (back-compat). Ignored for
+      non-`Fill` specs.
+- [x] **P2 — Wrap / flow layout** (inventory grids, mod lists). New
+      `layout::Flow` node: `Flow::new(spacing).with_run_spacing(r).with_padding(p)
+      .item(w, h)…` lays items left-to-right, wrapping to a new row on width
+      overflow. Implements `LayoutNode` (`rects[0]` = bounds, `rects[1..]` = items
+      top-aligned in add order). `content_size()` gives unwrapped single-row
+      extents; `measure_height(width)` returns the true wrapped height for sizing a
+      `Fit`/scroll container around it.
 - [ ] **P2 — Stable node IDs in `LayoutResult`** instead of positional indices
       (today `Vec<Rect>` indexed numerically, fragile under reordering).
 - [ ] **P2 — Borrow/arena API for `LayoutResult.rects`** to avoid per-frame

@@ -451,6 +451,12 @@ pub struct StackChild {
     pub constraint: Constraint,
     /// Alignment on the cross axis (defaults to [`CrossAlign::Stretch`]).
     pub align: CrossAlign,
+    /// Relative share of the remaining main-axis space for [`SizeSpec::Fill`]
+    /// children (defaults to `1.0`). Each `Fill` child receives
+    /// `remaining * (weight / sum_of_fill_weights)`, so two fills at `1.0`/`1.0`
+    /// split evenly while `2.0`/`1.0` gives a 2:1 split. Ignored for non-`Fill`
+    /// children.
+    pub weight: f32,
 }
 
 impl VStack {
@@ -475,6 +481,7 @@ impl VStack {
             cross_size: width,
             constraint: Constraint::default(),
             align: CrossAlign::Stretch,
+            weight: 1.0,
         });
         self
     }
@@ -487,6 +494,7 @@ impl VStack {
             cross_size: width,
             constraint: Constraint::default(),
             align: CrossAlign::Stretch,
+            weight: 1.0,
         });
         self
     }
@@ -499,6 +507,7 @@ impl VStack {
             cross_size: width,
             constraint: Constraint::default(),
             align: CrossAlign::Stretch,
+            weight: 1.0,
         });
         self
     }
@@ -534,6 +543,19 @@ impl VStack {
         }
         self
     }
+
+    /// Set the fill-distribution weight for the most recently added child.
+    ///
+    /// Only affects [`SizeSpec::Fill`] children: remaining space is split in
+    /// proportion to each fill child's weight (default `1.0`). A 2:1 split is
+    /// `…child_fill(w).weight(2.0)…child_fill(w).weight(1.0)`. Negative weights
+    /// are clamped to `0.0`. No-op when there is no child yet.
+    pub fn weight(mut self, weight: f32) -> Self {
+        if let Some(last) = self.children.last_mut() {
+            last.weight = weight.max(0.0);
+        }
+        self
+    }
 }
 
 impl LayoutNode for VStack {
@@ -557,9 +579,9 @@ impl LayoutNode for VStack {
         let inner_width = bounds.width - self.padding * 2.0;
         let inner_height = bounds.height - self.padding * 2.0;
 
-        // Calculate total fixed height and count fill children
+        // Calculate total fixed height and sum fill weights
         let mut fixed_height = 0.0;
-        let mut fill_count = 0;
+        let mut fill_weight = 0.0;
         for (i, child) in self.children.iter().enumerate() {
             if i > 0 {
                 fixed_height += self.spacing;
@@ -567,15 +589,16 @@ impl LayoutNode for VStack {
             match child.size {
                 SizeSpec::Fixed(h) => fixed_height += h,
                 SizeSpec::Percent(p) => fixed_height += inner_height * p,
-                SizeSpec::Fill => fill_count += 1,
+                SizeSpec::Fill => fill_weight += child.weight,
                 SizeSpec::Fit => fixed_height += child.content_size,
             }
         }
 
-        // Distribute remaining space to fill children
+        // Distribute remaining space to fill children in proportion to weight
+        // (equal weights reduce to remaining / fill_count, byte-identical).
         let remaining = (inner_height - fixed_height).max(0.0);
-        let fill_height = if fill_count > 0 {
-            remaining / fill_count as f32
+        let height_per_weight = if fill_weight > 0.0 {
+            remaining / fill_weight
         } else {
             0.0
         };
@@ -590,7 +613,7 @@ impl LayoutNode for VStack {
             let base_height = match child.size {
                 SizeSpec::Fixed(h) => h,
                 SizeSpec::Percent(p) => inner_height * p,
-                SizeSpec::Fill => fill_height,
+                SizeSpec::Fill => height_per_weight * child.weight,
                 SizeSpec::Fit => child.content_size,
             };
             let height = child.constraint.apply(base_height);
@@ -639,6 +662,7 @@ impl HStack {
             cross_size: height,
             constraint: Constraint::default(),
             align: CrossAlign::Stretch,
+            weight: 1.0,
         });
         self
     }
@@ -651,6 +675,7 @@ impl HStack {
             cross_size: height,
             constraint: Constraint::default(),
             align: CrossAlign::Stretch,
+            weight: 1.0,
         });
         self
     }
@@ -663,6 +688,7 @@ impl HStack {
             cross_size: height,
             constraint: Constraint::default(),
             align: CrossAlign::Stretch,
+            weight: 1.0,
         });
         self
     }
@@ -698,6 +724,19 @@ impl HStack {
         }
         self
     }
+
+    /// Set the fill-distribution weight for the most recently added child.
+    ///
+    /// Only affects [`SizeSpec::Fill`] children: remaining space is split in
+    /// proportion to each fill child's weight (default `1.0`). A 2:1 split is
+    /// `…child_fill(h).weight(2.0)…child_fill(h).weight(1.0)`. Negative weights
+    /// are clamped to `0.0`. No-op when there is no child yet.
+    pub fn weight(mut self, weight: f32) -> Self {
+        if let Some(last) = self.children.last_mut() {
+            last.weight = weight.max(0.0);
+        }
+        self
+    }
 }
 
 impl LayoutNode for HStack {
@@ -721,9 +760,9 @@ impl LayoutNode for HStack {
         let inner_width = bounds.width - self.padding * 2.0;
         let inner_height = bounds.height - self.padding * 2.0;
 
-        // Calculate total fixed width and count fill children
+        // Calculate total fixed width and sum fill weights
         let mut fixed_width = 0.0;
-        let mut fill_count = 0;
+        let mut fill_weight = 0.0;
         for (i, child) in self.children.iter().enumerate() {
             if i > 0 {
                 fixed_width += self.spacing;
@@ -731,15 +770,16 @@ impl LayoutNode for HStack {
             match child.size {
                 SizeSpec::Fixed(w) => fixed_width += w,
                 SizeSpec::Percent(p) => fixed_width += inner_width * p,
-                SizeSpec::Fill => fill_count += 1,
+                SizeSpec::Fill => fill_weight += child.weight,
                 SizeSpec::Fit => fixed_width += child.content_size,
             }
         }
 
-        // Distribute remaining space to fill children
+        // Distribute remaining space to fill children in proportion to weight
+        // (equal weights reduce to remaining / fill_count, byte-identical).
         let remaining = (inner_width - fixed_width).max(0.0);
-        let fill_width = if fill_count > 0 {
-            remaining / fill_count as f32
+        let width_per_weight = if fill_weight > 0.0 {
+            remaining / fill_weight
         } else {
             0.0
         };
@@ -754,7 +794,7 @@ impl LayoutNode for HStack {
             let base_width = match child.size {
                 SizeSpec::Fixed(w) => w,
                 SizeSpec::Percent(p) => inner_width * p,
-                SizeSpec::Fill => fill_width,
+                SizeSpec::Fill => width_per_weight * child.weight,
                 SizeSpec::Fit => child.content_size,
             };
             let width = child.constraint.apply(base_width);
@@ -800,6 +840,134 @@ impl LayoutNode for Leaf {
 
     fn layout(&self, bounds: Rect) -> LayoutResult {
         LayoutResult::single(bounds)
+    }
+}
+
+/// Wrapping flow / grid container — children are placed left-to-right and wrap
+/// to a new row when the next item would overflow the bounds width.
+///
+/// Unlike [`VStack`]/[`HStack`] (single-line), `Flow` is the layout for
+/// inventory grids, tag clouds, and mod lists: a run of fixed-size items that
+/// reflow to as many rows as the width requires. Items keep their own
+/// `(width, height)`; rows are as tall as their tallest item.
+///
+/// The wrapped height depends on the available width, which the width-less
+/// [`LayoutNode::content_size`] can't express — so [`content_size`](Self::content_size)
+/// reports the *unwrapped single-row* extents, and callers that need the true
+/// wrapped height (to size a scroll viewport or a `Fit` parent) call
+/// [`measure_height`](Self::measure_height) with the real width.
+///
+/// # Example
+/// ```ignore
+/// let grid = Flow::new(8.0).with_padding(8.0)
+///     .item(48.0, 48.0).item(48.0, 48.0).item(48.0, 48.0);
+/// let result = grid.layout(Rect::new(0.0, 0.0, 120.0, grid.measure_height(120.0)));
+/// // result.rects[1..] are the item rects, wrapped into rows.
+/// ```
+pub struct Flow {
+    /// Gap between items within a row (main axis).
+    pub spacing: f32,
+    /// Gap between rows (cross axis). Defaults to `spacing`.
+    pub run_spacing: f32,
+    /// Inset on all four sides.
+    pub padding: f32,
+    /// Items as `(width, height)`, placed in add order.
+    pub children: Vec<(f32, f32)>,
+}
+
+impl Flow {
+    /// A flow with `spacing` between items and rows, no padding.
+    pub fn new(spacing: f32) -> Self {
+        Self {
+            spacing,
+            run_spacing: spacing,
+            padding: 0.0,
+            children: Vec::new(),
+        }
+    }
+
+    /// Set a row gap distinct from the in-row item gap.
+    pub fn with_run_spacing(mut self, run_spacing: f32) -> Self {
+        self.run_spacing = run_spacing;
+        self
+    }
+
+    /// Set the inset applied on all four sides.
+    pub fn with_padding(mut self, padding: f32) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    /// Append one `width`×`height` item.
+    pub fn item(mut self, width: f32, height: f32) -> Self {
+        self.children.push((width, height));
+        self
+    }
+
+    /// Total wrapped content height for a given available `width`, including
+    /// padding on both sides. This is the value [`content_size`](Self::content_size)
+    /// cannot return (height depends on width) — use it to size a scroll
+    /// viewport or `Fit` parent around the flow. Returns `2 * padding` when empty.
+    pub fn measure_height(&self, width: f32) -> f32 {
+        let inner_w = (width - self.padding * 2.0).max(0.0);
+        let mut cur_x = 0.0_f32;
+        let mut cur_y = 0.0_f32;
+        let mut row_h = 0.0_f32;
+        let mut placed_any = false;
+        for &(w, h) in &self.children {
+            // Wrap before placing when this item would overflow the row (but
+            // never on the first item of a row, so an oversized item still fits).
+            if cur_x > 0.0 && cur_x + w > inner_w {
+                cur_y += row_h + self.run_spacing;
+                cur_x = 0.0;
+                row_h = 0.0;
+            }
+            cur_x += w + self.spacing;
+            row_h = row_h.max(h);
+            placed_any = true;
+        }
+        let content_h = if placed_any { cur_y + row_h } else { 0.0 };
+        content_h + self.padding * 2.0
+    }
+}
+
+impl LayoutNode for Flow {
+    /// Unwrapped single-row extents: total item width (+ gaps) and the tallest
+    /// item, plus padding. See the type docs — for the wrapped height use
+    /// [`Flow::measure_height`].
+    fn content_size(&self) -> (f32, f32) {
+        let mut width = 0.0_f32;
+        let mut height = 0.0_f32;
+        for (i, &(w, h)) in self.children.iter().enumerate() {
+            if i > 0 {
+                width += self.spacing;
+            }
+            width += w;
+            height = height.max(h);
+        }
+        (width + self.padding * 2.0, height + self.padding * 2.0)
+    }
+
+    fn layout(&self, bounds: Rect) -> LayoutResult {
+        let mut rects = vec![bounds];
+        let inner_w = (bounds.width - self.padding * 2.0).max(0.0);
+        let mut cur_x = self.padding;
+        let mut cur_y = self.padding;
+        let mut row_h = 0.0_f32;
+        for &(w, h) in &self.children {
+            // Wrap before placing when this item overflows the row, except as the
+            // first item in a row (an item wider than `inner_w` still gets placed
+            // once, overflowing, rather than looping forever).
+            if cur_x > self.padding && cur_x + w > self.padding + inner_w {
+                cur_x = self.padding;
+                cur_y += row_h + self.run_spacing;
+                row_h = 0.0;
+            }
+            rects.push(Rect::new(bounds.x + cur_x, bounds.y + cur_y, w, h));
+            cur_x += w + self.spacing;
+            row_h = row_h.max(h);
+        }
+        LayoutResult { rects }
     }
 }
 
@@ -1176,5 +1344,167 @@ mod tests {
             4.0 + 112.0 - 40.0,
             "end child at right edge"
         );
+    }
+
+    // ---- Weighted fill children ----
+
+    #[test]
+    fn hstack_weighted_fill_splits_2_to_1() {
+        // No padding/spacing: 300px split 2:1 → 200 / 100.
+        let stack = HStack::new(0.0)
+            .child_fill(30.0)
+            .weight(2.0)
+            .child_fill(30.0)
+            .weight(1.0);
+        let result = stack.layout(Rect::new(0.0, 0.0, 300.0, 40.0));
+        assert_eq!(result.rects[1].width, 200.0, "weight 2 child gets 2/3");
+        assert_eq!(result.rects[2].width, 100.0, "weight 1 child gets 1/3");
+        assert_eq!(result.rects[2].x, 200.0, "second child starts after first");
+    }
+
+    #[test]
+    fn vstack_weighted_fill_splits_three_ways() {
+        // 2:1:1 over 400px → 200 / 100 / 100.
+        let stack = VStack::new(0.0)
+            .child_fill(10.0)
+            .weight(2.0)
+            .child_fill(10.0)
+            .weight(1.0)
+            .child_fill(10.0)
+            .weight(1.0);
+        let result = stack.layout(Rect::new(0.0, 0.0, 50.0, 400.0));
+        assert_eq!(result.rects[1].height, 200.0);
+        assert_eq!(result.rects[2].height, 100.0);
+        assert_eq!(result.rects[3].height, 100.0);
+    }
+
+    #[test]
+    fn equal_weight_is_byte_identical_to_unweighted() {
+        // The back-compat invariant: default weight 1.0 reproduces the old
+        // remaining / fill_count split exactly.
+        let weighted = HStack::new(0.0).child_fill(10.0).child_fill(10.0);
+        let r = weighted.layout(Rect::new(0.0, 0.0, 300.0, 20.0));
+        assert_eq!(r.rects[1].width, 150.0);
+        assert_eq!(r.rects[2].width, 150.0);
+    }
+
+    #[test]
+    fn zero_weight_fill_gets_nothing() {
+        // A lone fill at weight 0 → fill_weight is 0 → 0px (no div-by-zero).
+        let stack = HStack::new(0.0).child(100.0, 20.0).child_fill(20.0).weight(0.0);
+        let result = stack.layout(Rect::new(0.0, 0.0, 300.0, 20.0));
+        assert_eq!(result.rects[1].width, 100.0, "fixed child unaffected");
+        assert_eq!(result.rects[2].width, 0.0, "zero-weight fill gets no space");
+    }
+
+    #[test]
+    fn weighted_fill_clamped_does_not_redistribute() {
+        // Single-pass: a weighted fill clamped by a constraint keeps its slack
+        // (no second redistribution pass), matching the unweighted behavior.
+        let stack = HStack::new(0.0)
+            .child_fill(20.0)
+            .weight(3.0)
+            .constrain(Constraint::max(50.0))
+            .child_fill(20.0)
+            .weight(1.0);
+        let result = stack.layout(Rect::new(0.0, 0.0, 400.0, 20.0));
+        // Raw split: 300 / 100; first clamped to 50, second stays 100.
+        assert_eq!(result.rects[1].width, 50.0, "clamped to max");
+        assert_eq!(result.rects[2].width, 100.0, "sibling keeps its 1/4 share");
+    }
+
+    #[test]
+    fn negative_weight_clamped_to_zero() {
+        let stack = HStack::new(0.0)
+            .child_fill(20.0)
+            .weight(-5.0)
+            .child_fill(20.0)
+            .weight(1.0);
+        let result = stack.layout(Rect::new(0.0, 0.0, 300.0, 20.0));
+        assert_eq!(result.rects[1].width, 0.0, "negative weight clamped to 0");
+        assert_eq!(result.rects[2].width, 300.0, "other child takes all");
+    }
+
+    // ---- Flow (wrap) layout ----
+
+    #[test]
+    fn flow_wraps_into_rows() {
+        // Three 100px items, 10px spacing, in a 250px-wide bound: items 0 and 1
+        // fit on row 0 (100 + 10 + 100 = 210 <= 250); item 2 (would reach 320)
+        // wraps to row 1.
+        let flow = Flow::new(10.0).item(100.0, 40.0).item(100.0, 40.0).item(100.0, 40.0);
+        let r = flow.layout(Rect::new(0.0, 0.0, 250.0, 200.0));
+        assert_eq!(r.rects.len(), 4, "container + 3 items");
+        // Row 0.
+        assert_eq!((r.rects[1].x, r.rects[1].y), (0.0, 0.0));
+        assert_eq!((r.rects[2].x, r.rects[2].y), (110.0, 0.0));
+        // Row 1: item 2 drops below, x resets.
+        assert_eq!(r.rects[3].x, 0.0, "wrapped item resets to left");
+        assert_eq!(r.rects[3].y, 50.0, "wrapped to row 1 (row_h 40 + spacing 10)");
+    }
+
+    #[test]
+    fn flow_padding_and_run_spacing_offsets() {
+        // padding 8, item gap 4, distinct run gap 20.
+        let flow = Flow::new(4.0)
+            .with_run_spacing(20.0)
+            .with_padding(8.0)
+            .item(50.0, 30.0)
+            .item(50.0, 30.0); // second overflows inner width 100-? -> wraps
+        // inner_w = 120 - 16 = 104; first at x=8 reaches 8+50+4=62; second would
+        // reach 62+50=112 > 8+104=112? exactly equal, not greater -> stays. Use a
+        // narrower bound to force a wrap.
+        let r = flow.layout(Rect::new(0.0, 0.0, 100.0, 200.0));
+        // inner_w = 100 - 16 = 84; item 0 at (8,8); item 1 (would reach 62+50=112
+        // > 8+84=92) wraps.
+        assert_eq!((r.rects[1].x, r.rects[1].y), (8.0, 8.0), "first item at padding");
+        assert_eq!(r.rects[2].x, 8.0, "second wraps to left padding");
+        assert_eq!(
+            r.rects[2].y, 8.0 + 30.0 + 20.0,
+            "second on row 1 (padding + row_h + run_spacing)"
+        );
+    }
+
+    #[test]
+    fn flow_measure_height_matches_last_rect_bottom() {
+        // The cross-check that measure_height and layout agree.
+        let flow = Flow::new(10.0)
+            .with_padding(6.0)
+            .item(80.0, 30.0)
+            .item(80.0, 50.0)
+            .item(80.0, 20.0);
+        let width = 200.0;
+        let r = flow.layout(Rect::new(0.0, 0.0, width, 500.0));
+        let last_bottom = r
+            .rects
+            .iter()
+            .skip(1)
+            .map(|rc| rc.y + rc.height)
+            .fold(0.0_f32, f32::max);
+        // measure_height includes the bottom padding; last_bottom does not.
+        assert_eq!(flow.measure_height(width), last_bottom + 6.0);
+    }
+
+    #[test]
+    fn flow_empty_is_just_bounds() {
+        let flow = Flow::new(8.0);
+        let bounds = Rect::new(1.0, 2.0, 100.0, 50.0);
+        let r = flow.layout(bounds);
+        assert_eq!(r.rects.len(), 1);
+        assert_eq!(r.rects[0], bounds);
+        assert_eq!(flow.measure_height(100.0), 0.0, "empty flow has no content height");
+    }
+
+    #[test]
+    fn flow_oversized_item_is_placed_once() {
+        // An item wider than the inner width must still be placed exactly once
+        // (no infinite wrap loop), overflowing the bound.
+        let flow = Flow::new(4.0).item(500.0, 30.0).item(20.0, 30.0);
+        let r = flow.layout(Rect::new(0.0, 0.0, 100.0, 200.0));
+        assert_eq!(r.rects.len(), 3, "both items placed");
+        assert_eq!((r.rects[1].x, r.rects[1].y), (0.0, 0.0), "oversized item on row 0");
+        // The small item can't share row 0 (cur_x already past inner_w) -> row 1.
+        assert_eq!(r.rects[2].x, 0.0);
+        assert_eq!(r.rects[2].y, 34.0, "small item wraps below oversized one");
     }
 }

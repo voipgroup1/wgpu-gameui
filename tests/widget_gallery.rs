@@ -11,7 +11,7 @@
 //! content `Rect` to draw into, so adding a widget is one `flow.cell(...)` call
 //! plus the widget's own draw call — no hand-placed coordinates.
 
-use wgpu_gameui::layout::Rect;
+use wgpu_gameui::layout::{Flow as LayoutFlow, HStack, LayoutNode, Rect};
 use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList, Dropdown,
     DropdownState, Easing, FocusState, HitZone, ImageButton, ImageFit, InputState, LayerStack, List,
@@ -1238,6 +1238,50 @@ fn render_widget_gallery() {
                 .with_size(12.0)
                 .with_color(200, 210, 230),
         );
+
+        // --- Layout primitives (weighted + flow) ---------------------------
+        // The declarative layout engine (`wgpu_gameui::layout`), not widgets:
+        // a weighted `HStack` Fill split and the wrapping `Flow` grid. Each
+        // computed `Rect` is painted as a plain rounded rect so the split ratios
+        // and the row-wrapping are eyeballable.
+        flow.section(list, "Layout: weighted HStack + Flow grid");
+
+        // Weighted HStack — remaining width split 2:1:1 across three Fill cells.
+        {
+            let r = flow.cell(list, "HStack weight 2:1:1", 300.0, 36.0);
+            let split = HStack::new(6.0)
+                .child_fill(0.0)
+                .weight(2.0)
+                .child_fill(0.0)
+                .weight(1.0)
+                .child_fill(0.0)
+                .weight(1.0);
+            let res = split.layout(r);
+            let colors = [
+                [0.30, 0.50, 0.90, 1.0],
+                [0.30, 0.75, 0.55, 1.0],
+                [0.85, 0.55, 0.30, 1.0],
+            ];
+            for (i, c) in colors.iter().enumerate() {
+                list.rounded_rect(res.rects[i + 1], 4.0, *c);
+            }
+        }
+
+        // Flow grid — nine uniform 40px tiles wrapping within a fixed width.
+        {
+            let grid_w = 200.0;
+            let mut grid = LayoutFlow::new(8.0);
+            for _ in 0..9 {
+                grid = grid.item(40.0, 40.0);
+            }
+            let grid_h = grid.measure_height(grid_w);
+            let r = flow.cell(list, "Flow grid (wraps)", grid_w, grid_h);
+            let res = grid.layout(r);
+            for (i, rc) in res.rects.iter().skip(1).enumerate() {
+                let t = i as f32 / 8.0;
+                list.rounded_rect(*rc, 6.0, [0.25 + 0.5 * t, 0.45, 0.85 - 0.4 * t, 1.0]);
+            }
+        }
 
         // --- Hover animation (easing) --------------------------------------
         // The animation system eases a widget's color from its idle value toward
