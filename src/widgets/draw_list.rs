@@ -578,6 +578,33 @@ impl DrawList {
             .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
     }
 
+    /// Add a filled rectangle with a distinct color per corner, in
+    /// `[top_left, top_right, bottom_right, bottom_left]` order — the GPU
+    /// interpolates linearly across the two triangles, giving a gradient fill
+    /// (used by the color picker's SV square / hue / alpha bars).
+    ///
+    /// Always soup geometry (a gradient can't use the instanced-chrome fast
+    /// path), and like [`quad_soup`](Self::quad_soup) it honors the current
+    /// transform + tint via [`vertex`](Self::vertex). No-op on non-positive size.
+    pub fn quad_gradient(&mut self, rect: Rect, colors: [[f32; 4]; 4]) {
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let x0 = rect.x;
+        let y0 = rect.y;
+        let x1 = rect.x + rect.width;
+        let y1 = rect.y + rect.height;
+        let base = self.vertices.len() as u32;
+
+        // Same winding as `quad_soup`: TL, TR, BR, BL.
+        self.vertices.push(self.vertex(x0, y0, colors[0]));
+        self.vertices.push(self.vertex(x1, y0, colors[1]));
+        self.vertices.push(self.vertex(x1, y1, colors[2]));
+        self.vertices.push(self.vertex(x0, y1, colors[3]));
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+    }
+
     /// Add a thick line segment as a quad.
     pub fn line(&mut self, p0: [f32; 2], p1: [f32; 2], thickness: f32, color: [f32; 4]) {
         let dx = p1[0] - p0[0];
@@ -1665,6 +1692,37 @@ mod tests {
         list.quad(0.0, 0.0, 10.0, 20.0, [1.0; 4]);
         assert!(list.vertices.is_empty());
         assert_eq!(list.chrome_instances[0].rect, [100.0, 50.0, 10.0, 20.0]);
+    }
+
+    #[test]
+    fn quad_gradient_assigns_corner_colors() {
+        let mut list = DrawList::new();
+        let tl = [1.0, 0.0, 0.0, 1.0];
+        let tr = [0.0, 1.0, 0.0, 1.0];
+        let br = [0.0, 0.0, 1.0, 1.0];
+        let bl = [1.0, 1.0, 0.0, 1.0];
+        list.quad_gradient(Rect::new(0.0, 0.0, 10.0, 20.0), [tl, tr, br, bl]);
+        // Four soup vertices in TL, TR, BR, BL order, each carrying its color.
+        assert_eq!(list.vertices.len(), 4);
+        assert_eq!(list.vertices[0].position, [0.0, 0.0]);
+        assert_eq!(list.vertices[0].color, tl);
+        assert_eq!(list.vertices[1].position, [10.0, 0.0]);
+        assert_eq!(list.vertices[1].color, tr);
+        assert_eq!(list.vertices[2].position, [10.0, 20.0]);
+        assert_eq!(list.vertices[2].color, br);
+        assert_eq!(list.vertices[3].position, [0.0, 20.0]);
+        assert_eq!(list.vertices[3].color, bl);
+        // Two triangles → 6 indices.
+        assert_eq!(list.indices, vec![0, 1, 2, 2, 3, 0]);
+    }
+
+    #[test]
+    fn quad_gradient_zero_size_is_noop() {
+        let mut list = DrawList::new();
+        list.quad_gradient(Rect::new(0.0, 0.0, 0.0, 20.0), [[1.0; 4]; 4]);
+        list.quad_gradient(Rect::new(0.0, 0.0, 20.0, 0.0), [[1.0; 4]; 4]);
+        assert!(list.vertices.is_empty());
+        assert!(list.indices.is_empty());
     }
 
     #[test]

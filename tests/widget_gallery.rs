@@ -13,8 +13,9 @@
 
 use wgpu_gameui::layout::{Flow as LayoutFlow, HStack, LayoutNode, MainAlign, Rect};
 use wgpu_gameui::{
-    Button, Checkbox, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList, Dropdown,
-    DropdownState, Easing, FocusState, HitZone, ImageButton, ImageFit, InputState, LayerStack, List,
+    Button, Checkbox, ColorPicker, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList,
+    Dropdown, DropdownState, Easing, FocusState, HitZone, Hsva, ImageButton, ImageFit, InputState,
+    LayerStack, List,
     ListItem, ListState, NumberInput, ProgressBar, RadioGroup, ScrollState, ScrollView,
     SelectionMode, Separator, Slider, StyleKey, StyleOverlay, StyleResolver, Table, TableCell,
     TableColumn,
@@ -1347,6 +1348,35 @@ fn render_widget_gallery() {
                 &style,
             );
             list.text(TextBlock::new("R", r.x + r.width - 28.0, r.y + 16.0).with_size(13.0));
+        }
+
+        // --- Color picker --------------------------------------------------
+        // SV square (white→hue across, →black down) + vertical hue spectrum,
+        // optionally an alpha bar (checkerboard under an opaque→transparent
+        // fade). Cursors sit at the fixed sample colors below.
+        flow.section(list, "Color picker");
+        {
+            let mut cap = DragCapture::new();
+
+            // HSV only — a warm orange.
+            let r = flow.cell(list, "HSV (no alpha)", 220.0, 120.0);
+            {
+                let mut c = ctx(list, &mut focus, &theme, &input);
+                ColorPicker::new().draw(Hsva::opaque(28.0, 0.85, 0.95), 900, &mut cap, r, &mut c);
+            }
+
+            // HSVA — a half-transparent teal, showing the alpha bar.
+            let r = flow.cell(list, "HSVA (alpha bar)", 248.0, 120.0);
+            {
+                let mut c = ctx(list, &mut focus, &theme, &input);
+                ColorPicker::new().with_alpha(true).draw(
+                    Hsva::new(175.0, 0.7, 0.8, 0.5),
+                    901,
+                    &mut cap,
+                    r,
+                    &mut c,
+                );
+            }
         }
 
         // --- Hover animation (easing) --------------------------------------

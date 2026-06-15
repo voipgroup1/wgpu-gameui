@@ -2,6 +2,7 @@
 
 mod button;
 mod checkbox;
+mod color_picker;
 mod drag;
 mod drag_handle;
 mod draw_list;
@@ -28,6 +29,7 @@ mod tree;
 
 pub use button::Button;
 pub use checkbox::{CHECKBOX_CHECKED_ICON, CHECKBOX_ICON, Checkbox};
+pub use color_picker::{ColorPicker, ColorPickerOutput};
 pub use drag::{DragCapture, DragId};
 pub use drag_handle::{DragHandle, DragHandleOutput};
 pub(crate) use draw_list::ColorCmd;

@@ -207,7 +207,19 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `mouse_consumed`. Like `Table`/`ScrollView` it takes a raw `&mut
       InputState` (it consumes the wheel), not a `DrawContext`. No `UiContext`
       façade yet (raw widget first, as Tree shipped).
-- [ ] **P2 — Color picker.**
+- [x] **P2 — Color picker.** `ColorPicker` (`src/widgets/color_picker.rs`) +
+      `ColorPickerOutput`. SV square (white→hue→black, one per-corner gradient) +
+      vertical hue spectrum bar + opt-in alpha bar (`.with_alpha(true)`, with a
+      checkerboard under an opaque→transparent fade). Caller owns the color as
+      `Hsva` (HSV is the source of truth so dragging S/V to an edge never loses
+      hue); `draw(hsva, id, capture, rect, ctx) -> ColorPickerOutput { hsva,
+      rgba, changed, dragging }`, threading like `Slider`'s value. Drag ownership
+      via a shared `DragCapture` from a single `DragId` — each of the three
+      sub-regions derives a collision-resistant id (private `region_id` mix), so
+      SV/hue/alpha never co-claim one drag and don't clash with sibling drag ids.
+      Builder: `.with_alpha`/`.with_bar_width`/`.with_gap`. Supporting additions:
+      new `wgpu_gameui::color` module (`Hsva` + `hsv_to_rgb`/`rgb_to_hsv`) and
+      `DrawList::quad_gradient(rect, [TL,TR,BR,BL])` per-corner gradient soup.
 - [x] **P2 — Separator / divider.** `Separator` (`src/widgets/separator.rs`)
       + `Orientation { Horizontal, Vertical }`. Stateless, non-interactive: draws
       through a `&StyleResolver` like `Panel` (no `DrawContext`). Builder:
