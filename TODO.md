@@ -467,16 +467,18 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       app owns sound — it already gets the interaction edges it needs from the
       widget return values + `HitZoneOutput` (`clicked`/`pressed`/`hovered`/…)
       to trigger its own SFX. Re-open only if a built-in hook proves necessary.
-- [~] **P1 — Mod-friendly registration** of custom widgets/styles.
-      `register_style(name, value)` landed: `Theme::register_style(&mut self,
-      name, StyleValue)` + `Theme::style(name) -> Option<StyleValue>` store/read
-      custom keys by name-hash (and `StyleOverlay` can carry them per-subtree).
-      `register_widget(name, draw_fn)` is **deferred until Lua integration**
-      (decision 2026-06) — widgets have heterogeneous signatures and there's no
-      uniform draw-fn contract yet, and the right shape is hard to know without a
-      concrete modding consumer driving the requirements. Design it against a
-      real `register_widget` call site (the Lua binding layer) rather than in the
-      abstract.
+- [x] **P1 — Mod-friendly *style* registration.** `register_style(name,
+      value)` landed: `Theme::register_style(&mut self, name, StyleValue)` +
+      `Theme::style(name) -> Option<StyleValue>` store/read custom keys by
+      name-hash (and `StyleOverlay` can carry them per-subtree). The custom-widget
+      half is split out to P2 below.
+- [ ] **P2 — Mod-friendly *widget* registration** (`register_widget(name,
+      draw_fn)`), **gated on Lua integration** (decision 2026-06; tracked under
+      "Beyond 1.0 → mod registry"). Widgets have heterogeneous signatures and
+      there's no uniform draw-fn contract yet, and the right shape is hard to know
+      without a concrete modding consumer driving the requirements — so design it
+      against a real `register_widget` call site (the Lua binding layer) rather
+      than in the abstract. Re-tiered from P1: not needed for 1.0 usability.
 - [x] **P1 — `UiMakeInteractive` / hit-zones independent of draw** for
       sensors over 3D things. `HitZone` (`src/widgets/hit_zone.rs`) is the
       deliberate draw-free widget: `HitZone::new().test(rect, &input) ->
