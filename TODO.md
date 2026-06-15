@@ -84,8 +84,15 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       .draw(rect, list)` widget. Adopted by the `NumberInput` `+`/`−` steppers.
       Behind the default-on `phosphor-icons` feature; widgets fall back to text
       glyphs when it's off.
-- [ ] **P2 — Gradient helpers** (linear/radial). Per-vertex color exists but
-      no constructor.
+- [x] **P2 — Gradient helpers** (linear/radial). `DrawList` constructors over
+      the per-vertex color path: `linear_gradient(rect, start, end, angle)`
+      (exact at any angle — a linear ramp is affine, so the four corner colors
+      are projected onto the gradient axis and bilinear interpolation reproduces
+      it), plus cheaper `horizontal_gradient(rect, left, right)` /
+      `vertical_gradient(rect, top, bottom)`. `radial_gradient(rect, inner,
+      outer, segments)` draws a triangle fan (≥3 wedges) whose radius reaches the
+      farthest corner and is clipped to the rect, so the whole rect fills;
+      transform/tint/clip-aware like the other soup primitives.
 - [x] **P2 — Text outline / shadow** (`UiTextOutline`, `UiTextShadow`). Already
       shipped via the MSDF text path: `TextBlock::with_outline(r,g,b,a,width_px)`,
       `with_shadow(r,g,b,a,dx,dy,softness)`, and a bonus `with_glow(r,g,b,a,

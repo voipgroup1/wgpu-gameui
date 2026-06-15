@@ -605,6 +605,89 @@ impl DrawList {
             .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
     }
 
+    /// Fill `rect` with a linear gradient from `start` to `end` along `angle`
+    /// (radians; `0` = left→right, `π/2` = top→bottom, increasing clockwise in
+    /// screen space where +y points down).
+    ///
+    /// Exact for any angle: a linear color ramp is an affine function of
+    /// position, which the GPU's bilinear corner interpolation reproduces
+    /// precisely — so this is just [`quad_gradient`](Self::quad_gradient) with
+    /// the four corner colors projected onto the gradient axis. No-op on
+    /// non-positive size. For the cardinal directions prefer the cheaper
+    /// [`horizontal_gradient`](Self::horizontal_gradient) /
+    /// [`vertical_gradient`](Self::vertical_gradient).
+    pub fn linear_gradient(&mut self, rect: Rect, start: [f32; 4], end: [f32; 4], angle: f32) {
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let (s, c) = angle.sin_cos();
+        let x0 = rect.x;
+        let y0 = rect.y;
+        let x1 = rect.x + rect.width;
+        let y1 = rect.y + rect.height;
+        // Project each corner (TL, TR, BR, BL) onto the gradient direction, then
+        // normalize to [0,1] across the projected extent → per-corner colors.
+        let proj = [
+            x0 * c + y0 * s,
+            x1 * c + y0 * s,
+            x1 * c + y1 * s,
+            x0 * c + y1 * s,
+        ];
+        let min = proj.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = proj.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let span = (max - min).max(f32::EPSILON);
+        let colors = proj.map(|p| lerp_color(start, end, (p - min) / span));
+        self.quad_gradient(rect, colors);
+    }
+
+    /// Fill `rect` with a horizontal gradient (`left` edge → `right` edge).
+    pub fn horizontal_gradient(&mut self, rect: Rect, left: [f32; 4], right: [f32; 4]) {
+        self.quad_gradient(rect, [left, right, right, left]);
+    }
+
+    /// Fill `rect` with a vertical gradient (`top` edge → `bottom` edge).
+    pub fn vertical_gradient(&mut self, rect: Rect, top: [f32; 4], bottom: [f32; 4]) {
+        self.quad_gradient(rect, [top, top, bottom, bottom]);
+    }
+
+    /// Fill `rect` with a radial gradient: `inner` at the center fading to
+    /// `outer` toward the edges, as a triangle fan of `segments` wedges (clamped
+    /// to ≥ 3). The fan radius reaches the rect's farthest corner so the whole
+    /// rect is filled, and the geometry is clipped to `rect`. Honors the current
+    /// transform/tint/clip like the other soup primitives. No-op on non-positive
+    /// size.
+    ///
+    /// The fade is circular (equal in x and y), so for a non-square rect the
+    /// iso-color rings are circles centered in the rect, not ellipses.
+    pub fn radial_gradient(&mut self, rect: Rect, inner: [f32; 4], outer: [f32; 4], segments: u32) {
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let segments = segments.max(3);
+        let cx = rect.x + rect.width * 0.5;
+        let cy = rect.y + rect.height * 0.5;
+        // Circumradius whose inscribed circle (apothem) still reaches the
+        // farthest corner, so the N-gon fully covers the rect before clipping.
+        let half_diag = (rect.width * rect.width + rect.height * rect.height).sqrt() * 0.5;
+        let r = half_diag / (std::f32::consts::PI / segments as f32).cos();
+
+        self.push_clip(rect);
+        let base = self.vertices.len() as u32;
+        self.vertices.push(self.vertex(cx, cy, inner));
+        for i in 0..segments {
+            let theta = std::f32::consts::TAU * (i as f32) / (segments as f32);
+            let (s, c) = theta.sin_cos();
+            self.vertices
+                .push(self.vertex(cx + r * c, cy + r * s, outer));
+        }
+        for i in 0..segments {
+            let a = base + 1 + i;
+            let b = base + 1 + ((i + 1) % segments);
+            self.indices.extend_from_slice(&[base, a, b]);
+        }
+        self.pop_clip();
+    }
+
     /// Add a thick line segment as a quad.
     pub fn line(&mut self, p0: [f32; 2], p1: [f32; 2], thickness: f32, color: [f32; 4]) {
         let dx = p1[0] - p0[0];
@@ -1397,6 +1480,16 @@ fn span_cursor_x(positions: &[(usize, f32)], byte_pos: usize) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// Component-wise linear interpolation between two RGBA colors at `t ∈ [0,1]`.
+fn lerp_color(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use crate::affine::Affine2;
@@ -1723,6 +1816,118 @@ mod tests {
         list.quad_gradient(Rect::new(0.0, 0.0, 20.0, 0.0), [[1.0; 4]; 4]);
         assert!(list.vertices.is_empty());
         assert!(list.indices.is_empty());
+    }
+
+    #[test]
+    fn horizontal_gradient_sets_left_right_corners() {
+        let mut list = DrawList::new();
+        let left = [1.0, 0.0, 0.0, 1.0];
+        let right = [0.0, 0.0, 1.0, 1.0];
+        list.horizontal_gradient(Rect::new(0.0, 0.0, 10.0, 20.0), left, right);
+        // TL=left, TR=right, BR=right, BL=left.
+        assert_eq!(list.vertices[0].color, left);
+        assert_eq!(list.vertices[1].color, right);
+        assert_eq!(list.vertices[2].color, right);
+        assert_eq!(list.vertices[3].color, left);
+    }
+
+    #[test]
+    fn vertical_gradient_sets_top_bottom_corners() {
+        let mut list = DrawList::new();
+        let top = [1.0, 0.0, 0.0, 1.0];
+        let bottom = [0.0, 0.0, 1.0, 1.0];
+        list.vertical_gradient(Rect::new(0.0, 0.0, 10.0, 20.0), top, bottom);
+        // TL=top, TR=top, BR=bottom, BL=bottom.
+        assert_eq!(list.vertices[0].color, top);
+        assert_eq!(list.vertices[1].color, top);
+        assert_eq!(list.vertices[2].color, bottom);
+        assert_eq!(list.vertices[3].color, bottom);
+    }
+
+    #[test]
+    fn linear_gradient_angle_zero_matches_horizontal() {
+        let start = [1.0, 0.0, 0.0, 1.0];
+        let end = [0.0, 1.0, 0.0, 1.0];
+        let rect = Rect::new(3.0, 5.0, 10.0, 20.0);
+
+        let mut a = DrawList::new();
+        a.linear_gradient(rect, start, end, 0.0);
+        let mut b = DrawList::new();
+        b.horizontal_gradient(rect, start, end);
+
+        for (va, vb) in a.vertices.iter().zip(b.vertices.iter()) {
+            for k in 0..4 {
+                assert!(
+                    (va.color[k] - vb.color[k]).abs() < 1e-5,
+                    "angle 0 should equal horizontal gradient"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linear_gradient_quarter_turn_matches_vertical() {
+        let start = [1.0, 0.0, 0.0, 1.0];
+        let end = [0.0, 1.0, 0.0, 1.0];
+        let rect = Rect::new(3.0, 5.0, 10.0, 20.0);
+
+        let mut a = DrawList::new();
+        a.linear_gradient(rect, start, end, std::f32::consts::FRAC_PI_2);
+        let mut b = DrawList::new();
+        b.vertical_gradient(rect, start, end);
+
+        for (va, vb) in a.vertices.iter().zip(b.vertices.iter()) {
+            for k in 0..4 {
+                assert!(
+                    (va.color[k] - vb.color[k]).abs() < 1e-5,
+                    "angle π/2 should equal vertical gradient"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linear_gradient_zero_size_is_noop() {
+        let mut list = DrawList::new();
+        list.linear_gradient(Rect::new(0.0, 0.0, 0.0, 20.0), [1.0; 4], [0.0; 4], 0.7);
+        assert!(list.vertices.is_empty());
+        assert!(list.indices.is_empty());
+    }
+
+    #[test]
+    fn radial_gradient_builds_fan_with_center_and_ring() {
+        let mut list = DrawList::new();
+        let inner = [1.0, 1.0, 1.0, 1.0];
+        let outer = [0.0, 0.0, 0.0, 0.0];
+        let segments = 8;
+        list.radial_gradient(Rect::new(0.0, 0.0, 40.0, 40.0), inner, outer, segments);
+
+        // 1 center vertex + `segments` ring vertices.
+        assert_eq!(list.vertices.len() as u32, 1 + segments);
+        // Center color = inner; ring colors = outer.
+        assert_eq!(list.vertices[0].color, inner);
+        for v in &list.vertices[1..] {
+            assert_eq!(v.color, outer);
+        }
+        // One triangle per wedge → 3 * segments indices, every triangle shares
+        // the center vertex (index 0).
+        assert_eq!(list.indices.len() as u32, 3 * segments);
+        for tri in list.indices.chunks(3) {
+            assert_eq!(tri[0], 0, "each wedge fans from the center vertex");
+        }
+    }
+
+    #[test]
+    fn radial_gradient_clamps_segments_and_zero_size_is_noop() {
+        let mut list = DrawList::new();
+        // segments < 3 is clamped up to 3 (a triangle).
+        list.radial_gradient(Rect::new(0.0, 0.0, 10.0, 10.0), [1.0; 4], [0.0; 4], 1);
+        assert_eq!(list.vertices.len(), 1 + 3);
+
+        let mut empty = DrawList::new();
+        empty.radial_gradient(Rect::new(0.0, 0.0, 0.0, 10.0), [1.0; 4], [0.0; 4], 16);
+        assert!(empty.vertices.is_empty());
+        assert!(empty.indices.is_empty());
     }
 
     #[test]

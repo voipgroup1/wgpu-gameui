@@ -1380,6 +1380,30 @@ fn render_widget_gallery() {
             }
         }
 
+        // --- Gradients -----------------------------------------------------
+        // Linear (horizontal / vertical / arbitrary angle) and radial fills,
+        // built straight on the DrawList's per-vertex color path.
+        flow.section(list, "Gradients");
+        {
+            let h = 80.0;
+            let r = flow.cell(list, "Horizontal", 150.0, h);
+            list.horizontal_gradient(r, [0.95, 0.30, 0.35, 1.0], [0.20, 0.45, 0.95, 1.0]);
+
+            let r = flow.cell(list, "Vertical", 150.0, h);
+            list.vertical_gradient(r, [0.26, 0.72, 0.42, 1.0], [0.09, 0.10, 0.13, 1.0]);
+
+            let r = flow.cell(list, "Linear 45°", 150.0, h);
+            list.linear_gradient(
+                r,
+                [0.95, 0.70, 0.20, 1.0],
+                [0.55, 0.20, 0.75, 1.0],
+                std::f32::consts::FRAC_PI_4,
+            );
+
+            let r = flow.cell(list, "Radial", 150.0, h);
+            list.radial_gradient(r, [1.0, 1.0, 1.0, 1.0], [0.09, 0.10, 0.13, 1.0], 64);
+        }
+
         // --- Group / titled panel ------------------------------------------
         // A bordered container with a header strip; `draw` returns the inner
         // content rect, which we fill with a couple of child widgets.
