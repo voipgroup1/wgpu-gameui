@@ -27,7 +27,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use wgpu_gameui::layout::{Anchor, Positioned, Rect, Size, VStack};
+use wgpu_gameui::layout::{Anchor, LayoutResult, Positioned, Rect, Size, VStack};
 use wgpu_gameui::{
     Button, DrawContext, DrawList, FocusState, FontSystemHandle, InputState, TextBlock, Theme,
     UiRenderer,
@@ -433,10 +433,20 @@ fn bench_layout(c: &mut Criterion) {
         );
 
         group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
+        // Fresh allocation per call (the `layout()` convenience path).
+        group.bench_with_input(BenchmarkId::new("alloc", count), &count, |b, _| {
             b.iter(|| {
                 let result = tree.layout_screen(1920.0, 1080.0);
                 std::hint::black_box(&result);
+            });
+        });
+        // Reused caller-owned buffer (the `layout_into` hot-loop path): the
+        // per-frame Vec allocation is paid once, then amortized away.
+        group.bench_with_input(BenchmarkId::new("reuse", count), &count, |b, _| {
+            let mut buf = LayoutResult::default();
+            b.iter(|| {
+                tree.layout_screen_into(1920.0, 1080.0, &mut buf);
+                std::hint::black_box(&buf);
             });
         });
     }

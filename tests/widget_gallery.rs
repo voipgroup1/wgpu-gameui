@@ -1263,7 +1263,7 @@ fn render_widget_gallery() {
                 [0.85, 0.55, 0.30, 1.0],
             ];
             for (i, c) in colors.iter().enumerate() {
-                list.rounded_rect(res.rects[i + 1], 4.0, *c);
+                list.rounded_rect(res.get(i + 1), 4.0, *c);
             }
         }
 
@@ -1277,9 +1277,9 @@ fn render_widget_gallery() {
             let grid_h = grid.measure_height(grid_w);
             let r = flow.cell(list, "Flow grid (wraps)", grid_w, grid_h);
             let res = grid.layout(r);
-            for (i, rc) in res.rects.iter().skip(1).enumerate() {
+            for (i, rc) in res.children().enumerate() {
                 let t = i as f32 / 8.0;
-                list.rounded_rect(*rc, 6.0, [0.25 + 0.5 * t, 0.45, 0.85 - 0.4 * t, 1.0]);
+                list.rounded_rect(rc, 6.0, [0.25 + 0.5 * t, 0.45, 0.85 - 0.4 * t, 1.0]);
             }
         }
 
@@ -1305,8 +1305,8 @@ fn render_widget_gallery() {
                 .child(44.0, 24.0)
                 .child(44.0, 24.0);
             let res = row.layout(r);
-            for rc in res.rects.iter().skip(1) {
-                list.rounded_rect(*rc, 4.0, [0.30, 0.55, 0.90, 1.0]);
+            for rc in res.children() {
+                list.rounded_rect(rc, 4.0, [0.30, 0.55, 0.90, 1.0]);
             }
         }
 

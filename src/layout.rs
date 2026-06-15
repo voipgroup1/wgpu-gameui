@@ -14,13 +14,19 @@
 //!     Anchor::TopRight { offset: (-10.0, 10.0) },
 //!     Size::fixed(80.0, 120.0),
 //!     VStack::new(8.0)
-//!         .child(Button::new("▲", ...))
-//!         .child(Label::new("Ground"))
-//!         .child(Button::new("▼", ...))
+//!         .child(30.0, 80.0).id(0)   // up button   — tagged for get_by_id
+//!         .child(30.0, 80.0).id(1)   // floor label
+//!         .child(30.0, 80.0).id(2)   // down button
 //! );
 //!
-//! let rects = floor_ui.layout(screen_width, screen_height);
-//! // Draw using computed rects...
+//! // One-shot (allocates a fresh result):
+//! let result = floor_ui.layout_screen(screen_width, screen_height);
+//! let up = result.get_by_id(0).unwrap();   // order-independent lookup
+//!
+//! // Frame loop (reuse a caller-owned buffer, no per-frame allocation):
+//! let mut layout_buf = LayoutResult::default();
+//! floor_ui.layout_screen_into(screen_width, screen_height, &mut layout_buf);
+//! // Draw using layout_buf.container() / .children() / .get_by_id(..)
 //! ```
 
 /// Computed rectangle after layout.
@@ -333,31 +339,121 @@ impl Size {
     }
 }
 
+/// Stable identity for a layout node, assigned by the caller.
+///
+/// Positional indexing into a [`LayoutResult`] (`get(1)`, `get(2)`, …) is fragile:
+/// inserting or reordering a child silently shifts every later index. Tag the
+/// children you care about with an id via the `.id(..)` builder (stacks) or
+/// [`Flow::item_id`], then look them up with [`LayoutResult::get_by_id`] — the
+/// lookup is order-independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId(pub u64);
+
+impl From<u64> for NodeId {
+    fn from(value: u64) -> Self {
+        NodeId(value)
+    }
+}
+
 /// A layout node that can be positioned and sized.
 pub trait LayoutNode {
     /// Compute minimum content size (for Fit sizing).
     fn content_size(&self) -> (f32, f32);
 
-    /// Layout this node within the given bounds.
-    /// Returns the computed rectangles for this node and all children.
-    fn layout(&self, bounds: Rect) -> LayoutResult;
+    /// Layout this node within `bounds`, writing the computed rects into `out`.
+    ///
+    /// `out` is **cleared first**, then filled with one entry per node in
+    /// traversal order (entry 0 is the container, `1..` its children). Pass a
+    /// caller-owned [`LayoutResult`] reused across frames to avoid the per-frame
+    /// allocation that [`layout`](Self::layout) incurs.
+    fn layout_into(&self, bounds: Rect, out: &mut LayoutResult);
+
+    /// Convenience wrapper that allocates a fresh [`LayoutResult`]. Prefer
+    /// [`layout_into`](Self::layout_into) with a reused buffer in a frame loop.
+    fn layout(&self, bounds: Rect) -> LayoutResult {
+        let mut out = LayoutResult::default();
+        self.layout_into(bounds, &mut out);
+        out
+    }
 }
 
-/// Result of layout computation.
+/// One laid-out node: its caller-assigned [`NodeId`] (if any) and computed rect.
+#[derive(Debug, Clone, Copy)]
+struct LayoutEntry {
+    id: Option<NodeId>,
+    rect: Rect,
+}
+
+/// Result of layout computation — entries in traversal order, entry 0 the
+/// container and `1..` its children.
+///
+/// Holds an internal buffer that [`LayoutNode::layout_into`] reuses, so a caller
+/// can keep one `LayoutResult` as frame-scratch and pay no per-frame allocation.
+/// Access rects positionally with [`get`](Self::get)/[`container`](Self::container)
+/// /[`children`](Self::children), or by stable identity with
+/// [`get_by_id`](Self::get_by_id).
 #[derive(Debug, Clone, Default)]
 pub struct LayoutResult {
-    /// Rectangles in order of layout tree traversal.
-    /// Index 0 is always the container itself.
-    pub rects: Vec<Rect>,
+    entries: Vec<LayoutEntry>,
 }
 
 impl LayoutResult {
+    /// A result holding a single (container) rect with no id.
     pub fn single(rect: Rect) -> Self {
-        Self { rects: vec![rect] }
+        Self {
+            entries: vec![LayoutEntry { id: None, rect }],
+        }
     }
 
+    /// Append an entry. Internal — nodes build results via `layout_into`.
+    fn push(&mut self, id: Option<NodeId>, rect: Rect) {
+        self.entries.push(LayoutEntry { id, rect });
+    }
+
+    /// The container rect (entry 0), or a zero rect if empty.
+    pub fn container(&self) -> Rect {
+        self.entries.first().map(|e| e.rect).unwrap_or_default()
+    }
+
+    /// The rect at `index` (0 = container), or a zero rect if out of bounds.
     pub fn get(&self, index: usize) -> Rect {
-        self.rects.get(index).copied().unwrap_or_default()
+        self.entries.get(index).map(|e| e.rect).unwrap_or_default()
+    }
+
+    /// The rect of the node tagged with `id`, or `None` if no node carries it.
+    /// Order-independent — the whole point of [`NodeId`]. Linear scan (child
+    /// counts are small).
+    pub fn get_by_id(&self, id: impl Into<NodeId>) -> Option<Rect> {
+        let id = id.into();
+        self.entries
+            .iter()
+            .find(|e| e.id == Some(id))
+            .map(|e| e.rect)
+    }
+
+    /// Number of entries (container + children).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when there are no entries at all (a default-constructed buffer).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of child entries (excludes the container).
+    pub fn child_count(&self) -> usize {
+        self.entries.len().saturating_sub(1)
+    }
+
+    /// All rects in order, including the container.
+    pub fn iter(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.entries.iter().map(|e| e.rect)
+    }
+
+    /// Child rects in order (skips the container at index 0).
+    pub fn children(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.entries.iter().skip(1).map(|e| e.rect)
     }
 }
 
@@ -377,13 +473,24 @@ impl<T> Positioned<T> {
         }
     }
 
-    /// Layout starting from screen coordinates.
+    /// Layout starting from screen coordinates (allocates a fresh result).
     pub fn layout_screen(&self, screen_width: f32, screen_height: f32) -> LayoutResult
     where
         T: LayoutNode,
     {
         let screen = Rect::new(0.0, 0.0, screen_width, screen_height);
         self.layout(screen)
+    }
+
+    /// Layout from screen coordinates into a caller-owned buffer (no allocation
+    /// when `out` already has capacity). The frame-loop counterpart of
+    /// [`layout_screen`](Self::layout_screen).
+    pub fn layout_screen_into(&self, screen_width: f32, screen_height: f32, out: &mut LayoutResult)
+    where
+        T: LayoutNode,
+    {
+        let screen = Rect::new(0.0, 0.0, screen_width, screen_height);
+        self.layout_into(screen, out);
     }
 }
 
@@ -392,7 +499,7 @@ impl<T: LayoutNode> LayoutNode for Positioned<T> {
         self.child.content_size()
     }
 
-    fn layout(&self, parent: Rect) -> LayoutResult {
+    fn layout_into(&self, parent: Rect, out: &mut LayoutResult) {
         let (content_w, content_h) = self.child.content_size();
         let width = self
             .size
@@ -405,7 +512,8 @@ impl<T: LayoutNode> LayoutNode for Positioned<T> {
         let (x, y) = self.anchor.resolve(parent, width, height);
 
         let bounds = Rect::new(x, y, width, height);
-        self.child.layout(bounds)
+        // Delegate: the child's container becomes entry 0 (it clears `out`).
+        self.child.layout_into(bounds, out);
     }
 }
 
@@ -517,6 +625,25 @@ pub struct StackChild {
     /// split evenly while `2.0`/`1.0` gives a 2:1 split. Ignored for non-`Fill`
     /// children.
     pub weight: f32,
+    /// Optional stable identity for [`LayoutResult::get_by_id`] (defaults to
+    /// `None`). Set via the `.id(..)` builder.
+    pub id: Option<NodeId>,
+}
+
+impl StackChild {
+    /// Construct a child with default `constraint`/`align`/`weight`/`id`. The
+    /// `child*` builders funnel through this so new fields are set in one place.
+    fn new(size: SizeSpec, content_size: f32, cross_size: f32) -> Self {
+        Self {
+            size,
+            content_size,
+            cross_size,
+            constraint: Constraint::default(),
+            align: CrossAlign::Stretch,
+            weight: 1.0,
+            id: None,
+        }
+    }
 }
 
 impl VStack {
@@ -549,40 +676,22 @@ impl VStack {
 
     /// Add a child with fixed height.
     pub fn child(mut self, height: f32, width: f32) -> Self {
-        self.children.push(StackChild {
-            size: SizeSpec::Fixed(height),
-            content_size: height,
-            cross_size: width,
-            constraint: Constraint::default(),
-            align: CrossAlign::Stretch,
-            weight: 1.0,
-        });
+        self.children
+            .push(StackChild::new(SizeSpec::Fixed(height), height, width));
         self
     }
 
     /// Add a child that fills remaining space.
     pub fn child_fill(mut self, width: f32) -> Self {
-        self.children.push(StackChild {
-            size: SizeSpec::Fill,
-            content_size: 0.0,
-            cross_size: width,
-            constraint: Constraint::default(),
-            align: CrossAlign::Stretch,
-            weight: 1.0,
-        });
+        self.children
+            .push(StackChild::new(SizeSpec::Fill, 0.0, width));
         self
     }
 
     /// Add a child with percentage height.
     pub fn child_percent(mut self, percent: f32, width: f32) -> Self {
-        self.children.push(StackChild {
-            size: SizeSpec::Percent(percent),
-            content_size: 0.0,
-            cross_size: width,
-            constraint: Constraint::default(),
-            align: CrossAlign::Stretch,
-            weight: 1.0,
-        });
+        self.children
+            .push(StackChild::new(SizeSpec::Percent(percent), 0.0, width));
         self
     }
 
@@ -630,6 +739,16 @@ impl VStack {
         }
         self
     }
+
+    /// Tag the most recently added child with a stable [`NodeId`] for
+    /// order-independent lookup via [`LayoutResult::get_by_id`]. No-op when there
+    /// is no child yet.
+    pub fn id(mut self, id: impl Into<NodeId>) -> Self {
+        if let Some(last) = self.children.last_mut() {
+            last.id = Some(id.into());
+        }
+        self
+    }
 }
 
 impl LayoutNode for VStack {
@@ -648,8 +767,9 @@ impl LayoutNode for VStack {
         (width + self.padding * 2.0, height)
     }
 
-    fn layout(&self, bounds: Rect) -> LayoutResult {
-        let mut rects = vec![bounds];
+    fn layout_into(&self, bounds: Rect, out: &mut LayoutResult) {
+        out.entries.clear();
+        out.push(None, bounds);
         let inner_width = bounds.width - self.padding * 2.0;
         let inner_height = bounds.height - self.padding * 2.0;
 
@@ -716,11 +836,9 @@ impl LayoutNode for VStack {
                 }
             };
 
-            rects.push(Rect::new(cx, y, cwidth, height));
+            out.push(child.id, Rect::new(cx, y, cwidth, height));
             y += height;
         }
-
-        LayoutResult { rects }
     }
 }
 
@@ -754,40 +872,22 @@ impl HStack {
 
     /// Add a child with fixed width.
     pub fn child(mut self, width: f32, height: f32) -> Self {
-        self.children.push(StackChild {
-            size: SizeSpec::Fixed(width),
-            content_size: width,
-            cross_size: height,
-            constraint: Constraint::default(),
-            align: CrossAlign::Stretch,
-            weight: 1.0,
-        });
+        self.children
+            .push(StackChild::new(SizeSpec::Fixed(width), width, height));
         self
     }
 
     /// Add a child that fills remaining space.
     pub fn child_fill(mut self, height: f32) -> Self {
-        self.children.push(StackChild {
-            size: SizeSpec::Fill,
-            content_size: 0.0,
-            cross_size: height,
-            constraint: Constraint::default(),
-            align: CrossAlign::Stretch,
-            weight: 1.0,
-        });
+        self.children
+            .push(StackChild::new(SizeSpec::Fill, 0.0, height));
         self
     }
 
     /// Add a child with percentage width.
     pub fn child_percent(mut self, percent: f32, height: f32) -> Self {
-        self.children.push(StackChild {
-            size: SizeSpec::Percent(percent),
-            content_size: 0.0,
-            cross_size: height,
-            constraint: Constraint::default(),
-            align: CrossAlign::Stretch,
-            weight: 1.0,
-        });
+        self.children
+            .push(StackChild::new(SizeSpec::Percent(percent), 0.0, height));
         self
     }
 
@@ -835,6 +935,16 @@ impl HStack {
         }
         self
     }
+
+    /// Tag the most recently added child with a stable [`NodeId`] for
+    /// order-independent lookup via [`LayoutResult::get_by_id`]. No-op when there
+    /// is no child yet.
+    pub fn id(mut self, id: impl Into<NodeId>) -> Self {
+        if let Some(last) = self.children.last_mut() {
+            last.id = Some(id.into());
+        }
+        self
+    }
 }
 
 impl LayoutNode for HStack {
@@ -853,8 +963,9 @@ impl LayoutNode for HStack {
         (width, height + self.padding * 2.0)
     }
 
-    fn layout(&self, bounds: Rect) -> LayoutResult {
-        let mut rects = vec![bounds];
+    fn layout_into(&self, bounds: Rect, out: &mut LayoutResult) {
+        out.entries.clear();
+        out.push(None, bounds);
         let inner_width = bounds.width - self.padding * 2.0;
         let inner_height = bounds.height - self.padding * 2.0;
 
@@ -921,11 +1032,9 @@ impl LayoutNode for HStack {
                 }
             };
 
-            rects.push(Rect::new(x, cy, width, cheight));
+            out.push(child.id, Rect::new(x, cy, width, cheight));
             x += width;
         }
-
-        LayoutResult { rects }
     }
 }
 
@@ -946,8 +1055,9 @@ impl LayoutNode for Leaf {
         (self.width, self.height)
     }
 
-    fn layout(&self, bounds: Rect) -> LayoutResult {
-        LayoutResult::single(bounds)
+    fn layout_into(&self, bounds: Rect, out: &mut LayoutResult) {
+        out.entries.clear();
+        out.push(None, bounds);
     }
 }
 
@@ -970,7 +1080,7 @@ impl LayoutNode for Leaf {
 /// let grid = Flow::new(8.0).with_padding(8.0)
 ///     .item(48.0, 48.0).item(48.0, 48.0).item(48.0, 48.0);
 /// let result = grid.layout(Rect::new(0.0, 0.0, 120.0, grid.measure_height(120.0)));
-/// // result.rects[1..] are the item rects, wrapped into rows.
+/// // result.children() yields the item rects, wrapped into rows.
 /// ```
 pub struct Flow {
     /// Gap between items within a row (main axis).
@@ -979,8 +1089,17 @@ pub struct Flow {
     pub run_spacing: f32,
     /// Inset on all four sides.
     pub padding: f32,
-    /// Items as `(width, height)`, placed in add order.
-    pub children: Vec<(f32, f32)>,
+    /// Items in add order.
+    pub children: Vec<FlowItem>,
+}
+
+/// One item in a [`Flow`]: its size and optional stable [`NodeId`].
+#[derive(Debug, Clone, Copy)]
+pub struct FlowItem {
+    pub width: f32,
+    pub height: f32,
+    /// Stable identity for [`LayoutResult::get_by_id`]; `None` for `.item(..)`.
+    pub id: Option<NodeId>,
 }
 
 impl Flow {
@@ -1006,9 +1125,24 @@ impl Flow {
         self
     }
 
-    /// Append one `width`×`height` item.
+    /// Append one `width`×`height` item (no id).
     pub fn item(mut self, width: f32, height: f32) -> Self {
-        self.children.push((width, height));
+        self.children.push(FlowItem {
+            width,
+            height,
+            id: None,
+        });
+        self
+    }
+
+    /// Append one `width`×`height` item tagged with a stable [`NodeId`] for
+    /// order-independent lookup via [`LayoutResult::get_by_id`].
+    pub fn item_id(mut self, id: impl Into<NodeId>, width: f32, height: f32) -> Self {
+        self.children.push(FlowItem {
+            width,
+            height,
+            id: Some(id.into()),
+        });
         self
     }
 
@@ -1022,7 +1156,12 @@ impl Flow {
         let mut cur_y = 0.0_f32;
         let mut row_h = 0.0_f32;
         let mut placed_any = false;
-        for &(w, h) in &self.children {
+        for &FlowItem {
+            width: w,
+            height: h,
+            ..
+        } in &self.children
+        {
             // Wrap before placing when this item would overflow the row (but
             // never on the first item of a row, so an oversized item still fits).
             if cur_x > 0.0 && cur_x + w > inner_w {
@@ -1046,23 +1185,25 @@ impl LayoutNode for Flow {
     fn content_size(&self) -> (f32, f32) {
         let mut width = 0.0_f32;
         let mut height = 0.0_f32;
-        for (i, &(w, h)) in self.children.iter().enumerate() {
+        for (i, item) in self.children.iter().enumerate() {
             if i > 0 {
                 width += self.spacing;
             }
-            width += w;
-            height = height.max(h);
+            width += item.width;
+            height = height.max(item.height);
         }
         (width + self.padding * 2.0, height + self.padding * 2.0)
     }
 
-    fn layout(&self, bounds: Rect) -> LayoutResult {
-        let mut rects = vec![bounds];
+    fn layout_into(&self, bounds: Rect, out: &mut LayoutResult) {
+        out.entries.clear();
+        out.push(None, bounds);
         let inner_w = (bounds.width - self.padding * 2.0).max(0.0);
         let mut cur_x = self.padding;
         let mut cur_y = self.padding;
         let mut row_h = 0.0_f32;
-        for &(w, h) in &self.children {
+        for item in &self.children {
+            let (w, h) = (item.width, item.height);
             // Wrap before placing when this item overflows the row, except as the
             // first item in a row (an item wider than `inner_w` still gets placed
             // once, overflowing, rather than looping forever).
@@ -1071,11 +1212,10 @@ impl LayoutNode for Flow {
                 cur_y += row_h + self.run_spacing;
                 row_h = 0.0;
             }
-            rects.push(Rect::new(bounds.x + cur_x, bounds.y + cur_y, w, h));
+            out.push(item.id, Rect::new(bounds.x + cur_x, bounds.y + cur_y, w, h));
             cur_x += w + self.spacing;
             row_h = row_h.max(h);
         }
-        LayoutResult { rects }
     }
 }
 
@@ -1106,19 +1246,19 @@ mod tests {
         let result = stack.layout(bounds);
 
         // Container rect
-        assert_eq!(result.rects[0], bounds);
+        assert_eq!(result.get(0), bounds);
 
         // First child: y = 50 + 10 padding = 60
-        assert_eq!(result.rects[1].y, 60.0);
-        assert_eq!(result.rects[1].height, 30.0);
+        assert_eq!(result.get(1).y, 60.0);
+        assert_eq!(result.get(1).height, 30.0);
 
         // Second child: y = 60 + 30 + 8 spacing = 98
-        assert_eq!(result.rects[2].y, 98.0);
-        assert_eq!(result.rects[2].height, 20.0);
+        assert_eq!(result.get(2).y, 98.0);
+        assert_eq!(result.get(2).height, 20.0);
 
         // Third child: y = 98 + 20 + 8 spacing = 126
-        assert_eq!(result.rects[3].y, 126.0);
-        assert_eq!(result.rects[3].height, 30.0);
+        assert_eq!(result.get(3).y, 126.0);
+        assert_eq!(result.get(3).height, 30.0);
     }
 
     #[test]
@@ -1172,7 +1312,7 @@ mod tests {
             .child_fill(60.0)
             .constrain(Constraint::max(120.0));
         let result = stack.layout(Rect::new(0.0, 0.0, 60.0, 400.0));
-        assert_eq!(result.rects[1].height, 120.0);
+        assert_eq!(result.get(1).height, 120.0);
     }
 
     #[test]
@@ -1182,7 +1322,7 @@ mod tests {
             .child(10.0, 60.0)
             .constrain(Constraint::min(40.0));
         let result = stack.layout(Rect::new(0.0, 0.0, 60.0, 400.0));
-        assert_eq!(result.rects[1].height, 40.0);
+        assert_eq!(result.get(1).height, 40.0);
     }
 
     #[test]
@@ -1191,7 +1331,7 @@ mod tests {
             .child_fill(20.0)
             .constrain(Constraint::between(50.0, 150.0));
         let result = stack.layout(Rect::new(0.0, 0.0, 1000.0, 20.0));
-        assert_eq!(result.rects[1].width, 150.0, "fill width clamped to max");
+        assert_eq!(result.get(1).width, 150.0, "fill width clamped to max");
     }
 
     #[test]
@@ -1199,7 +1339,7 @@ mod tests {
         // Should not panic when there's no last child to clamp.
         let stack = VStack::new(0.0).constrain(Constraint::min(10.0));
         let result = stack.layout(Rect::new(0.0, 0.0, 60.0, 400.0));
-        assert_eq!(result.rects.len(), 1, "only the container rect");
+        assert_eq!(result.len(), 1, "only the container rect");
     }
 
     #[test]
@@ -1320,19 +1460,19 @@ mod tests {
             .child(30.0, 40.0) // cross_size=40, but Stretch ignores it
             .child(20.0, 40.0);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
-        assert_eq!(result.rects[1].x, 10.0);
-        assert_eq!(result.rects[1].width, 100.0);
-        assert_eq!(result.rects[2].x, 10.0);
-        assert_eq!(result.rects[2].width, 100.0);
+        assert_eq!(result.get(1).x, 10.0);
+        assert_eq!(result.get(1).width, 100.0);
+        assert_eq!(result.get(2).x, 10.0);
+        assert_eq!(result.get(2).width, 100.0);
     }
 
     #[test]
     fn vstack_align_start_pins_left() {
         let stack = VStack::new(0.0).child(30.0, 40.0).align(CrossAlign::Start);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
-        assert_eq!(result.rects[1].x, 10.0, "start aligns to left edge");
+        assert_eq!(result.get(1).x, 10.0, "start aligns to left edge");
         assert_eq!(
-            result.rects[1].width, 40.0,
+            result.get(1).width, 40.0,
             "start uses cross_size, not inner_width"
         );
     }
@@ -1342,8 +1482,8 @@ mod tests {
         let stack = VStack::new(0.0).child(30.0, 40.0).align(CrossAlign::Center);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_width = 100 (no padding), center = 10 + (100 - 40) / 2 = 40
-        assert_eq!(result.rects[1].x, 40.0);
-        assert_eq!(result.rects[1].width, 40.0);
+        assert_eq!(result.get(1).x, 40.0);
+        assert_eq!(result.get(1).width, 40.0);
     }
 
     #[test]
@@ -1351,8 +1491,8 @@ mod tests {
         let stack = VStack::new(0.0).child(30.0, 40.0).align(CrossAlign::End);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_width = 100, end = 10 + 100 - 40 = 70
-        assert_eq!(result.rects[1].x, 70.0);
-        assert_eq!(result.rects[1].width, 40.0);
+        assert_eq!(result.get(1).x, 70.0);
+        assert_eq!(result.get(1).width, 40.0);
     }
 
     #[test]
@@ -1363,8 +1503,8 @@ mod tests {
             .align(CrossAlign::Center);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_width = 100 - 20 = 80, center x = 10 + 10 + (80 - 40) / 2 = 40
-        assert_eq!(result.rects[1].x, 40.0);
-        assert_eq!(result.rects[1].width, 40.0);
+        assert_eq!(result.get(1).x, 40.0);
+        assert_eq!(result.get(1).width, 40.0);
     }
 
     #[test]
@@ -1372,16 +1512,16 @@ mod tests {
         // cross_size larger than inner_width should be clamped.
         let stack = VStack::new(0.0).child(30.0, 200.0).align(CrossAlign::Start);
         let result = stack.layout(Rect::new(0.0, 0.0, 100.0, 100.0));
-        assert_eq!(result.rects[1].width, 100.0, "clamped to inner_width");
+        assert_eq!(result.get(1).width, 100.0, "clamped to inner_width");
     }
 
     #[test]
     fn hstack_align_start_pins_top() {
         let stack = HStack::new(0.0).child(30.0, 20.0).align(CrossAlign::Start);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
-        assert_eq!(result.rects[1].y, 10.0, "start aligns to top edge");
+        assert_eq!(result.get(1).y, 10.0, "start aligns to top edge");
         assert_eq!(
-            result.rects[1].height, 20.0,
+            result.get(1).height, 20.0,
             "start uses cross_size, not inner_height"
         );
     }
@@ -1391,8 +1531,8 @@ mod tests {
         let stack = HStack::new(0.0).child(30.0, 20.0).align(CrossAlign::Center);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_height = 100, center y = 10 + (100 - 20) / 2 = 50
-        assert_eq!(result.rects[1].y, 50.0);
-        assert_eq!(result.rects[1].height, 20.0);
+        assert_eq!(result.get(1).y, 50.0);
+        assert_eq!(result.get(1).height, 20.0);
     }
 
     #[test]
@@ -1400,8 +1540,8 @@ mod tests {
         let stack = HStack::new(0.0).child(30.0, 20.0).align(CrossAlign::End);
         let result = stack.layout(Rect::new(10.0, 10.0, 100.0, 100.0));
         // inner_height = 100, end y = 10 + 100 - 20 = 90
-        assert_eq!(result.rects[1].y, 90.0);
-        assert_eq!(result.rects[1].height, 20.0);
+        assert_eq!(result.get(1).y, 90.0);
+        assert_eq!(result.get(1).height, 20.0);
     }
 
     #[test]
@@ -1415,11 +1555,11 @@ mod tests {
             .align(CrossAlign::End); // pinned to bottom
         let result = stack.layout(Rect::new(0.0, 0.0, 200.0, 100.0));
         // inner_height = 100 - 10 = 90
-        assert_eq!(result.rects[1].height, 30.0, "start child uses cross_size");
-        assert_eq!(result.rects[1].y, 5.0, "start child at top edge");
-        assert_eq!(result.rects[2].height, 30.0, "end child uses cross_size");
+        assert_eq!(result.get(1).height, 30.0, "start child uses cross_size");
+        assert_eq!(result.get(1).y, 5.0, "start child at top edge");
+        assert_eq!(result.get(2).height, 30.0, "end child uses cross_size");
         assert_eq!(
-            result.rects[2].y, 65.0,
+            result.get(2).y, 65.0,
             "end child at bottom edge (5 + 90 - 30)"
         );
     }
@@ -1436,19 +1576,19 @@ mod tests {
             .align(CrossAlign::End);
         let result = stack.layout(Rect::new(0.0, 0.0, 120.0, 200.0));
         // inner_width = 120 - 8 = 112
-        assert_eq!(result.rects[1].width, 50.0, "center child uses cross_size");
+        assert_eq!(result.get(1).width, 50.0, "center child uses cross_size");
         assert_eq!(
-            result.rects[1].x,
+            result.get(1).x,
             4.0 + (112.0 - 50.0) * 0.5,
             "center child x"
         );
         assert_eq!(
-            result.rects[2].width, 112.0,
+            result.get(2).width, 112.0,
             "fill child stretches full width"
         );
-        assert_eq!(result.rects[3].width, 40.0, "end child uses cross_size");
+        assert_eq!(result.get(3).width, 40.0, "end child uses cross_size");
         assert_eq!(
-            result.rects[3].x,
+            result.get(3).x,
             4.0 + 112.0 - 40.0,
             "end child at right edge"
         );
@@ -1465,9 +1605,9 @@ mod tests {
             .child_fill(30.0)
             .weight(1.0);
         let result = stack.layout(Rect::new(0.0, 0.0, 300.0, 40.0));
-        assert_eq!(result.rects[1].width, 200.0, "weight 2 child gets 2/3");
-        assert_eq!(result.rects[2].width, 100.0, "weight 1 child gets 1/3");
-        assert_eq!(result.rects[2].x, 200.0, "second child starts after first");
+        assert_eq!(result.get(1).width, 200.0, "weight 2 child gets 2/3");
+        assert_eq!(result.get(2).width, 100.0, "weight 1 child gets 1/3");
+        assert_eq!(result.get(2).x, 200.0, "second child starts after first");
     }
 
     #[test]
@@ -1481,9 +1621,9 @@ mod tests {
             .child_fill(10.0)
             .weight(1.0);
         let result = stack.layout(Rect::new(0.0, 0.0, 50.0, 400.0));
-        assert_eq!(result.rects[1].height, 200.0);
-        assert_eq!(result.rects[2].height, 100.0);
-        assert_eq!(result.rects[3].height, 100.0);
+        assert_eq!(result.get(1).height, 200.0);
+        assert_eq!(result.get(2).height, 100.0);
+        assert_eq!(result.get(3).height, 100.0);
     }
 
     #[test]
@@ -1492,8 +1632,8 @@ mod tests {
         // remaining / fill_count split exactly.
         let weighted = HStack::new(0.0).child_fill(10.0).child_fill(10.0);
         let r = weighted.layout(Rect::new(0.0, 0.0, 300.0, 20.0));
-        assert_eq!(r.rects[1].width, 150.0);
-        assert_eq!(r.rects[2].width, 150.0);
+        assert_eq!(r.get(1).width, 150.0);
+        assert_eq!(r.get(2).width, 150.0);
     }
 
     #[test]
@@ -1501,8 +1641,8 @@ mod tests {
         // A lone fill at weight 0 → fill_weight is 0 → 0px (no div-by-zero).
         let stack = HStack::new(0.0).child(100.0, 20.0).child_fill(20.0).weight(0.0);
         let result = stack.layout(Rect::new(0.0, 0.0, 300.0, 20.0));
-        assert_eq!(result.rects[1].width, 100.0, "fixed child unaffected");
-        assert_eq!(result.rects[2].width, 0.0, "zero-weight fill gets no space");
+        assert_eq!(result.get(1).width, 100.0, "fixed child unaffected");
+        assert_eq!(result.get(2).width, 0.0, "zero-weight fill gets no space");
     }
 
     #[test]
@@ -1517,8 +1657,8 @@ mod tests {
             .weight(1.0);
         let result = stack.layout(Rect::new(0.0, 0.0, 400.0, 20.0));
         // Raw split: 300 / 100; first clamped to 50, second stays 100.
-        assert_eq!(result.rects[1].width, 50.0, "clamped to max");
-        assert_eq!(result.rects[2].width, 100.0, "sibling keeps its 1/4 share");
+        assert_eq!(result.get(1).width, 50.0, "clamped to max");
+        assert_eq!(result.get(2).width, 100.0, "sibling keeps its 1/4 share");
     }
 
     #[test]
@@ -1529,8 +1669,8 @@ mod tests {
             .child_fill(20.0)
             .weight(1.0);
         let result = stack.layout(Rect::new(0.0, 0.0, 300.0, 20.0));
-        assert_eq!(result.rects[1].width, 0.0, "negative weight clamped to 0");
-        assert_eq!(result.rects[2].width, 300.0, "other child takes all");
+        assert_eq!(result.get(1).width, 0.0, "negative weight clamped to 0");
+        assert_eq!(result.get(2).width, 300.0, "other child takes all");
     }
 
     // ---- Main-axis justification (justify-content) ----
@@ -1545,10 +1685,10 @@ mod tests {
             .child(40.0, 20.0);
         let ra = a.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
         let rb = b.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
-        assert_eq!(ra.rects[1].x, rb.rects[1].x);
-        assert_eq!(ra.rects[2].x, rb.rects[2].x);
-        assert_eq!(ra.rects[1].x, 0.0);
-        assert_eq!(ra.rects[2].x, 50.0, "40 width + 10 spacing");
+        assert_eq!(ra.get(1).x, rb.get(1).x);
+        assert_eq!(ra.get(2).x, rb.get(2).x);
+        assert_eq!(ra.get(1).x, 0.0);
+        assert_eq!(ra.get(2).x, 50.0, "40 width + 10 spacing");
     }
 
     #[test]
@@ -1559,8 +1699,8 @@ mod tests {
             .child(40.0, 20.0)
             .child(40.0, 20.0);
         let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
-        assert_eq!(r.rects[1].x, 55.0);
-        assert_eq!(r.rects[2].x, 105.0, "55 + 40 + 10");
+        assert_eq!(r.get(1).x, 55.0);
+        assert_eq!(r.get(2).x, 105.0, "55 + 40 + 10");
     }
 
     #[test]
@@ -1571,8 +1711,8 @@ mod tests {
             .child(40.0, 20.0);
         let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
         // Last item ends flush at the right edge.
-        assert_eq!(r.rects[2].x + r.rects[2].width, 200.0);
-        assert_eq!(r.rects[1].x, 110.0, "200 - 90 content");
+        assert_eq!(r.get(2).x + r.get(2).width, 200.0);
+        assert_eq!(r.get(1).x, 110.0, "200 - 90 content");
     }
 
     #[test]
@@ -1585,9 +1725,9 @@ mod tests {
             .child(40.0, 20.0)
             .child(40.0, 20.0);
         let r = stack.layout(Rect::new(0.0, 0.0, 240.0, 30.0));
-        assert_eq!(r.rects[1].x, 0.0, "first flush left");
-        assert_eq!(r.rects[2].x, 100.0, "40 + 60 gap");
-        assert_eq!(r.rects[3].x + r.rects[3].width, 240.0, "last flush right");
+        assert_eq!(r.get(1).x, 0.0, "first flush left");
+        assert_eq!(r.get(2).x, 100.0, "40 + 60 gap");
+        assert_eq!(r.get(3).x + r.get(3).width, 240.0, "last flush right");
     }
 
     #[test]
@@ -1596,7 +1736,7 @@ mod tests {
             .justify(MainAlign::SpaceBetween)
             .child(40.0, 20.0);
         let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
-        assert_eq!(r.rects[1].x, 0.0, "lone child stays at start");
+        assert_eq!(r.get(1).x, 0.0, "lone child stays at start");
     }
 
     #[test]
@@ -1608,8 +1748,8 @@ mod tests {
             .child(50.0, 20.0)
             .child(50.0, 20.0);
         let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
-        assert_eq!(r.rects[1].x, 25.0, "half-gap lead");
-        assert_eq!(r.rects[2].x, 125.0, "25 + 50 + 50 gap");
+        assert_eq!(r.get(1).x, 25.0, "half-gap lead");
+        assert_eq!(r.get(2).x, 125.0, "25 + 50 + 50 gap");
     }
 
     #[test]
@@ -1621,8 +1761,8 @@ mod tests {
             .child(50.0, 20.0);
         let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
         let gap = 100.0 / 3.0;
-        assert!((r.rects[1].x - gap).abs() < 0.001, "lead gap");
-        assert!((r.rects[2].x - (gap + 50.0 + gap)).abs() < 0.001);
+        assert!((r.get(1).x - gap).abs() < 0.001, "lead gap");
+        assert!((r.get(2).x - (gap + 50.0 + gap)).abs() < 0.001);
     }
 
     #[test]
@@ -1636,9 +1776,9 @@ mod tests {
         let plain = HStack::new(0.0).child(40.0, 20.0).child_fill(20.0);
         let rj = justified.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
         let rp = plain.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
-        assert_eq!(rj.rects[1].x, rp.rects[1].x);
-        assert_eq!(rj.rects[2].x, rp.rects[2].x);
-        assert_eq!(rj.rects[2].width, rp.rects[2].width);
+        assert_eq!(rj.get(1).x, rp.get(1).x);
+        assert_eq!(rj.get(2).x, rp.get(2).x);
+        assert_eq!(rj.get(2).width, rp.get(2).width);
     }
 
     #[test]
@@ -1649,8 +1789,8 @@ mod tests {
             .child(40.0, 20.0)
             .child(40.0, 20.0);
         let r = stack.layout(Rect::new(0.0, 0.0, 30.0, 200.0));
-        assert_eq!(r.rects[1].y, 55.0);
-        assert_eq!(r.rects[2].y, 105.0);
+        assert_eq!(r.get(1).y, 55.0);
+        assert_eq!(r.get(2).y, 105.0);
     }
 
     #[test]
@@ -1663,7 +1803,7 @@ mod tests {
             .child(40.0, 20.0)
             .child(40.0, 20.0);
         let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 60.0));
-        assert_eq!(r.rects[1].x, 60.0, "padding 20 + center lead 40");
+        assert_eq!(r.get(1).x, 60.0, "padding 20 + center lead 40");
     }
 
     // ---- Flow (wrap) layout ----
@@ -1675,13 +1815,13 @@ mod tests {
         // wraps to row 1.
         let flow = Flow::new(10.0).item(100.0, 40.0).item(100.0, 40.0).item(100.0, 40.0);
         let r = flow.layout(Rect::new(0.0, 0.0, 250.0, 200.0));
-        assert_eq!(r.rects.len(), 4, "container + 3 items");
+        assert_eq!(r.len(), 4, "container + 3 items");
         // Row 0.
-        assert_eq!((r.rects[1].x, r.rects[1].y), (0.0, 0.0));
-        assert_eq!((r.rects[2].x, r.rects[2].y), (110.0, 0.0));
+        assert_eq!((r.get(1).x, r.get(1).y), (0.0, 0.0));
+        assert_eq!((r.get(2).x, r.get(2).y), (110.0, 0.0));
         // Row 1: item 2 drops below, x resets.
-        assert_eq!(r.rects[3].x, 0.0, "wrapped item resets to left");
-        assert_eq!(r.rects[3].y, 50.0, "wrapped to row 1 (row_h 40 + spacing 10)");
+        assert_eq!(r.get(3).x, 0.0, "wrapped item resets to left");
+        assert_eq!(r.get(3).y, 50.0, "wrapped to row 1 (row_h 40 + spacing 10)");
     }
 
     #[test]
@@ -1698,10 +1838,10 @@ mod tests {
         let r = flow.layout(Rect::new(0.0, 0.0, 100.0, 200.0));
         // inner_w = 100 - 16 = 84; item 0 at (8,8); item 1 (would reach 62+50=112
         // > 8+84=92) wraps.
-        assert_eq!((r.rects[1].x, r.rects[1].y), (8.0, 8.0), "first item at padding");
-        assert_eq!(r.rects[2].x, 8.0, "second wraps to left padding");
+        assert_eq!((r.get(1).x, r.get(1).y), (8.0, 8.0), "first item at padding");
+        assert_eq!(r.get(2).x, 8.0, "second wraps to left padding");
         assert_eq!(
-            r.rects[2].y, 8.0 + 30.0 + 20.0,
+            r.get(2).y, 8.0 + 30.0 + 20.0,
             "second on row 1 (padding + row_h + run_spacing)"
         );
     }
@@ -1717,9 +1857,7 @@ mod tests {
         let width = 200.0;
         let r = flow.layout(Rect::new(0.0, 0.0, width, 500.0));
         let last_bottom = r
-            .rects
-            .iter()
-            .skip(1)
+            .children()
             .map(|rc| rc.y + rc.height)
             .fold(0.0_f32, f32::max);
         // measure_height includes the bottom padding; last_bottom does not.
@@ -1731,8 +1869,8 @@ mod tests {
         let flow = Flow::new(8.0);
         let bounds = Rect::new(1.0, 2.0, 100.0, 50.0);
         let r = flow.layout(bounds);
-        assert_eq!(r.rects.len(), 1);
-        assert_eq!(r.rects[0], bounds);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.get(0), bounds);
         assert_eq!(flow.measure_height(100.0), 0.0, "empty flow has no content height");
     }
 
@@ -1742,10 +1880,113 @@ mod tests {
         // (no infinite wrap loop), overflowing the bound.
         let flow = Flow::new(4.0).item(500.0, 30.0).item(20.0, 30.0);
         let r = flow.layout(Rect::new(0.0, 0.0, 100.0, 200.0));
-        assert_eq!(r.rects.len(), 3, "both items placed");
-        assert_eq!((r.rects[1].x, r.rects[1].y), (0.0, 0.0), "oversized item on row 0");
+        assert_eq!(r.len(), 3, "both items placed");
+        assert_eq!((r.get(1).x, r.get(1).y), (0.0, 0.0), "oversized item on row 0");
         // The small item can't share row 0 (cur_x already past inner_w) -> row 1.
-        assert_eq!(r.rects[2].x, 0.0);
-        assert_eq!(r.rects[2].y, 34.0, "small item wraps below oversized one");
+        assert_eq!(r.get(2).x, 0.0);
+        assert_eq!(r.get(2).y, 34.0, "small item wraps below oversized one");
+    }
+
+    // ---- Stable node IDs (get_by_id) ----
+
+    #[test]
+    fn get_by_id_resolves_tagged_children() {
+        let stack = HStack::new(0.0)
+            .child(40.0, 20.0)
+            .id(10)
+            .child(60.0, 20.0)
+            .id(20);
+        let r = stack.layout(Rect::new(0.0, 0.0, 100.0, 20.0));
+        assert_eq!(r.get_by_id(10), Some(r.get(1)));
+        assert_eq!(r.get_by_id(20), Some(r.get(2)));
+        assert_eq!(r.get_by_id(10).unwrap().width, 40.0);
+        assert_eq!(r.get_by_id(20).unwrap().x, 40.0);
+    }
+
+    #[test]
+    fn get_by_id_is_order_independent() {
+        // The core regression `NodeId` prevents: reordering children shifts every
+        // positional index, but id lookup still resolves to the same logical node.
+        let a = HStack::new(0.0).child(40.0, 20.0).id(1).child(60.0, 20.0).id(2);
+        let b = HStack::new(0.0).child(60.0, 20.0).id(2).child(40.0, 20.0).id(1);
+        let ra = a.layout(Rect::new(0.0, 0.0, 100.0, 20.0));
+        let rb = b.layout(Rect::new(0.0, 0.0, 100.0, 20.0));
+        // Positional indices disagree after the swap...
+        assert_ne!(ra.get(1).width, rb.get(1).width);
+        // ...but each id still maps to a 40-wide / 60-wide box respectively.
+        assert_eq!(ra.get_by_id(1).unwrap().width, 40.0);
+        assert_eq!(rb.get_by_id(1).unwrap().width, 40.0);
+        assert_eq!(ra.get_by_id(2).unwrap().width, 60.0);
+        assert_eq!(rb.get_by_id(2).unwrap().width, 60.0);
+    }
+
+    #[test]
+    fn get_by_id_unknown_and_untagged_return_none() {
+        let stack = VStack::new(0.0).child(10.0, 20.0).id(7).child(10.0, 20.0); // 2nd untagged
+        let r = stack.layout(Rect::new(0.0, 0.0, 20.0, 40.0));
+        assert_eq!(r.get_by_id(99), None, "unknown id");
+        // The untagged child has no id, so nothing resolves to it by id.
+        assert_eq!(r.get_by_id(0), None);
+        assert_eq!(r.get_by_id(7), Some(r.get(1)));
+    }
+
+    #[test]
+    fn flow_item_id_is_addressable() {
+        let flow = Flow::new(8.0)
+            .item(40.0, 40.0)
+            .item_id(5, 40.0, 40.0)
+            .item(40.0, 40.0);
+        let r = flow.layout(Rect::new(0.0, 0.0, 200.0, 60.0));
+        assert_eq!(r.get_by_id(5), Some(r.get(2)), "tagged tile resolves by id");
+        assert_eq!(r.get_by_id(0), None, "untagged tiles have no id");
+    }
+
+    // ---- Arena / buffer reuse (layout_into) ----
+
+    #[test]
+    fn layout_into_clears_stale_entries() {
+        let big = VStack::new(0.0).child(10.0, 20.0).child(10.0, 20.0).child(10.0, 20.0);
+        let small = VStack::new(0.0).child(10.0, 20.0);
+        let mut buf = LayoutResult::default();
+        big.layout_into(Rect::new(0.0, 0.0, 20.0, 60.0), &mut buf);
+        assert_eq!(buf.len(), 4, "container + 3 children");
+        // Reusing the same buffer for a smaller tree must not leave stragglers.
+        small.layout_into(Rect::new(0.0, 0.0, 20.0, 20.0), &mut buf);
+        assert_eq!(buf.len(), 2, "container + 1 child; stale entries cleared");
+    }
+
+    #[test]
+    fn layout_into_matches_fresh_layout() {
+        let stack = HStack::new(6.0)
+            .child(40.0, 20.0)
+            .child_fill(20.0)
+            .weight(2.0)
+            .child_fill(20.0);
+        let bounds = Rect::new(3.0, 5.0, 300.0, 40.0);
+        let fresh = stack.layout(bounds);
+        let mut buf = LayoutResult::default();
+        stack.layout_into(bounds, &mut buf);
+        assert_eq!(buf.len(), fresh.len());
+        for i in 0..fresh.len() {
+            assert_eq!(buf.get(i), fresh.get(i), "entry {i} must match fresh layout");
+        }
+    }
+
+    #[test]
+    fn layout_into_reuses_capacity() {
+        // Sanity that we reuse the buffer's allocation rather than reallocating
+        // every frame: after the first fill, capacity covers the entry count and
+        // does not shrink on subsequent equal-size fills.
+        let stack = VStack::new(0.0)
+            .child(10.0, 20.0)
+            .child(10.0, 20.0)
+            .child(10.0, 20.0);
+        let bounds = Rect::new(0.0, 0.0, 20.0, 60.0);
+        let mut buf = LayoutResult::default();
+        stack.layout_into(bounds, &mut buf);
+        let cap = buf.entries.capacity();
+        assert!(cap >= 4);
+        stack.layout_into(bounds, &mut buf);
+        assert_eq!(buf.entries.capacity(), cap, "capacity reused, no realloc");
     }
 }

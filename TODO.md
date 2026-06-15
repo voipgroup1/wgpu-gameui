@@ -270,10 +270,22 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `justify-content`). Completes the flexbox model alongside weighted `Fill`
       (`flex-grow`), `CrossAlign` (`align-items`), and `Flow` (`flex-wrap`); the
       remaining CSS-flex gap is `flex-shrink`.
-- [ ] **P2 — Stable node IDs in `LayoutResult`** instead of positional indices
-      (today `Vec<Rect>` indexed numerically, fragile under reordering).
-- [ ] **P2 — Borrow/arena API for `LayoutResult.rects`** to avoid per-frame
-      heap allocations.
+- [x] **P2 — Stable node IDs in `LayoutResult`.** New `NodeId(pub u64)` (with
+      `From<u64>`); tag children via `.id(n)` on `VStack`/`HStack` or
+      `Flow::item_id(n, w, h)`, then resolve order-independently with
+      `LayoutResult::get_by_id(n) -> Option<Rect>`. `LayoutResult` is now
+      encapsulated (private `entries`) behind accessors —
+      `container()`/`get(i)`/`get_by_id(id)`/`children()`/`iter()`/`len()`/
+      `child_count()` — so positional `[i]` indexing (fragile under reordering) is
+      retired. Builders funnel through a private `StackChild::new`.
+- [x] **P2 — Borrow/arena API for `LayoutResult`.** `LayoutNode::layout_into(
+      bounds, &mut LayoutResult)` is now the trait primitive (clears + refills a
+      caller-owned buffer, reusing its capacity → zero per-frame allocation);
+      `layout()` is a provided convenience wrapper that allocates. `Positioned`
+      gains `layout_screen_into(w, h, &mut buf)`. Frame-loop callers hold one
+      `LayoutResult` as scratch — mirrors the `ScrollState`/`DragCapture`
+      caller-owned convention. Bench `layout_resolve` now has `alloc` vs `reuse`
+      arms.
 
 ---
 
