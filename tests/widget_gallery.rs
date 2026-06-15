@@ -11,7 +11,7 @@
 //! content `Rect` to draw into, so adding a widget is one `flow.cell(...)` call
 //! plus the widget's own draw call — no hand-placed coordinates.
 
-use wgpu_gameui::layout::{Flow as LayoutFlow, HStack, LayoutNode, Rect};
+use wgpu_gameui::layout::{Flow as LayoutFlow, HStack, LayoutNode, MainAlign, Rect};
 use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList, Dropdown,
     DropdownState, Easing, FocusState, HitZone, ImageButton, ImageFit, InputState, LayerStack, List,
@@ -1280,6 +1280,33 @@ fn render_widget_gallery() {
             for (i, rc) in res.rects.iter().skip(1).enumerate() {
                 let t = i as f32 / 8.0;
                 list.rounded_rect(*rc, 6.0, [0.25 + 0.5 * t, 0.45, 0.85 - 0.4 * t, 1.0]);
+            }
+        }
+
+        // Main-axis justification (justify-content) — the same three fixed-size
+        // cells distributed six ways across a fixed-width track, so the spacing
+        // policies are eyeballable stacked vertically.
+        flow.section(list, "Justify (main-axis distribution)");
+        for (label, mode) in [
+            ("Start", MainAlign::Start),
+            ("Center", MainAlign::Center),
+            ("End", MainAlign::End),
+            ("SpaceBetween", MainAlign::SpaceBetween),
+            ("SpaceAround", MainAlign::SpaceAround),
+            ("SpaceEvenly", MainAlign::SpaceEvenly),
+        ] {
+            let track_w = 300.0;
+            let r = flow.cell(list, label, track_w, 28.0);
+            // Faint track backing so empty space reads as "the container".
+            list.rounded_rect(r, 4.0, [0.16, 0.16, 0.20, 1.0]);
+            let row = HStack::new(0.0)
+                .justify(mode)
+                .child(44.0, 24.0)
+                .child(44.0, 24.0)
+                .child(44.0, 24.0);
+            let res = row.layout(r);
+            for rc in res.rects.iter().skip(1) {
+                list.rounded_rect(*rc, 4.0, [0.30, 0.55, 0.90, 1.0]);
             }
         }
 

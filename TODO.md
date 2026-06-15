@@ -262,6 +262,14 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       top-aligned in add order). `content_size()` gives unwrapped single-row
       extents; `measure_height(width)` returns the true wrapped height for sizing a
       `Fit`/scroll container around it.
+- [x] **P2 — Main-axis justification (`justify-content`).** `MainAlign`
+      (`Start`/`Center`/`End`/`SpaceBetween`/`SpaceAround`/`SpaceEvenly`) on both
+      stacks via `HStack::new(8.0).justify(MainAlign::SpaceBetween)…`. Distributes
+      leftover main-axis space; defaults to `Start` (byte-identical) and is a no-op
+      when a `Fill` child already consumed the slack (mirrors `flex-grow` vs
+      `justify-content`). Completes the flexbox model alongside weighted `Fill`
+      (`flex-grow`), `CrossAlign` (`align-items`), and `Flow` (`flex-wrap`); the
+      remaining CSS-flex gap is `flex-shrink`.
 - [ ] **P2 — Stable node IDs in `LayoutResult`** instead of positional indices
       (today `Vec<Rect>` indexed numerically, fragile under reordering).
 - [ ] **P2 — Borrow/arena API for `LayoutResult.rects`** to avoid per-frame

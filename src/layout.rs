@@ -428,11 +428,68 @@ pub enum CrossAlign {
     Stretch,
 }
 
+/// Distribution of children along the **main axis** when there is leftover space
+/// — the equivalent of CSS `justify-content`.
+///
+/// Defaults to [`Start`](MainAlign::Start) (children packed at the start, leftover
+/// space trailing — the existing behavior). Only has an effect when no
+/// [`SizeSpec::Fill`] child is present: a `Fill` child grows to consume the
+/// slack, leaving nothing to distribute (just like `flex-grow` vs
+/// `justify-content` in CSS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MainAlign {
+    /// Pack children at the start; leftover space trails (default).
+    #[default]
+    Start,
+    /// Center the children as a group; leftover space splits before and after.
+    Center,
+    /// Pack children at the end; leftover space leads.
+    End,
+    /// Leftover space divided evenly *between* adjacent children (none at the
+    /// ends). A single child behaves like [`Start`](MainAlign::Start).
+    SpaceBetween,
+    /// Leftover space divided so each child has equal space around it — the end
+    /// gaps are half the size of the gaps between children.
+    SpaceAround,
+    /// Leftover space divided into equal gaps, including the two ends.
+    SpaceEvenly,
+}
+
+impl MainAlign {
+    /// Resolve a main-axis distribution into a leading offset and the extra gap
+    /// to insert between adjacent children, given `free` leftover space and `n`
+    /// children. `Start` (and `n == 0`) yields `(0.0, 0.0)` — byte-identical to
+    /// the un-justified layout.
+    fn resolve(self, free: f32, n: usize) -> (f32, f32) {
+        if n == 0 {
+            return (0.0, 0.0);
+        }
+        let nf = n as f32;
+        match self {
+            MainAlign::Start => (0.0, 0.0),
+            MainAlign::Center => (free * 0.5, 0.0),
+            MainAlign::End => (free, 0.0),
+            MainAlign::SpaceBetween => {
+                if n > 1 {
+                    (0.0, free / (nf - 1.0))
+                } else {
+                    (0.0, 0.0)
+                }
+            }
+            MainAlign::SpaceAround => (free / (2.0 * nf), free / nf),
+            MainAlign::SpaceEvenly => (free / (nf + 1.0), free / (nf + 1.0)),
+        }
+    }
+}
+
 /// Vertical stack - children arranged top to bottom.
 pub struct VStack {
     pub spacing: f32,
     pub padding: f32,
     pub children: Vec<StackChild>,
+    /// Main-axis (vertical) distribution of leftover space. Defaults to
+    /// [`MainAlign::Start`]; ignored when a [`SizeSpec::Fill`] child is present.
+    pub main_align: MainAlign,
 }
 
 /// Horizontal stack - children arranged left to right.
@@ -440,6 +497,9 @@ pub struct HStack {
     pub spacing: f32,
     pub padding: f32,
     pub children: Vec<StackChild>,
+    /// Main-axis (horizontal) distribution of leftover space. Defaults to
+    /// [`MainAlign::Start`]; ignored when a [`SizeSpec::Fill`] child is present.
+    pub main_align: MainAlign,
 }
 
 /// A child in a stack with its sizing.
@@ -465,11 +525,25 @@ impl VStack {
             spacing,
             padding: 0.0,
             children: Vec::new(),
+            main_align: MainAlign::Start,
         }
     }
 
     pub fn with_padding(mut self, padding: f32) -> Self {
         self.padding = padding;
+        self
+    }
+
+    /// Set the main-axis (vertical) distribution of leftover space — the
+    /// `justify-content` equivalent. Defaults to [`MainAlign::Start`]. No effect
+    /// when a [`SizeSpec::Fill`] child is present (the fill consumes the slack).
+    ///
+    /// ```ignore
+    /// VStack::new(8.0).justify(MainAlign::SpaceBetween)
+    ///     .child(30.0, 80.0).child(30.0, 80.0)
+    /// ```
+    pub fn justify(mut self, main_align: MainAlign) -> Self {
+        self.main_align = main_align;
         self
     }
 
@@ -603,11 +677,21 @@ impl LayoutNode for VStack {
             0.0
         };
 
+        // Main-axis justification distributes the leftover space when no Fill
+        // child claimed it. `remaining` already equals that slack here (fill
+        // children resolve to 0 height), so reuse it directly. Default
+        // `MainAlign::Start` → (0, 0), byte-identical to the un-justified layout.
+        let (justify_offset, justify_gap) = if fill_weight == 0.0 {
+            self.main_align.resolve(remaining, self.children.len())
+        } else {
+            (0.0, 0.0)
+        };
+
         // Position children
-        let mut y = bounds.y + self.padding;
+        let mut y = bounds.y + self.padding + justify_offset;
         for (i, child) in self.children.iter().enumerate() {
             if i > 0 {
-                y += self.spacing;
+                y += self.spacing + justify_gap;
             }
 
             let base_height = match child.size {
@@ -646,11 +730,25 @@ impl HStack {
             spacing,
             padding: 0.0,
             children: Vec::new(),
+            main_align: MainAlign::Start,
         }
     }
 
     pub fn with_padding(mut self, padding: f32) -> Self {
         self.padding = padding;
+        self
+    }
+
+    /// Set the main-axis (horizontal) distribution of leftover space — the
+    /// `justify-content` equivalent. Defaults to [`MainAlign::Start`]. No effect
+    /// when a [`SizeSpec::Fill`] child is present (the fill consumes the slack).
+    ///
+    /// ```ignore
+    /// HStack::new(8.0).justify(MainAlign::SpaceBetween)
+    ///     .child(80.0, 30.0).child(80.0, 30.0)
+    /// ```
+    pub fn justify(mut self, main_align: MainAlign) -> Self {
+        self.main_align = main_align;
         self
     }
 
@@ -784,11 +882,21 @@ impl LayoutNode for HStack {
             0.0
         };
 
+        // Main-axis justification distributes the leftover space when no Fill
+        // child claimed it. `remaining` already equals that slack here (fill
+        // children resolve to 0 width), so reuse it directly. Default
+        // `MainAlign::Start` → (0, 0), byte-identical to the un-justified layout.
+        let (justify_offset, justify_gap) = if fill_weight == 0.0 {
+            self.main_align.resolve(remaining, self.children.len())
+        } else {
+            (0.0, 0.0)
+        };
+
         // Position children
-        let mut x = bounds.x + self.padding;
+        let mut x = bounds.x + self.padding + justify_offset;
         for (i, child) in self.children.iter().enumerate() {
             if i > 0 {
-                x += self.spacing;
+                x += self.spacing + justify_gap;
             }
 
             let base_width = match child.size {
@@ -1423,6 +1531,139 @@ mod tests {
         let result = stack.layout(Rect::new(0.0, 0.0, 300.0, 20.0));
         assert_eq!(result.rects[1].width, 0.0, "negative weight clamped to 0");
         assert_eq!(result.rects[2].width, 300.0, "other child takes all");
+    }
+
+    // ---- Main-axis justification (justify-content) ----
+
+    #[test]
+    fn justify_start_is_byte_identical_default() {
+        // Default (no .justify) and explicit Start must match exactly.
+        let a = HStack::new(10.0).child(40.0, 20.0).child(40.0, 20.0);
+        let b = HStack::new(10.0)
+            .justify(MainAlign::Start)
+            .child(40.0, 20.0)
+            .child(40.0, 20.0);
+        let ra = a.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
+        let rb = b.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
+        assert_eq!(ra.rects[1].x, rb.rects[1].x);
+        assert_eq!(ra.rects[2].x, rb.rects[2].x);
+        assert_eq!(ra.rects[1].x, 0.0);
+        assert_eq!(ra.rects[2].x, 50.0, "40 width + 10 spacing");
+    }
+
+    #[test]
+    fn justify_center_offsets_group() {
+        // Two 40px items + 10px gap = 90 content; 200 wide → 110 free → 55 lead.
+        let stack = HStack::new(10.0)
+            .justify(MainAlign::Center)
+            .child(40.0, 20.0)
+            .child(40.0, 20.0);
+        let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
+        assert_eq!(r.rects[1].x, 55.0);
+        assert_eq!(r.rects[2].x, 105.0, "55 + 40 + 10");
+    }
+
+    #[test]
+    fn justify_end_pushes_to_far_edge() {
+        let stack = HStack::new(10.0)
+            .justify(MainAlign::End)
+            .child(40.0, 20.0)
+            .child(40.0, 20.0);
+        let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
+        // Last item ends flush at the right edge.
+        assert_eq!(r.rects[2].x + r.rects[2].width, 200.0);
+        assert_eq!(r.rects[1].x, 110.0, "200 - 90 content");
+    }
+
+    #[test]
+    fn justify_space_between_spreads_to_edges() {
+        // 3 items × 40 = 120 (gap 0 for clean math); 240 wide → 120 free over 2
+        // gaps = 60 each.
+        let stack = HStack::new(0.0)
+            .justify(MainAlign::SpaceBetween)
+            .child(40.0, 20.0)
+            .child(40.0, 20.0)
+            .child(40.0, 20.0);
+        let r = stack.layout(Rect::new(0.0, 0.0, 240.0, 30.0));
+        assert_eq!(r.rects[1].x, 0.0, "first flush left");
+        assert_eq!(r.rects[2].x, 100.0, "40 + 60 gap");
+        assert_eq!(r.rects[3].x + r.rects[3].width, 240.0, "last flush right");
+    }
+
+    #[test]
+    fn justify_space_between_single_child_is_start() {
+        let stack = HStack::new(0.0)
+            .justify(MainAlign::SpaceBetween)
+            .child(40.0, 20.0);
+        let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
+        assert_eq!(r.rects[1].x, 0.0, "lone child stays at start");
+    }
+
+    #[test]
+    fn justify_space_around_half_end_gaps() {
+        // 2 items × 50 = 100; 200 wide → 100 free; around → each item gets 50,
+        // so 25 lead, 50 between, 25 trail.
+        let stack = HStack::new(0.0)
+            .justify(MainAlign::SpaceAround)
+            .child(50.0, 20.0)
+            .child(50.0, 20.0);
+        let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
+        assert_eq!(r.rects[1].x, 25.0, "half-gap lead");
+        assert_eq!(r.rects[2].x, 125.0, "25 + 50 + 50 gap");
+    }
+
+    #[test]
+    fn justify_space_evenly_equal_gaps() {
+        // 2 items × 50 = 100; 200 wide → 100 free over 3 equal gaps ≈ 33.33.
+        let stack = HStack::new(0.0)
+            .justify(MainAlign::SpaceEvenly)
+            .child(50.0, 20.0)
+            .child(50.0, 20.0);
+        let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
+        let gap = 100.0 / 3.0;
+        assert!((r.rects[1].x - gap).abs() < 0.001, "lead gap");
+        assert!((r.rects[2].x - (gap + 50.0 + gap)).abs() < 0.001);
+    }
+
+    #[test]
+    fn justify_is_noop_with_fill_child() {
+        // A Fill child consumes the slack, so justify has nothing to distribute:
+        // result matches Start exactly.
+        let justified = HStack::new(0.0)
+            .justify(MainAlign::SpaceBetween)
+            .child(40.0, 20.0)
+            .child_fill(20.0);
+        let plain = HStack::new(0.0).child(40.0, 20.0).child_fill(20.0);
+        let rj = justified.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
+        let rp = plain.layout(Rect::new(0.0, 0.0, 200.0, 30.0));
+        assert_eq!(rj.rects[1].x, rp.rects[1].x);
+        assert_eq!(rj.rects[2].x, rp.rects[2].x);
+        assert_eq!(rj.rects[2].width, rp.rects[2].width);
+    }
+
+    #[test]
+    fn justify_vstack_center_offsets_vertically() {
+        // Mirror of the HStack center test on the vertical axis.
+        let stack = VStack::new(10.0)
+            .justify(MainAlign::Center)
+            .child(40.0, 20.0)
+            .child(40.0, 20.0);
+        let r = stack.layout(Rect::new(0.0, 0.0, 30.0, 200.0));
+        assert_eq!(r.rects[1].y, 55.0);
+        assert_eq!(r.rects[2].y, 105.0);
+    }
+
+    #[test]
+    fn justify_respects_padding() {
+        // padding 20 → inner 160; 2×40 content = 80 → 80 free; center lead 40,
+        // plus padding 20 = 60.
+        let stack = HStack::new(0.0)
+            .with_padding(20.0)
+            .justify(MainAlign::Center)
+            .child(40.0, 20.0)
+            .child(40.0, 20.0);
+        let r = stack.layout(Rect::new(0.0, 0.0, 200.0, 60.0));
+        assert_eq!(r.rects[1].x, 60.0, "padding 20 + center lead 40");
     }
 
     // ---- Flow (wrap) layout ----
