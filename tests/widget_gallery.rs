@@ -1240,17 +1240,21 @@ fn render_widget_gallery() {
         );
 
         // --- Hover animation (easing) --------------------------------------
-        // The animation system eases a widget's fill from its idle color toward
-        // the hover color over `theme.animation_duration`. There's no time axis
-        // in a static PNG, so we sample the *same* ease-out curve at five points
-        // t ∈ {0, .25, .5, .75, 1} and paint a Button at each — left = idle fill,
-        // right = full hover fill — using the public `ease`/`lerp_color` through a
-        // per-button `StyleOverlay`. This is exactly the ramp an animated button
-        // walks frame-to-frame on hover.
-        flow.section(list, "Hover animation (easing)");
+        // The animation system eases a widget's color from its idle value toward
+        // its hover value over `theme.animation_duration`. A static PNG has no
+        // time axis, so we sample the *same* ease-out curve at five linear points
+        // t ∈ {0, .25, .5, .75, 1} and paint a Button at each step.
+        //
+        // The endpoints here are exaggerated — idle slate (`button`) → bright
+        // `accent` — *on purpose*: the real default hover delta (`button` →
+        // `button_hover`) is only ~0.04/channel and reads as flat gray at this
+        // size. With a high-contrast pair the ease-out shape is legible: the
+        // steps bunch toward the bright end (fast start, slow finish). Drawn via
+        // the public `ease`/`lerp_color` through a per-button `StyleOverlay`.
+        flow.section(list, "Hover animation (ease-out curve)");
         for &t in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
             let eased = ease(Easing::EaseOut, t);
-            let fill = lerp_color(theme.button, theme.button_hover, eased);
+            let fill = lerp_color(theme.button, theme.accent, eased);
             let mut ramp = StyleOverlay::new();
             ramp.set_color(StyleKey::Button, fill);
             let label = format!("t={t:.2}");
