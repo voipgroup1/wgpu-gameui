@@ -53,7 +53,7 @@ pub use image_button::ImageButton;
 pub use list::{List, ListItem, ListOutput, ListState, SelectionMode};
 pub use number_input::{NumberInput, NumberOutput};
 pub use panel::{Panel, label, label_at, label_centered_at, title, title_at};
-pub use progress_bar::ProgressBar;
+pub use progress_bar::{ProgressBar, ProgressFill};
 pub use radio::RadioGroup;
 pub use scroll_view::{ScrollBegin, ScrollState, ScrollView};
 pub use separator::{Orientation, Separator};

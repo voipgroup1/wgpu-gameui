@@ -526,8 +526,21 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       samples the ease-out curve at t∈{0,.25,.5,.75,1}. Other raw widgets adopt
       the same `.animated(id)` pattern as needed.
 - [ ] **P2 — Theme stack** (push tint/color), tied to A5/D8 above.
-- [ ] **P2 — Move semantic policy out of theme.** `progress_fill`/`_low`
-      colors encode "low = red"; should be a thresholds struct or callback.
+- [x] **P2 — Move semantic policy out of theme.** Done. The theme now supplies
+      only a palette; the *policy* mapping state→palette is caller-owned (progress)
+      or a trivial themeable mapping (severity).
+      - **Progress:** extracted the hardcoded `<0.25/<0.5` banding into a
+        caller-owned `ProgressFill` policy: `ProgressFill::Stat { low, medium }`
+        (default `{0.25, 0.5}` — preserves prior behavior, thresholds now named &
+        tunable) or `ProgressFill::Solid(StyleKey)` for neutral progress where low
+        isn't "bad". Set via `ProgressBar::with_fill(..)`; the value→color decision
+        is no longer baked into the widget/theme.
+      - **Severity:** added themeable `StyleKey::Info/Success/Warning` (+ matching
+        `Theme.info/success/warning` fields; `Error` reuses the existing color), so
+        `Banner`/`ToastStack` colors resolve through the style system
+        (`Severity::style_key()` → `StyleResolver::color`) and a `StyleOverlay`/
+        custom `Theme` can recolor severities. `Severity::accent()` kept as the
+        resolver-free default, kept in sync with the default theme palette.
 
 ---
 

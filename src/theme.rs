@@ -21,6 +21,12 @@ pub struct Theme {
     pub text_dim: [f32; 4],
     pub text_highlight: [f32; 4],
     pub accent: [f32; 4],
+    /// Severity accents (see [`Severity`](crate::Severity)). The themeable palette
+    /// behind banners/toasts; `error` doubles as the failure severity, so there's
+    /// no separate severity-error field.
+    pub info: [f32; 4],
+    pub success: [f32; 4],
+    pub warning: [f32; 4],
     pub error: [f32; 4],
     /// Outline color drawn around the keyboard-focused widget. Bright by design
     /// so the focus ring reads clearly against any widget chrome.
@@ -87,6 +93,11 @@ impl Default for Theme {
             text_dim: [0.7, 0.7, 0.8, 1.0],
             text_highlight: [0.6, 0.8, 1.0, 1.0],
             accent: [0.3, 0.5, 0.9, 1.0],
+            // Severity palette (mirrors Severity::accent() so the resolver-free
+            // default and the themed default agree).
+            info: [0.22, 0.55, 0.95, 1.0],
+            success: [0.26, 0.72, 0.42, 1.0],
+            warning: [0.95, 0.70, 0.20, 1.0],
             error: [0.9, 0.3, 0.3, 1.0],
             focus_ring: [0.45, 0.62, 1.0, 1.0],
 
@@ -224,6 +235,9 @@ impl Theme {
             TextDim => StyleValue::Color(self.text_dim),
             TextHighlight => StyleValue::Color(self.text_highlight),
             Accent => StyleValue::Color(self.accent),
+            Info => StyleValue::Color(self.info),
+            Success => StyleValue::Color(self.success),
+            Warning => StyleValue::Color(self.warning),
             Error => StyleValue::Color(self.error),
             FocusRing => StyleValue::Color(self.focus_ring),
             TabInactive => StyleValue::Color(self.tab_inactive),
@@ -276,6 +290,9 @@ impl Theme {
             (TextDim, StyleValue::Color(c)) => self.text_dim = c,
             (TextHighlight, StyleValue::Color(c)) => self.text_highlight = c,
             (Accent, StyleValue::Color(c)) => self.accent = c,
+            (Info, StyleValue::Color(c)) => self.info = c,
+            (Success, StyleValue::Color(c)) => self.success = c,
+            (Warning, StyleValue::Color(c)) => self.warning = c,
             (Error, StyleValue::Color(c)) => self.error = c,
             (FocusRing, StyleValue::Color(c)) => self.focus_ring = c,
             (TabInactive, StyleValue::Color(c)) => self.tab_inactive = c,

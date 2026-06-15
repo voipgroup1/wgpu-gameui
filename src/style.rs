@@ -85,6 +85,14 @@ pub enum StyleKey {
     TextDim,
     TextHighlight,
     Accent,
+    /// Informational severity accent (see [`Severity`](crate::Severity)). Themeable
+    /// palette entry; the severity→key mapping is the only fixed policy.
+    Info,
+    /// Success / confirmation severity accent.
+    Success,
+    /// Warning / caution severity accent.
+    Warning,
+    /// Failure severity accent (shared with the general error color).
     Error,
     FocusRing,
     TabInactive,
@@ -142,6 +150,9 @@ impl StyleKey {
                 | TextDim
                 | TextHighlight
                 | Accent
+                | Info
+                | Success
+                | Warning
                 | Error
                 | FocusRing
                 | TabInactive
@@ -344,6 +355,9 @@ pub(crate) const COLOR_KEYS: &[StyleKey] = &[
     StyleKey::TextDim,
     StyleKey::TextHighlight,
     StyleKey::Accent,
+    StyleKey::Info,
+    StyleKey::Success,
+    StyleKey::Warning,
     StyleKey::Error,
     StyleKey::FocusRing,
     StyleKey::TabInactive,

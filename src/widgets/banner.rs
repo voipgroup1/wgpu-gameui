@@ -34,24 +34,41 @@ pub enum Severity {
 }
 
 impl Severity {
-    /// The accent color for this severity.
+    /// The [`StyleKey`] this severity resolves its accent through. This is the
+    /// only fixed policy: the colors themselves live in the themeable palette, so
+    /// a [`StyleOverlay`](crate::StyleOverlay) or custom [`Theme`](crate::Theme)
+    /// can recolor severities without touching the widget.
+    pub fn style_key(self) -> StyleKey {
+        match self {
+            Severity::Info => StyleKey::Info,
+            Severity::Success => StyleKey::Success,
+            Severity::Warning => StyleKey::Warning,
+            Severity::Error => StyleKey::Error,
+        }
+    }
+
+    /// The default accent color for this severity, resolver-free.
     ///
-    /// Fixed RGBA rather than theme-sourced: the [`Theme`](crate::Theme) has no
-    /// success/warning colors yet (only `accent`/`error`), so the four levels are
-    /// defined here for a consistent, legible palette. The separate "semantic
-    /// policy out of theme" P2 can later route these through the style system.
+    /// Mirrors the default [`Theme`](crate::Theme) severity palette so callers
+    /// without a [`StyleResolver`] still get the canonical colors; the rendered
+    /// path resolves through [`style_key`](Self::style_key) so themes/overlays win.
     pub fn accent(self) -> [f32; 4] {
         match self {
             Severity::Info => [0.22, 0.55, 0.95, 1.0],
             Severity::Success => [0.26, 0.72, 0.42, 1.0],
             Severity::Warning => [0.95, 0.70, 0.20, 1.0],
-            Severity::Error => [0.90, 0.32, 0.34, 1.0],
+            Severity::Error => [0.9, 0.3, 0.3, 1.0],
         }
     }
 
-    /// Translucent background tint derived from the accent.
-    fn background(self) -> [f32; 4] {
-        let a = self.accent();
+    /// The resolved accent color for this severity under `style`.
+    fn resolved_accent(self, style: &StyleResolver) -> [f32; 4] {
+        style.color(self.style_key())
+    }
+
+    /// Translucent background tint derived from the resolved accent.
+    fn resolved_background(self, style: &StyleResolver) -> [f32; 4] {
+        let a = self.resolved_accent(style);
         [a[0], a[1], a[2], 0.16]
     }
 }
@@ -99,7 +116,8 @@ impl<'a> Banner<'a> {
         self
     }
 
-    /// The accent color for this banner's severity.
+    /// The default accent color for this banner's severity (resolver-free; the
+    /// drawn color resolves through the [`StyleResolver`] in [`draw`](Self::draw)).
     pub fn accent(&self) -> [f32; 4] {
         self.severity.accent()
     }
@@ -137,10 +155,10 @@ impl<'a> Banner<'a> {
     pub fn draw(&self, rect: Rect, list: &mut DrawList, style: &StyleResolver) {
         let pad = style.scalar(StyleKey::Padding);
         let font_size = style.scalar(StyleKey::FontSize);
-        let accent = self.severity.accent();
+        let accent = self.severity.resolved_accent(style);
 
         // Tinted background + left accent bar.
-        list.quad(rect.x, rect.y, rect.width, rect.height, self.severity.background());
+        list.quad(rect.x, rect.y, rect.width, rect.height, self.severity.resolved_background(style));
         list.quad(rect.x, rect.y, BAR_W, rect.height, accent);
 
         let text_x = Self::text_x(rect, pad);
@@ -177,11 +195,48 @@ impl<'a> Banner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DrawList, Theme};
+    use crate::{DrawList, StyleOverlay, StyleValue, Theme};
 
     fn style() -> StyleResolver<'static> {
         let theme: &'static Theme = Box::leak(Box::new(Theme::default()));
         StyleResolver::new(theme)
+    }
+
+    #[test]
+    fn severity_maps_to_themeable_style_keys() {
+        assert_eq!(Severity::Info.style_key(), StyleKey::Info);
+        assert_eq!(Severity::Success.style_key(), StyleKey::Success);
+        assert_eq!(Severity::Warning.style_key(), StyleKey::Warning);
+        assert_eq!(Severity::Error.style_key(), StyleKey::Error);
+    }
+
+    #[test]
+    fn default_accent_matches_themed_palette() {
+        // The resolver-free default must equal what the default theme resolves to.
+        let s = style();
+        for sev in [
+            Severity::Info,
+            Severity::Success,
+            Severity::Warning,
+            Severity::Error,
+        ] {
+            assert_eq!(sev.accent(), s.color(sev.style_key()), "{sev:?}");
+        }
+    }
+
+    #[test]
+    fn overlay_recolors_the_accent_bar() {
+        let theme = Theme::default();
+        let mut overlay = StyleOverlay::new();
+        let custom = [0.10, 0.20, 0.30, 1.0];
+        overlay.set(StyleKey::Success, StyleValue::Color(custom));
+        let s = StyleResolver::with_overlay(&theme, &overlay);
+
+        let mut list = DrawList::new();
+        Banner::success("Saved").draw(Rect::new(0.0, 0.0, 200.0, 40.0), &mut list, &s);
+        // The accent bar is the second chrome instance; its color follows the overlay.
+        let bar = list.chrome_instances[1];
+        assert_eq!(bar.bg, custom, "accent bar resolves through the style system");
     }
 
     #[test]

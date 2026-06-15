@@ -6,10 +6,59 @@ use crate::text::TextBlock;
 
 use super::DrawList;
 
+/// How a [`ProgressBar`] picks its fill color from its value — the caller-owned
+/// *semantic policy*. The [`Theme`](crate::Theme) only supplies the palette
+/// (`ProgressFill` / `ProgressFillLow` / `ProgressFillMedium`); this type decides
+/// which one a given value maps to, so "low = bad" is a choice the call site
+/// makes rather than something baked into the widget or theme.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProgressFill {
+    /// One color across the whole range, from any style key. Use this for neutral
+    /// progress (downloads, loading) where low isn't "bad".
+    Solid(StyleKey),
+    /// Three-band "stat" coloring (health/hunger bars): `value < low` →
+    /// [`ProgressFillLow`](StyleKey::ProgressFillLow), `value < medium` →
+    /// [`ProgressFillMedium`](StyleKey::ProgressFillMedium), otherwise
+    /// [`ProgressFill`](StyleKey::ProgressFill). Thresholds are caller-tunable.
+    Stat { low: f32, medium: f32 },
+}
+
+impl Default for ProgressFill {
+    /// The classic stat banding (`low` < 0.25, `medium` < 0.5) — preserves the
+    /// historical built-in behavior, now as an overridable default.
+    fn default() -> Self {
+        ProgressFill::Stat {
+            low: 0.25,
+            medium: 0.5,
+        }
+    }
+}
+
+impl ProgressFill {
+    /// Resolve the fill color for `value` under `style`.
+    fn color(self, value: f32, style: &StyleResolver) -> [f32; 4] {
+        match self {
+            ProgressFill::Solid(key) => style.color(key),
+            ProgressFill::Stat { low, medium } => {
+                if value < low {
+                    style.color(StyleKey::ProgressFillLow)
+                } else if value < medium {
+                    style.color(StyleKey::ProgressFillMedium)
+                } else {
+                    style.color(StyleKey::ProgressFill)
+                }
+            }
+        }
+    }
+}
+
 /// Progress bar widget - shows a value as a filled bar.
 pub struct ProgressBar {
     pub value: f32,      // 0.0 to 1.0
     pub show_text: bool, // Show percentage text
+    /// Caller-owned color policy. Defaults to [`ProgressFill::default`] (stat
+    /// banding); set via [`with_fill`](Self::with_fill) for solid or custom bands.
+    pub fill: ProgressFill,
 }
 
 impl ProgressBar {
@@ -17,6 +66,7 @@ impl ProgressBar {
         Self {
             value: value.clamp(0.0, 1.0),
             show_text: false,
+            fill: ProgressFill::default(),
         }
     }
 
@@ -39,6 +89,12 @@ impl ProgressBar {
         self
     }
 
+    /// Set the fill color policy (solid vs stat banding). See [`ProgressFill`].
+    pub fn with_fill(mut self, fill: ProgressFill) -> Self {
+        self.fill = fill;
+        self
+    }
+
     /// Draw the progress bar at the given rect.
     pub fn draw(&self, rect: Rect, list: &mut DrawList, style: &StyleResolver) {
         let border_radius = style.scalar(StyleKey::BorderRadius);
@@ -50,14 +106,8 @@ impl ProgressBar {
             list.quad(rect.x, rect.y, rect.width, rect.height, progress_background);
         }
 
-        // Fill - color based on value
-        let fill_color = if self.value < 0.25 {
-            style.color(StyleKey::ProgressFillLow)
-        } else if self.value < 0.5 {
-            style.color(StyleKey::ProgressFillMedium)
-        } else {
-            style.color(StyleKey::ProgressFill)
-        };
+        // Fill - color from the caller-owned policy.
+        let fill_color = self.fill.color(self.value, style);
 
         let fill_width = rect.width * self.value;
         if fill_width > 0.0 {
@@ -149,5 +199,58 @@ impl ProgressBar {
             rect.height,
         );
         self.draw(bar_rect, list, style);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Theme;
+
+    fn theme() -> Theme {
+        Theme::default()
+    }
+
+    /// The fill quad is the second chrome instance (background is first).
+    fn fill_color(bar: &ProgressBar, theme: &Theme) -> [f32; 4] {
+        let mut list = DrawList::new();
+        let style = StyleResolver::new(theme);
+        bar.draw(Rect::new(0.0, 0.0, 100.0, 20.0), &mut list, &style);
+        list.chrome_instances[1].bg
+    }
+
+    #[test]
+    fn default_policy_is_stat_banding() {
+        assert_eq!(
+            ProgressFill::default(),
+            ProgressFill::Stat { low: 0.25, medium: 0.5 }
+        );
+        assert_eq!(ProgressBar::new(0.5).fill, ProgressFill::default());
+    }
+
+    #[test]
+    fn stat_banding_picks_palette_by_threshold() {
+        let t = theme();
+        assert_eq!(fill_color(&ProgressBar::new(0.10), &t), t.progress_fill_low);
+        assert_eq!(fill_color(&ProgressBar::new(0.40), &t), t.progress_fill_medium);
+        assert_eq!(fill_color(&ProgressBar::new(0.90), &t), t.progress_fill);
+    }
+
+    #[test]
+    fn custom_thresholds_shift_the_bands() {
+        let t = theme();
+        // With low=0.5 the 0.40 value now reads as "low" rather than "medium".
+        let bar = ProgressBar::new(0.40).with_fill(ProgressFill::Stat { low: 0.5, medium: 0.8 });
+        assert_eq!(fill_color(&bar, &t), t.progress_fill_low);
+    }
+
+    #[test]
+    fn solid_fill_ignores_value() {
+        let t = theme();
+        // A neutral solid bar uses one key regardless of value (low isn't "bad").
+        let low = ProgressBar::new(0.05).with_fill(ProgressFill::Solid(StyleKey::Accent));
+        let high = ProgressBar::new(0.95).with_fill(ProgressFill::Solid(StyleKey::Accent));
+        assert_eq!(fill_color(&low, &t), t.accent);
+        assert_eq!(fill_color(&high, &t), t.accent);
     }
 }

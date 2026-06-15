@@ -16,7 +16,7 @@ use wgpu_gameui::{
     Banner, Button, Checkbox, ColorPicker, ColumnWidth, Corner, DragCapture, DragHandle,
     DrawContext, DrawList, Dropdown, DropdownState, Easing, FocusState, Group, HitZone, Hsva,
     ImageButton, ImageFit, InputState, LayerStack, List,
-    ListItem, ListState, NumberInput, ProgressBar, RadioGroup, ScrollState, ScrollView,
+    ListItem, ListState, NumberInput, ProgressBar, ProgressFill, RadioGroup, ScrollState, ScrollView,
     SelectionMode, Separator, Severity, Slider, StyleKey, StyleOverlay, StyleResolver, Table,
     TableCell, TableColumn,
     Tabs, TextAlign, TextBlock, TextInput, Toast, ToastStack, TextSpan, Theme, TooltipContent,
@@ -701,6 +701,18 @@ fn render_widget_gallery() {
 
         let r = flow.cell(list, "Progress bar", 150.0, 20.0);
         ProgressBar::new(0.65).draw(r, list, &StyleResolver::new(&theme));
+
+        // Stat banding (caller-owned policy): low/medium/high pick distinct colors.
+        let r = flow.cell(list, "Progress (stat: low)", 150.0, 20.0);
+        ProgressBar::new(0.15).draw(r, list, &StyleResolver::new(&theme));
+        let r = flow.cell(list, "Progress (stat: med)", 150.0, 20.0);
+        ProgressBar::new(0.40).draw(r, list, &StyleResolver::new(&theme));
+
+        // Solid fill: neutral progress where "low" isn't bad.
+        let r = flow.cell(list, "Progress (solid accent)", 150.0, 20.0);
+        ProgressBar::new(0.30)
+            .with_fill(ProgressFill::Solid(StyleKey::Accent))
+            .draw(r, list, &StyleResolver::new(&theme));
 
         let r = flow.cell(list, "Slider", 160.0, 24.0);
         let mut capture = DragCapture::default();
