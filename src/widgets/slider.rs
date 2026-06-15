@@ -2,6 +2,7 @@
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
+use crate::StyleKey;
 
 use super::{DragCapture, DragId, DrawContext, FocusId};
 
@@ -176,6 +177,7 @@ impl Slider {
 
         let changed = (new_value - value).abs() > f32::EPSILON;
         let theme = ctx.theme;
+        let s = ctx.styles();
         let list = &mut *ctx.draw_list;
 
         // Recalculate scrubber position with potentially updated value
@@ -189,7 +191,7 @@ impl Slider {
         // ---- Track (procedural rounded pill) ----
         let track_rect = Rect::new(rect.x, track_y, track_width, track_height);
         let track_radius = track_height * 0.5;
-        list.rounded_rect(track_rect, track_radius, theme.input_background);
+        list.rounded_rect(track_rect, track_radius, s.color(StyleKey::InputBackground));
 
         // Filled portion: from the track's left up to the knob centre.
         let fill_w = (display_scrubber_x - rect.x).clamp(0.0, track_width);
@@ -197,7 +199,7 @@ impl Slider {
             list.rounded_rect(
                 Rect::new(rect.x, track_y, fill_w, track_height),
                 track_radius,
-                theme.accent,
+                s.color(StyleKey::Accent),
             );
         }
 
@@ -205,8 +207,8 @@ impl Slider {
         list.rounded_rect_outline(
             track_rect,
             track_radius,
-            theme.border_width,
-            theme.input_border,
+            s.scalar(StyleKey::BorderWidth),
+            s.color(StyleKey::InputBorder),
         );
 
         // ---- Scrubber (procedural circle handle) ----
@@ -216,12 +218,12 @@ impl Slider {
         if dragging || hovered {
             list.circle(knob_center, knob_radius + 2.0, [1.0, 1.0, 1.0, 0.10]);
         }
-        list.circle(knob_center, knob_radius, theme.text);
+        list.circle(knob_center, knob_radius, s.color(StyleKey::Text));
         list.circle_outline(
             knob_center,
             knob_radius,
-            theme.border_width.max(1.0),
-            theme.button_border,
+            s.scalar(StyleKey::BorderWidth).max(1.0),
+            s.color(StyleKey::ButtonBorder),
         );
 
         // Value text
@@ -231,8 +233,8 @@ impl Slider {
             } else {
                 format!("{:.1}", new_value)
             };
-            let text_color = theme.text;
-            let font_size = theme.font_size * 0.8;
+            let text_color = s.color(StyleKey::Text);
+            let font_size = s.scalar(StyleKey::FontSize) * 0.8;
             let text_x = rect.x + track_width + 6.0;
             let text_y = list.vcentered_text_y(
                 rect.y,

@@ -16,9 +16,9 @@
 //! if Button::new("Cancel").bare().draw(rect2, &mut list, &theme, &input) { … }
 //! ```
 
-use crate::Theme;
 use crate::layout::Rect;
 use crate::text::{TextAlign, TextBlock};
+use crate::{StyleKey, StyleResolver};
 
 use super::{DrawContext, DrawList, FocusId};
 
@@ -31,17 +31,17 @@ pub(crate) struct ButtonVisual {
 
 impl ButtonVisual {
     /// Background fill for the current state (disabled dims the idle color).
-    fn bg_color(&self, theme: &Theme) -> [f32; 4] {
+    fn bg_color(&self, s: &StyleResolver) -> [f32; 4] {
         if !self.enabled {
-            let mut c = theme.button;
+            let mut c = s.color(StyleKey::Button);
             c[3] = 0.5;
             c
         } else if self.pressed {
-            theme.button_pressed
+            s.color(StyleKey::ButtonPressed)
         } else if self.hovered {
-            theme.button_hover
+            s.color(StyleKey::ButtonHover)
         } else {
-            theme.button
+            s.color(StyleKey::Button)
         }
     }
 }
@@ -53,27 +53,28 @@ impl ButtonVisual {
 /// (0 => square) via [`DrawList::rounded_rect`]/[`DrawList::rounded_rect_outline`].
 pub(crate) fn draw_chrome(
     list: &mut DrawList,
-    theme: &Theme,
+    s: &StyleResolver,
     rect: Rect,
     radius: f32,
     v: &ButtonVisual,
 ) {
-    let bg = v.bg_color(theme);
+    let bg = v.bg_color(s);
     let border_color = if v.hovered && v.enabled {
-        theme.accent
+        s.color(StyleKey::Accent)
     } else {
-        theme.button_border
+        s.color(StyleKey::ButtonBorder)
     };
+    let border_width = s.scalar(StyleKey::BorderWidth);
     // One instanced SDF rounded-rect carries fill + border. When the border is
     // disabled (`border_width == 0`) a transparent border color collapses the
     // SDF to a plain fill. `chrome_rect` falls back to immediate tessellation
     // under a rotated/scaled transform, so correctness is universal.
-    let border = if theme.border_width > 0.0 {
+    let border = if border_width > 0.0 {
         border_color
     } else {
         [0.0, 0.0, 0.0, 0.0]
     };
-    list.chrome_rect(rect, radius, theme.border_width, bg, border);
+    list.chrome_rect(rect, radius, border_width, bg, border);
 }
 
 /// Draw the bare-button feedback overlay (no background/border): a dim for
@@ -96,22 +97,22 @@ pub(crate) fn draw_bare_overlay(list: &mut DrawList, rect: Rect, v: &ButtonVisua
 /// width. The horizontal inset is the theme padding, but capped relative to the
 /// button width so a small button (e.g. a spin-box `+`/`-` stepper) still leaves
 /// room for the glyph instead of pushing it off the edge.
-fn draw_label(list: &mut DrawList, theme: &Theme, rect: Rect, label: &str, enabled: bool) {
-    let text_color = if enabled { theme.text } else { theme.text_dim };
-    let inset = theme.padding.min(rect.width * 0.15);
+fn draw_label(list: &mut DrawList, s: &StyleResolver, rect: Rect, label: &str, enabled: bool) {
+    let text_color = if enabled {
+        s.color(StyleKey::Text)
+    } else {
+        s.color(StyleKey::TextDim)
+    };
+    let font_size = s.scalar(StyleKey::FontSize);
+    let font = s.theme().font.clone();
+    let inset = s.scalar(StyleKey::Padding).min(rect.width * 0.15);
     // Optically centre the label band (x-height for mixed case, cap height for
     // all-caps/numeric) — centring by font_size alone leaves the glyph low,
     // drifting to the bottom on short buttons like spin-box steppers.
-    let text_y = list.vcentered_text_y(
-        rect.y,
-        rect.height,
-        theme.font_size,
-        theme.font.as_ref(),
-        label,
-    );
+    let text_y = list.vcentered_text_y(rect.y, rect.height, font_size, font.as_ref(), label);
     list.text(
         TextBlock::new(label, rect.x + inset, text_y)
-            .with_size(theme.font_size)
+            .with_size(font_size)
             .with_color(
                 (text_color[0] * 255.0) as u8,
                 (text_color[1] * 255.0) as u8,
@@ -119,7 +120,7 @@ fn draw_label(list: &mut DrawList, theme: &Theme, rect: Rect, label: &str, enabl
             )
             .with_max_width((rect.width - inset * 2.0).max(0.0))
             .with_align(TextAlign::Center)
-            .with_font_opt(theme.font.clone()),
+            .with_font_opt(font),
     );
 }
 
@@ -186,7 +187,6 @@ impl Button {
             return false;
         }
         let input = ctx.input;
-        let theme = ctx.theme;
 
         // Honor layer capture so a button under a modal/popup doesn't react to
         // clicks meant for the overlay.
@@ -201,15 +201,16 @@ impl Button {
             pressed,
         };
 
+        let s = ctx.styles();
         {
             let list = &mut *ctx.draw_list;
             if self.chrome {
-                let radius = self.radius.unwrap_or(theme.border_radius);
-                draw_chrome(list, theme, rect, radius, &v);
+                let radius = self.radius.unwrap_or_else(|| s.scalar(StyleKey::BorderRadius));
+                draw_chrome(list, &s, rect, radius, &v);
             } else {
                 draw_bare_overlay(list, rect, &v);
             }
-            draw_label(list, theme, rect, &self.label, self.enabled);
+            draw_label(list, &s, rect, &self.label, self.enabled);
         }
 
         // Keyboard focus + Space/Enter activation (opt-in via `focusable`).
@@ -246,9 +247,9 @@ impl Button {
         ctx: &mut DrawContext,
         texture_key: &str,
     ) -> bool {
-        let list = &mut *ctx.draw_list;
-        let theme = ctx.theme;
+        let s = ctx.styles();
         let input = ctx.input;
+        let list = &mut *ctx.draw_list;
         let hovered =
             enabled && !input.mouse_consumed && rect.contains(input.mouse_x, input.mouse_y);
         let pressed = hovered && input.mouse_down;
@@ -264,7 +265,7 @@ impl Button {
                 pressed,
             },
         );
-        draw_label(list, theme, rect, label, enabled);
+        draw_label(list, &s, rect, label, enabled);
 
         clicked
     }
@@ -273,7 +274,7 @@ impl Button {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FocusState, InputState};
+    use crate::{FocusState, InputState, Theme};
 
     fn input_at(x: f32, y: f32, down: bool, clicked: bool) -> InputState {
         InputState {
@@ -542,6 +543,32 @@ mod tests {
             focus.is_focused(7),
             "clicking a focusable button focuses it"
         );
+    }
+
+    #[test]
+    fn style_overlay_overrides_chrome_fill() {
+        use crate::{StyleKey, StyleOverlay};
+        let theme = Theme::default();
+        let input = input_at(0.0, 0.0, false, false);
+
+        // Baseline: idle fill is theme.button.
+        let mut base = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go").draw(rect(), &mut with_ctx(&mut base, &mut focus, &theme, &input));
+        assert_eq!(base.chrome_instances[0].bg, theme.button);
+
+        // With an overlay recoloring Button, the drawn fill follows the overlay —
+        // proving the resolver seam actually reaches the widget, no theme clone.
+        let mut overlay = StyleOverlay::new();
+        overlay.set_color(StyleKey::Button, [0.7, 0.1, 0.2, 1.0]);
+        let mut styled = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go").draw(
+            rect(),
+            &mut DrawContext::new(&mut styled, &mut focus, &theme, &input, 800.0, 600.0)
+                .with_style(&overlay),
+        );
+        assert_eq!(styled.chrome_instances[0].bg, [0.7, 0.1, 0.2, 1.0]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Panel widget and label/title helpers.
 
-use crate::Theme;
 use crate::layout::Rect;
+use crate::{StyleKey, StyleResolver};
 
 use super::DrawList;
 
@@ -33,69 +33,47 @@ impl Panel {
         }
     }
 
-    pub fn draw(&self, list: &mut DrawList, theme: &Theme) {
-        // Draw background
-        let rect = Rect::new(self.x, self.y, self.width, self.height);
-        if theme.border_radius > 0.0 {
-            list.rounded_rect(rect, theme.border_radius, theme.panel);
-        } else {
-            list.quad(self.x, self.y, self.width, self.height, theme.panel);
-        }
-
-        // Draw border (4 non-overlapping inset quads). Top/bottom span the
-        // full width; left/right span only the inner height between them so
-        // the corners are painted exactly once — important for any
-        // semi-transparent panel_border color.
-        let border = theme.border_width;
-        let inner_h = (self.height - 2.0 * border).max(0.0);
-        list.quad(self.x, self.y, self.width, border, theme.panel_border);
-        list.quad(
-            self.x,
-            self.y + self.height - border,
-            self.width,
-            border,
-            theme.panel_border,
-        );
-        list.quad(self.x, self.y + border, border, inner_h, theme.panel_border);
-        list.quad(
-            self.x + self.width - border,
-            self.y + border,
-            border,
-            inner_h,
-            theme.panel_border,
+    pub fn draw(&self, list: &mut DrawList, style: &StyleResolver) {
+        Self::draw_at(
+            Rect::new(self.x, self.y, self.width, self.height),
+            list,
+            style,
         );
     }
 
     /// Draw a panel at a layout-computed rect.
-    pub fn draw_at(rect: Rect, list: &mut DrawList, theme: &Theme) {
+    pub fn draw_at(rect: Rect, list: &mut DrawList, style: &StyleResolver) {
+        let radius = style.scalar(StyleKey::BorderRadius);
+        let panel = style.color(StyleKey::Panel);
+        let panel_border = style.color(StyleKey::PanelBorder);
         // Draw background
-        if theme.border_radius > 0.0 {
-            list.rounded_rect(rect, theme.border_radius, theme.panel);
+        if radius > 0.0 {
+            list.rounded_rect(rect, radius, panel);
         } else {
-            list.quad(rect.x, rect.y, rect.width, rect.height, theme.panel);
+            list.quad(rect.x, rect.y, rect.width, rect.height, panel);
         }
 
         // Draw border (4 non-overlapping inset quads). Top/bottom span the
         // full width; left/right span only the inner height between them so
         // the corners are painted exactly once — important for any
         // semi-transparent panel_border color.
-        let border = theme.border_width;
+        let border = style.scalar(StyleKey::BorderWidth);
         let inner_h = (rect.height - 2.0 * border).max(0.0);
-        list.quad(rect.x, rect.y, rect.width, border, theme.panel_border);
+        list.quad(rect.x, rect.y, rect.width, border, panel_border);
         list.quad(
             rect.x,
             rect.y + rect.height - border,
             rect.width,
             border,
-            theme.panel_border,
+            panel_border,
         );
-        list.quad(rect.x, rect.y + border, border, inner_h, theme.panel_border);
+        list.quad(rect.x, rect.y + border, border, inner_h, panel_border);
         list.quad(
             rect.x + rect.width - border,
             rect.y + border,
             border,
             inner_h,
-            theme.panel_border,
+            panel_border,
         );
     }
 
@@ -106,49 +84,49 @@ impl Panel {
 }
 
 /// Label - simple text display.
-pub fn label(list: &mut DrawList, theme: &Theme, text: &str, x: f32, y: f32) {
-    list.text(theme.text(text, x, y));
+pub fn label(list: &mut DrawList, style: &StyleResolver, text: &str, x: f32, y: f32) {
+    list.text(style.text_block(text, x, y));
 }
 
 /// Label at a layout-computed rect (vertically centered).
-pub fn label_at(list: &mut DrawList, theme: &Theme, text: &str, rect: Rect) {
+pub fn label_at(list: &mut DrawList, style: &StyleResolver, text: &str, rect: Rect) {
     let y = list.vcentered_text_y(
         rect.y,
         rect.height,
-        theme.font_size,
-        theme.font.as_ref(),
+        style.scalar(StyleKey::FontSize),
+        style.theme().font.as_ref(),
         text,
     );
-    list.text(theme.text(text, rect.x + theme.padding, y));
+    list.text(style.text_block(text, rect.x + style.scalar(StyleKey::Padding), y));
 }
 
 /// Label centered horizontally and vertically in a rect.
-pub fn label_centered_at(list: &mut DrawList, theme: &Theme, text: &str, rect: Rect) {
-    let (text_width, _) = list.measure_text(text, theme.font_size, None);
+pub fn label_centered_at(list: &mut DrawList, style: &StyleResolver, text: &str, rect: Rect) {
+    let (text_width, _) = list.measure_text(text, style.scalar(StyleKey::FontSize), None);
     let x = rect.x + (rect.width - text_width) / 2.0;
     let y = list.vcentered_text_y(
         rect.y,
         rect.height,
-        theme.font_size,
-        theme.font.as_ref(),
+        style.scalar(StyleKey::FontSize),
+        style.theme().font.as_ref(),
         text,
     );
-    list.text(theme.text(text, x, y));
+    list.text(style.text_block(text, x, y));
 }
 
 /// Title - larger text display.
-pub fn title(list: &mut DrawList, theme: &Theme, text: &str, x: f32, y: f32) {
-    list.text(theme.title(text, x, y));
+pub fn title(list: &mut DrawList, style: &StyleResolver, text: &str, x: f32, y: f32) {
+    list.text(style.title_block(text, x, y));
 }
 
 /// Title at a layout-computed rect (vertically centered).
-pub fn title_at(list: &mut DrawList, theme: &Theme, text: &str, rect: Rect) {
+pub fn title_at(list: &mut DrawList, style: &StyleResolver, text: &str, rect: Rect) {
     let y = list.vcentered_text_y(
         rect.y,
         rect.height,
-        theme.font_size_title,
-        theme.font.as_ref(),
+        style.scalar(StyleKey::FontSizeTitle),
+        style.theme().font.as_ref(),
         text,
     );
-    list.text(theme.title(text, rect.x + theme.padding, y));
+    list.text(style.title_block(text, rect.x + style.scalar(StyleKey::Padding), y));
 }

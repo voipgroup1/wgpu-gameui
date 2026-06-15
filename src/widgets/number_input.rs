@@ -19,6 +19,8 @@
 //! Integer fields are just `decimals == 0` (the default).
 
 use crate::layout::Rect;
+#[cfg(feature = "phosphor-icons")]
+use crate::StyleKey;
 
 use super::{Button, DrawContext, FocusId, TextInput};
 
@@ -252,7 +254,8 @@ impl NumberInput {
                 // which already leaves ~25% margin, so no extra inset is needed —
                 // and crucially the minus renders as a short bar the width of the
                 // plus's arm, not stretched to the (wider) button.
-                let tint = ctx.theme.text;
+                let s = ctx.styles();
+                let tint = s.color(StyleKey::Text);
                 if Button::new("").with_radius(0.0).draw(up_rect, ctx) && can_click {
                     value = self.clamp(value + self.step);
                     stepped = true;

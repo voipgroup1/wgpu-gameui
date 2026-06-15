@@ -36,6 +36,7 @@
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
+use crate::StyleKey;
 
 use super::{DragCapture, DragId, DrawContext};
 
@@ -134,7 +135,7 @@ impl DragHandle {
         ctx: &mut DrawContext,
     ) -> DragHandleOutput {
         let input = ctx.input;
-        let theme = ctx.theme;
+        let s = ctx.styles();
 
         let hovered = rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
         let was_active = capture.is_active(id);
@@ -167,17 +168,19 @@ impl DragHandle {
 
         // --- chrome ------------------------------------------------------
         if self.chrome {
+            let border_radius = s.scalar(StyleKey::BorderRadius);
+            let panel = s.color(StyleKey::Panel);
             let list = &mut *ctx.draw_list;
-            if theme.border_radius > 0.0 {
-                list.rounded_rect(rect, theme.border_radius, theme.panel);
+            if border_radius > 0.0 {
+                list.rounded_rect(rect, border_radius, panel);
             } else {
-                list.quad(rect.x, rect.y, rect.width, rect.height, theme.panel);
+                list.quad(rect.x, rect.y, rect.width, rect.height, panel);
             }
             // Brighten on hover / while dragging for affordance.
             if dragging || hovered {
                 let a = if dragging { 0.12 } else { 0.06 };
-                if theme.border_radius > 0.0 {
-                    list.rounded_rect(rect, theme.border_radius, [1.0, 1.0, 1.0, a]);
+                if border_radius > 0.0 {
+                    list.rounded_rect(rect, border_radius, [1.0, 1.0, 1.0, a]);
                 } else {
                     list.quad(rect.x, rect.y, rect.width, rect.height, [1.0, 1.0, 1.0, a]);
                 }
@@ -189,12 +192,13 @@ impl DragHandle {
         }
 
         if let Some(label) = &self.label {
+            let font_size = s.scalar(StyleKey::FontSize);
+            let text_x = rect.x + s.scalar(StyleKey::Padding);
+            let c = s.color(StyleKey::Text);
+            let font = s.theme().font.clone();
             let list = &mut *ctx.draw_list;
-            let font_size = theme.font_size;
-            let text_x = rect.x + theme.padding;
             let text_y =
-                list.vcentered_text_y(rect.y, rect.height, font_size, theme.font.as_ref(), label);
-            let c = theme.text;
+                list.vcentered_text_y(rect.y, rect.height, font_size, font.as_ref(), label);
             let block = TextBlock::new(label, text_x, text_y)
                 .with_size(font_size)
                 .with_color(
@@ -202,7 +206,7 @@ impl DragHandle {
                     (c[1] * 255.0) as u8,
                     (c[2] * 255.0) as u8,
                 )
-                .with_font_opt(theme.font.clone());
+                .with_font_opt(font);
             list.text(block);
         }
 
@@ -235,7 +239,7 @@ impl DragHandle {
 
     /// Draw a 2×3 grid of dots centred in `rect` as a grab affordance.
     fn draw_grip(&self, ctx: &mut DrawContext, rect: Rect) {
-        let color = ctx.theme.text_dim;
+        let color = ctx.color(StyleKey::TextDim);
         let dot = 2.0_f32;
         let gap = 3.0_f32;
         let cols = 3;

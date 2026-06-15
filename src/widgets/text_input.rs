@@ -1,6 +1,7 @@
 //! Text input widget with selection, cursor navigation, and clipboard support.
 
 use crate::InputState;
+use crate::StyleKey;
 use crate::layout::Rect;
 use crate::text::{
     CaretPos, TextBlock, TextSpan, WrapMode, byte_at_point, byte_on_adjacent_line, caret_for_byte,
@@ -631,9 +632,9 @@ impl TextInput {
     /// [`set_clipboard_get`](Self::set_clipboard_get) /
     /// [`set_clipboard_set`](Self::set_clipboard_set) before drawing.
     pub fn draw(&mut self, id: FocusId, ctx: &mut DrawContext) -> bool {
+        let s = ctx.styles();
         let list = &mut *ctx.draw_list;
         let focus = &mut *ctx.focus;
-        let theme = ctx.theme;
         let input = ctx.input;
         // Join the Tab ring for this frame.
         focus.register(id);
@@ -648,7 +649,7 @@ impl TextInput {
         let focused = focus.is_focused(id);
 
         // ---- Geometry & layout policy ----
-        let padding = theme.padding;
+        let padding = s.scalar(StyleKey::Padding);
         let text_x = self.x + padding;
         let text_max_w = self.width - padding * 2.0;
         // Single-line never wraps (a long value overflows + clips); multiline
@@ -662,9 +663,9 @@ impl TextInput {
         // (font_size * 1.25). Single-line keeps font_size for the selection/caret
         // quad height (unchanged behaviour).
         let line_height = if self.multiline {
-            theme.font_size * 1.25
+            s.scalar(StyleKey::FontSize) * 1.25
         } else {
-            theme.font_size
+            s.scalar(StyleKey::FontSize)
         };
         // Top-aligned for multiline, vertically centred for single-line. Unlike
         // static labels (which pick the band from their text), an editable field
@@ -674,9 +675,10 @@ impl TextInput {
         let text_top = if self.multiline {
             self.y + padding
         } else {
-            let m = list.font_vmetrics(theme.font.as_ref());
-            self.y + self.height / 2.0 - theme.font_size * m.baseline_ratio
-                + theme.font_size * m.x_ratio / 2.0
+            let m = list.font_vmetrics(s.theme().font.as_ref());
+            let font_size = s.scalar(StyleKey::FontSize);
+            self.y + self.height / 2.0 - font_size * m.baseline_ratio
+                + font_size * m.x_ratio / 2.0
         };
         let inner_rect = Rect::new(
             text_x,
@@ -690,7 +692,7 @@ impl TextInput {
         // testing see this frame's geometry (one-frame edit latency — see
         // `process_keyboard_with_layout`).
         let nav_layout: Vec<CaretPos> = if self.multiline && focused {
-            list.text_caret_layout(&self.value, theme.font_size, Some(text_max_w), wrap)
+            list.text_caret_layout(&self.value, s.scalar(StyleKey::FontSize), Some(text_max_w), wrap)
         } else {
             Vec::new()
         };
@@ -719,8 +721,11 @@ impl TextInput {
 
                 if click_x >= text_left && click_x <= text_right {
                     let local_x = click_x - text_left;
-                    let positions =
-                        list.text_cursor_positions(&self.value, theme.font_size, Some(text_max_w));
+                    let positions = list.text_cursor_positions(
+                        &self.value,
+                        s.scalar(StyleKey::FontSize),
+                        Some(text_max_w),
+                    );
                     let byte_pos = closest_cursor_pos(&positions, local_x);
                     if input.shift_pressed {
                         // Extend selection.
@@ -760,30 +765,30 @@ impl TextInput {
         // (Dropdown/Button/Checkbox); `rounded_rect` falls back to a hard
         // rectangle when the radius is 0, so a rectangular theme still works.
         let frame = Rect::new(self.x, self.y, self.width, self.height);
-        let radius = theme.border_radius;
-        let border = theme.border_width;
+        let radius = s.scalar(StyleKey::BorderRadius);
+        let border = s.scalar(StyleKey::BorderWidth);
         let border_color = if focused {
-            theme.input_focus_border
+            s.color(StyleKey::InputFocusBorder)
         } else if hovered {
-            theme.accent
+            s.color(StyleKey::Accent)
         } else {
-            theme.input_border
+            s.color(StyleKey::InputBorder)
         };
 
-        list.rounded_rect(frame, radius, theme.input_background);
+        list.rounded_rect(frame, radius, s.color(StyleKey::InputBackground));
         list.rounded_rect_outline(frame, radius, border, border_color);
 
         // ---- Draw text content ----
         let (text_content, text_color) = if self.value.is_empty() {
-            (&self.placeholder, theme.text_dim)
+            (&self.placeholder, s.color(StyleKey::TextDim))
         } else {
-            (&self.value, theme.text)
+            (&self.value, s.color(StyleKey::Text))
         };
 
         // Render-time caret layout (multiline+focused), reflecting any edits made
         // this frame — used for autoscroll, per-line selection, and the caret.
         let render_layout: Vec<CaretPos> = if self.multiline && focused {
-            list.text_caret_layout(&self.value, theme.font_size, Some(text_max_w), wrap)
+            list.text_caret_layout(&self.value, s.scalar(StyleKey::FontSize), Some(text_max_w), wrap)
         } else {
             Vec::new()
         };
@@ -854,13 +859,13 @@ impl TextInput {
                                 text_top - scroll + lt,
                                 (x2 - x1).max(1.0),
                                 line_height,
-                                theme.accent,
+                                s.color(StyleKey::Accent),
                             );
                         }
                     } else {
                         let positions = list.text_cursor_positions(
                             &self.value,
-                            theme.font_size,
+                            s.scalar(StyleKey::FontSize),
                             Some(text_max_w),
                         );
                         let sel_x1 = positions
@@ -879,7 +884,7 @@ impl TextInput {
                             text_top,
                             sel_x2 - sel_x1,
                             line_height,
-                            theme.accent,
+                            s.color(StyleKey::Accent),
                         );
                     }
                 }
@@ -895,7 +900,7 @@ impl TextInput {
                 self.cursor_pos,
                 &input.preedit,
                 input.preedit_cursor,
-                theme.text, // underline colour matches the text
+                s.color(StyleKey::Text), // underline colour matches the text
             ))
         } else {
             None
@@ -903,20 +908,21 @@ impl TextInput {
 
         let block_y = text_top - scroll;
         if let Some((_display, spans, _caret)) = &composed {
+            let text_c = s.color(StyleKey::Text);
             let text = TextBlock::new("", text_x, block_y)
-                .with_size(theme.font_size)
+                .with_size(s.scalar(StyleKey::FontSize))
                 .with_wrap(wrap)
                 .with_color(
-                    (theme.text[0] * 255.0) as u8,
-                    (theme.text[1] * 255.0) as u8,
-                    (theme.text[2] * 255.0) as u8,
+                    (text_c[0] * 255.0) as u8,
+                    (text_c[1] * 255.0) as u8,
+                    (text_c[2] * 255.0) as u8,
                 )
                 .with_max_width(text_max_w)
                 .with_spans(spans.clone());
             list.text(text);
         } else {
             let text = TextBlock::new(text_content, text_x, block_y)
-                .with_size(theme.font_size)
+                .with_size(s.scalar(StyleKey::FontSize))
                 .with_wrap(wrap)
                 .with_color(
                     (text_color[0] * 255.0) as u8,
@@ -938,7 +944,7 @@ impl TextInput {
                 };
                 let caret_x = text_x + caret.x;
                 let caret_y = text_top - scroll + caret.line_top;
-                list.quad(caret_x, caret_y, 1.5, caret_h, theme.text);
+                list.quad(caret_x, caret_y, 1.5, caret_h, s.color(StyleKey::Text));
                 // Tell the windowing layer a text field is focused (so it can
                 // enable IME) and where to anchor the IME candidate window.
                 focus.request_ime(Rect::new(caret_x, caret_y, 1.5, caret_h));
@@ -946,8 +952,11 @@ impl TextInput {
                 let cursor_x = if let Some((display, _spans, caret_byte)) = &composed {
                     // Caret position is measured on the composed display string so
                     // it sits inside the preedit where the IME asked.
-                    let positions =
-                        list.text_cursor_positions(display, theme.font_size, Some(text_max_w));
+                    let positions = list.text_cursor_positions(
+                        display,
+                        s.scalar(StyleKey::FontSize),
+                        Some(text_max_w),
+                    );
                     let offset = positions
                         .iter()
                         .find(|&&(i, _)| i >= *caret_byte)
@@ -957,8 +966,11 @@ impl TextInput {
                 } else if self.value.is_empty() {
                     text_x
                 } else {
-                    let positions =
-                        list.text_cursor_positions(&self.value, theme.font_size, Some(text_max_w));
+                    let positions = list.text_cursor_positions(
+                        &self.value,
+                        s.scalar(StyleKey::FontSize),
+                        Some(text_max_w),
+                    );
                     let offset = positions
                         .iter()
                         .find(|&&(i, _)| i >= self.cursor_pos)
@@ -966,7 +978,7 @@ impl TextInput {
                         .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
                     text_x + offset
                 };
-                list.quad(cursor_x, block_y, 1.5, line_height, theme.text);
+                list.quad(cursor_x, block_y, 1.5, line_height, s.color(StyleKey::Text));
                 // See the multiline branch: declare IME focus + caret anchor.
                 focus.request_ime(Rect::new(cursor_x, block_y, 1.5, line_height));
             }

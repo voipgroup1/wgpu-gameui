@@ -55,7 +55,7 @@ use std::collections::HashSet;
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::{InputState, SpriteId};
+use crate::{InputState, SpriteId, StyleKey};
 
 use super::{DrawContext, DrawList, FocusId};
 
@@ -487,6 +487,7 @@ impl<'a> TreeNode<'a> {
         state: &mut TreeState,
         ctx: &mut DrawContext,
     ) -> TreeNodeOutput {
+        let s = ctx.styles();
         let theme = ctx.theme;
         let input = ctx.input;
 
@@ -537,20 +538,26 @@ impl<'a> TreeNode<'a> {
 
         // ---- full-row highlight (selection wins over hover) ---------------
         if selected {
-            list.quad(rect.x, rect.y, rect.width, rect.height, theme.accent);
+            list.quad(rect.x, rect.y, rect.width, rect.height, s.color(StyleKey::Accent));
         } else if row_hovered {
-            list.quad(rect.x, rect.y, rect.width, rect.height, theme.button_hover);
+            list.quad(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                s.color(StyleKey::ButtonHover),
+            );
         }
 
         let text_color = self.label_color.unwrap_or(if selected {
-            theme.background
+            s.color(StyleKey::Background)
         } else {
-            theme.text
+            s.color(StyleKey::Text)
         });
         let arrow_color = if selected {
-            theme.background
+            s.color(StyleKey::Background)
         } else {
-            theme.text_dim
+            s.color(StyleKey::TextDim)
         };
 
         // ---- disclosure triangle ------------------------------------------
@@ -582,14 +589,14 @@ impl<'a> TreeNode<'a> {
         let text_y = list.vcentered_text_y(
             rect.y,
             rect.height,
-            theme.font_size,
+            s.scalar(StyleKey::FontSize),
             theme.font.as_ref(),
             self.label,
         );
         let (r, g, b) = rgb(text_color);
         list.text(
             TextBlock::new(self.label, text_x, text_y)
-                .with_size(theme.font_size)
+                .with_size(s.scalar(StyleKey::FontSize))
                 .with_color(r, g, b)
                 .with_max_width(label_max_w)
                 .with_ellipsis()

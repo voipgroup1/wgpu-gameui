@@ -1,5 +1,6 @@
 //! UI theming - colors, fonts, spacing.
 
+use crate::style::{CustomStyles, StyleKey, StyleValue};
 use crate::text::{FontHandle, TextBlock};
 
 /// UI theme with colors and styling.
@@ -53,6 +54,13 @@ pub struct Theme {
     /// custom family; every widget that builds text through this `Theme` picks it
     /// up. Per-block `TextBlock::with_font` still overrides it.
     pub font: Option<FontHandle>,
+
+    /// Mod-defined style values keyed by [`StyleKey::custom`] name-hash. Built-in
+    /// styles live in the typed fields above; this map holds keys the core
+    /// doesn't know about, so a custom widget can theme itself without core
+    /// changes. Populate via [`Theme::register_style`]; read via [`Theme::style`]
+    /// or the keyed [`Theme::get`].
+    custom: CustomStyles,
 }
 
 impl Default for Theme {
@@ -99,6 +107,7 @@ impl Default for Theme {
             input_height: 40.0,
 
             font: None,
+            custom: CustomStyles::default(),
         }
     }
 }
@@ -112,6 +121,52 @@ mod tests {
         let theme = Theme::default();
         assert!(theme.text("hi", 0.0, 0.0).font.is_none());
         assert!(theme.title("hi", 0.0, 0.0).font.is_none());
+    }
+
+    #[test]
+    fn builtin_keys_round_trip_through_get_set() {
+        use crate::style::{COLOR_KEYS, SCALAR_KEYS};
+        let mut theme = Theme::default();
+        // Every color key reads back the field, and set writes it.
+        for &k in COLOR_KEYS {
+            let orig = theme.get(k).unwrap().as_color().unwrap();
+            let probe = [orig[0] * 0.5 + 0.1, 0.2, 0.3, 1.0];
+            theme.set(k, StyleValue::Color(probe));
+            assert_eq!(theme.get(k).unwrap().as_color().unwrap(), probe, "{k:?}");
+        }
+        for &k in SCALAR_KEYS {
+            theme.set(k, StyleValue::Scalar(123.5));
+            assert_eq!(theme.get(k).unwrap().as_scalar().unwrap(), 123.5, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn get_set_match_typed_field_accessor() {
+        let mut theme = Theme::default();
+        theme.set(StyleKey::Accent, StyleValue::Color([0.1, 0.2, 0.3, 1.0]));
+        assert_eq!(theme.accent, [0.1, 0.2, 0.3, 1.0], "set writes the typed field");
+        theme.button = [0.4, 0.5, 0.6, 1.0];
+        assert_eq!(
+            theme.get(StyleKey::Button).unwrap().as_color().unwrap(),
+            [0.4, 0.5, 0.6, 1.0],
+            "get reads the typed field"
+        );
+    }
+
+    #[test]
+    fn register_and_read_custom_style() {
+        let mut theme = Theme::default();
+        assert_eq!(theme.style("mywidget.glow"), None);
+        theme.register_style("mywidget.glow", StyleValue::Color([1.0, 0.5, 0.0, 1.0]));
+        assert_eq!(
+            theme.style("mywidget.glow"),
+            Some(StyleValue::Color([1.0, 0.5, 0.0, 1.0]))
+        );
+        // Reachable via the keyed get with the same name.
+        assert_eq!(
+            theme.get(StyleKey::custom("mywidget.glow")),
+            Some(StyleValue::Color([1.0, 0.5, 0.0, 1.0]))
+        );
     }
 
     #[test]
@@ -130,6 +185,116 @@ mod tests {
 }
 
 impl Theme {
+    /// Resolve a [`StyleKey`] to its value: built-in keys read the typed field,
+    /// `Custom` keys read the [`register_style`](Self::register_style) map
+    /// (`None` if unset). This is the keyed view of the theme that the
+    /// [`StyleResolver`](crate::StyleResolver) reads through.
+    pub fn get(&self, key: StyleKey) -> Option<StyleValue> {
+        use StyleKey::*;
+        let v = match key {
+            // Colors
+            Background => StyleValue::Color(self.background),
+            Panel => StyleValue::Color(self.panel),
+            PanelBorder => StyleValue::Color(self.panel_border),
+            Button => StyleValue::Color(self.button),
+            ButtonHover => StyleValue::Color(self.button_hover),
+            ButtonPressed => StyleValue::Color(self.button_pressed),
+            ButtonBorder => StyleValue::Color(self.button_border),
+            InputBackground => StyleValue::Color(self.input_background),
+            InputBorder => StyleValue::Color(self.input_border),
+            InputFocusBorder => StyleValue::Color(self.input_focus_border),
+            Text => StyleValue::Color(self.text),
+            TextDim => StyleValue::Color(self.text_dim),
+            TextHighlight => StyleValue::Color(self.text_highlight),
+            Accent => StyleValue::Color(self.accent),
+            Error => StyleValue::Color(self.error),
+            FocusRing => StyleValue::Color(self.focus_ring),
+            TabInactive => StyleValue::Color(self.tab_inactive),
+            TabActive => StyleValue::Color(self.tab_active),
+            TabHover => StyleValue::Color(self.tab_hover),
+            TabBorder => StyleValue::Color(self.tab_border),
+            ProgressBackground => StyleValue::Color(self.progress_background),
+            ProgressFill => StyleValue::Color(self.progress_fill),
+            ProgressFillLow => StyleValue::Color(self.progress_fill_low),
+            ProgressFillMedium => StyleValue::Color(self.progress_fill_medium),
+            // Scalars
+            Padding => StyleValue::Scalar(self.padding),
+            Spacing => StyleValue::Scalar(self.spacing),
+            BorderRadius => StyleValue::Scalar(self.border_radius),
+            BorderWidth => StyleValue::Scalar(self.border_width),
+            FontSize => StyleValue::Scalar(self.font_size),
+            FontSizeTitle => StyleValue::Scalar(self.font_size_title),
+            ButtonHeight => StyleValue::Scalar(self.button_height),
+            InputHeight => StyleValue::Scalar(self.input_height),
+            // Custom namespace
+            Custom(id) => return self.custom.get(&id).copied(),
+        };
+        Some(v)
+    }
+
+    /// Set a [`StyleKey`]'s value. Built-in keys write the typed field; a
+    /// shape mismatch (e.g. a [`StyleValue::Scalar`] into a color field) is a
+    /// `debug_assert` failure and a no-op in release. `Custom` keys write the
+    /// custom map regardless of shape.
+    pub fn set(&mut self, key: StyleKey, value: StyleValue) {
+        use StyleKey::*;
+        // Custom keys store whatever shape they're given.
+        if let Custom(id) = key {
+            self.custom.insert(id, value);
+            return;
+        }
+        match (key, value) {
+            (Background, StyleValue::Color(c)) => self.background = c,
+            (Panel, StyleValue::Color(c)) => self.panel = c,
+            (PanelBorder, StyleValue::Color(c)) => self.panel_border = c,
+            (Button, StyleValue::Color(c)) => self.button = c,
+            (ButtonHover, StyleValue::Color(c)) => self.button_hover = c,
+            (ButtonPressed, StyleValue::Color(c)) => self.button_pressed = c,
+            (ButtonBorder, StyleValue::Color(c)) => self.button_border = c,
+            (InputBackground, StyleValue::Color(c)) => self.input_background = c,
+            (InputBorder, StyleValue::Color(c)) => self.input_border = c,
+            (InputFocusBorder, StyleValue::Color(c)) => self.input_focus_border = c,
+            (Text, StyleValue::Color(c)) => self.text = c,
+            (TextDim, StyleValue::Color(c)) => self.text_dim = c,
+            (TextHighlight, StyleValue::Color(c)) => self.text_highlight = c,
+            (Accent, StyleValue::Color(c)) => self.accent = c,
+            (Error, StyleValue::Color(c)) => self.error = c,
+            (FocusRing, StyleValue::Color(c)) => self.focus_ring = c,
+            (TabInactive, StyleValue::Color(c)) => self.tab_inactive = c,
+            (TabActive, StyleValue::Color(c)) => self.tab_active = c,
+            (TabHover, StyleValue::Color(c)) => self.tab_hover = c,
+            (TabBorder, StyleValue::Color(c)) => self.tab_border = c,
+            (ProgressBackground, StyleValue::Color(c)) => self.progress_background = c,
+            (ProgressFill, StyleValue::Color(c)) => self.progress_fill = c,
+            (ProgressFillLow, StyleValue::Color(c)) => self.progress_fill_low = c,
+            (ProgressFillMedium, StyleValue::Color(c)) => self.progress_fill_medium = c,
+            (Padding, StyleValue::Scalar(s)) => self.padding = s,
+            (Spacing, StyleValue::Scalar(s)) => self.spacing = s,
+            (BorderRadius, StyleValue::Scalar(s)) => self.border_radius = s,
+            (BorderWidth, StyleValue::Scalar(s)) => self.border_width = s,
+            (FontSize, StyleValue::Scalar(s)) => self.font_size = s,
+            (FontSizeTitle, StyleValue::Scalar(s)) => self.font_size_title = s,
+            (ButtonHeight, StyleValue::Scalar(s)) => self.button_height = s,
+            (InputHeight, StyleValue::Scalar(s)) => self.input_height = s,
+            (k, v) => debug_assert!(
+                false,
+                "Theme::set shape mismatch for {k:?}: built-in key got {v:?}"
+            ),
+        }
+    }
+
+    /// Register a mod-defined style value under `name` (Teardown-style
+    /// `register_style`). Sugar for `set(StyleKey::custom(name), value)`; read it
+    /// back with [`style`](Self::style) or `get(StyleKey::custom(name))`.
+    pub fn register_style(&mut self, name: &str, value: StyleValue) {
+        self.set(StyleKey::custom(name), value);
+    }
+
+    /// Read a mod-defined style value by `name` (`None` if never registered).
+    pub fn style(&self, name: &str) -> Option<StyleValue> {
+        self.get(StyleKey::custom(name))
+    }
+
     /// Create a text block with theme styling
     pub fn text(&self, content: impl Into<String>, x: f32, y: f32) -> TextBlock {
         TextBlock::new(content, x, y)

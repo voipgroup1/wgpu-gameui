@@ -15,6 +15,7 @@ mod list;
 mod number_input;
 mod panel;
 mod progress_bar;
+mod radio;
 mod scroll_view;
 mod slider;
 mod table;
@@ -43,6 +44,7 @@ pub use list::{List, ListItem, ListOutput, ListState, SelectionMode};
 pub use number_input::{NumberInput, NumberOutput};
 pub use panel::{Panel, label, label_at, label_centered_at, title, title_at};
 pub use progress_bar::ProgressBar;
+pub use radio::RadioGroup;
 pub use scroll_view::{ScrollBegin, ScrollState, ScrollView};
 pub use slider::{Slider, SliderOutput};
 pub use table::{Align, ColumnWidth, Table, TableCell, TableColumn, TableOutput};
@@ -51,7 +53,7 @@ pub use text_input::TextInput;
 pub use tooltip::{TooltipContent, TooltipLayer};
 pub use tree::{TreeAction, TreeIcon, TreeId, TreeNode, TreeNodeOutput, TreeState};
 
-use crate::{InputState, Theme};
+use crate::{InputState, StyleKey, StyleOverlay, StyleResolver, Theme};
 
 /// Context for drawing UI elements.
 ///
@@ -74,6 +76,12 @@ pub struct DrawContext<'a> {
     /// layer index so [`register_focus`](Self::register_focus) automatically
     /// scopes the focusable to that layer's Tab ring.
     pub active_layer: Option<usize>,
+    /// Optional scoped style overrides layered over [`theme`](Self::theme).
+    /// `None` (the default) resolves every key straight from the theme; set via
+    /// [`with_style`](Self::with_style) so a caller can recolor a subtree without
+    /// cloning the theme. Widgets read styles through [`color`](Self::color) /
+    /// [`scalar`](Self::scalar), which consult this first.
+    pub style: Option<&'a StyleOverlay>,
 }
 
 impl<'a> DrawContext<'a> {
@@ -94,7 +102,46 @@ impl<'a> DrawContext<'a> {
             screen_width,
             screen_height,
             active_layer: None,
+            style: None,
         }
+    }
+
+    /// Layer `overlay` over the theme for this context: every [`color`](Self::color)
+    /// / [`scalar`](Self::scalar) lookup consults the overlay first, so a caller
+    /// can restyle the widgets drawn through this context without cloning the
+    /// theme. Builder-style; chain after [`new`](Self::new).
+    pub fn with_style(mut self, overlay: &'a StyleOverlay) -> Self {
+        self.style = Some(overlay);
+        self
+    }
+
+    /// A [`StyleResolver`] bound to this context's theme + optional overlay — the
+    /// single resolution path widgets read through.
+    pub fn styles(&self) -> StyleResolver<'a> {
+        StyleResolver::with_overlay_opt(self.theme, self.style)
+    }
+
+    /// Resolve a built-in color [`StyleKey`] (overlay → theme). Equivalent to the
+    /// old direct `theme.<field>` read when no overlay is set.
+    pub fn color(&self, key: StyleKey) -> [f32; 4] {
+        self.styles().color(key)
+    }
+
+    /// Resolve a built-in scalar [`StyleKey`] (overlay → theme).
+    pub fn scalar(&self, key: StyleKey) -> f32 {
+        self.styles().scalar(key)
+    }
+
+    /// Resolve a color key, falling back to `default` when unset (for `Custom`
+    /// keys).
+    pub fn color_or(&self, key: StyleKey, default: [f32; 4]) -> [f32; 4] {
+        self.styles().color_or(key, default)
+    }
+
+    /// Resolve a scalar key, falling back to `default` when unset (for `Custom`
+    /// keys).
+    pub fn scalar_or(&self, key: StyleKey, default: f32) -> f32 {
+        self.styles().scalar_or(key, default)
     }
 
     /// Register `id` as focusable in the active layer (or base if no layer).
@@ -111,11 +158,8 @@ impl<'a> DrawContext<'a> {
     /// [`Theme::focus_ring`]. Focusable widgets call this when they hold focus so
     /// every widget gets a consistent focus indicator from one place.
     pub fn draw_focus_ring(&mut self, rect: crate::layout::Rect) {
-        self.draw_list.rounded_rect_outline(
-            rect,
-            self.theme.border_radius,
-            2.0,
-            self.theme.focus_ring,
-        );
+        let radius = self.scalar(StyleKey::BorderRadius);
+        let color = self.color(StyleKey::FocusRing);
+        self.draw_list.rounded_rect_outline(rect, radius, 2.0, color);
     }
 }

@@ -1,7 +1,7 @@
 //! Progress bar widget.
 
-use crate::Theme;
 use crate::layout::Rect;
+use crate::{StyleKey, StyleResolver};
 use crate::text::TextBlock;
 
 use super::DrawList;
@@ -40,27 +40,23 @@ impl ProgressBar {
     }
 
     /// Draw the progress bar at the given rect.
-    pub fn draw(&self, rect: Rect, list: &mut DrawList, theme: &Theme) {
+    pub fn draw(&self, rect: Rect, list: &mut DrawList, style: &StyleResolver) {
+        let border_radius = style.scalar(StyleKey::BorderRadius);
+        let progress_background = style.color(StyleKey::ProgressBackground);
         // Background
-        if theme.border_radius > 0.0 {
-            list.rounded_rect(rect, theme.border_radius, theme.progress_background);
+        if border_radius > 0.0 {
+            list.rounded_rect(rect, border_radius, progress_background);
         } else {
-            list.quad(
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                theme.progress_background,
-            );
+            list.quad(rect.x, rect.y, rect.width, rect.height, progress_background);
         }
 
         // Fill - color based on value
         let fill_color = if self.value < 0.25 {
-            theme.progress_fill_low
+            style.color(StyleKey::ProgressFillLow)
         } else if self.value < 0.5 {
-            theme.progress_fill_medium
+            style.color(StyleKey::ProgressFillMedium)
         } else {
-            theme.progress_fill
+            style.color(StyleKey::ProgressFill)
         };
 
         let fill_width = rect.width * self.value;
@@ -69,22 +65,23 @@ impl ProgressBar {
         }
 
         // Border
+        let panel_border = style.color(StyleKey::PanelBorder);
         let border = 1.0;
-        list.quad(rect.x, rect.y, rect.width, border, theme.panel_border);
+        list.quad(rect.x, rect.y, rect.width, border, panel_border);
         list.quad(
             rect.x,
             rect.y + rect.height - border,
             rect.width,
             border,
-            theme.panel_border,
+            panel_border,
         );
-        list.quad(rect.x, rect.y, border, rect.height, theme.panel_border);
+        list.quad(rect.x, rect.y, border, rect.height, panel_border);
         list.quad(
             rect.x + rect.width - border,
             rect.y,
             border,
             rect.height,
-            theme.panel_border,
+            panel_border,
         );
 
         // Text (percentage)
@@ -94,17 +91,23 @@ impl ProgressBar {
             let font_size = rect.height * 0.7;
             let (text_width, _) = list.measure_text(&text, font_size, None);
             let text_x = rect.x + (rect.width - text_width) / 2.0;
-            let text_y =
-                list.vcentered_text_y(rect.y, rect.height, font_size, theme.font.as_ref(), &text);
+            let text_y = list.vcentered_text_y(
+                rect.y,
+                rect.height,
+                font_size,
+                style.theme().font.as_ref(),
+                &text,
+            );
 
+            let text_color = style.color(StyleKey::Text);
             let block = TextBlock::new(&text, text_x, text_y)
                 .with_size(font_size)
                 .with_color(
-                    (theme.text[0] * 255.0) as u8,
-                    (theme.text[1] * 255.0) as u8,
-                    (theme.text[2] * 255.0) as u8,
+                    (text_color[0] * 255.0) as u8,
+                    (text_color[1] * 255.0) as u8,
+                    (text_color[2] * 255.0) as u8,
                 )
-                .with_font_opt(theme.font.clone());
+                .with_font_opt(style.theme().font.clone());
             list.text(block);
         }
     }
@@ -116,20 +119,26 @@ impl ProgressBar {
         label_width: f32,
         rect: Rect,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
     ) {
         // Label on the left
-        let font_size = theme.font_size * 0.75;
-        let label_y =
-            list.vcentered_text_y(rect.y, rect.height, font_size, theme.font.as_ref(), label);
+        let font_size = style.scalar(StyleKey::FontSize) * 0.75;
+        let label_y = list.vcentered_text_y(
+            rect.y,
+            rect.height,
+            font_size,
+            style.theme().font.as_ref(),
+            label,
+        );
+        let text_color = style.color(StyleKey::Text);
         let label_block = TextBlock::new(label, rect.x, label_y)
             .with_size(font_size)
             .with_color(
-                (theme.text[0] * 255.0) as u8,
-                (theme.text[1] * 255.0) as u8,
-                (theme.text[2] * 255.0) as u8,
+                (text_color[0] * 255.0) as u8,
+                (text_color[1] * 255.0) as u8,
+                (text_color[2] * 255.0) as u8,
             )
-            .with_font_opt(theme.font.clone());
+            .with_font_opt(style.theme().font.clone());
         list.text(label_block);
 
         // Progress bar on the right
@@ -139,6 +148,6 @@ impl ProgressBar {
             rect.width - label_width,
             rect.height,
         );
-        self.draw(bar_rect, list, theme);
+        self.draw(bar_rect, list, style);
     }
 }

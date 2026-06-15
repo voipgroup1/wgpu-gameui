@@ -2,7 +2,7 @@
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::{InputState, Theme};
+use crate::{InputState, StyleKey, StyleResolver};
 
 use super::DrawList;
 
@@ -49,7 +49,7 @@ impl<'a> Tabs<'a> {
         rect: Rect,
         active: usize,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
         input: &InputState,
     ) -> TabsOutput {
         let tab_count = self.labels.len();
@@ -70,7 +70,7 @@ impl<'a> Tabs<'a> {
             bar_rect.y,
             bar_rect.width,
             bar_rect.height,
-            theme.tab_inactive,
+            style.color(StyleKey::TabInactive),
         );
 
         // Draw each tab
@@ -88,11 +88,11 @@ impl<'a> Tabs<'a> {
 
             // Tab background
             let bg_color = if is_active {
-                theme.tab_active
+                style.color(StyleKey::TabActive)
             } else if is_hovered {
-                theme.tab_hover
+                style.color(StyleKey::TabHover)
             } else {
-                theme.tab_inactive
+                style.color(StyleKey::TabInactive)
             };
             list.quad(tab_x, rect.y, tab_width, self.tab_height, bg_color);
 
@@ -103,7 +103,7 @@ impl<'a> Tabs<'a> {
                     rect.y + self.tab_height - 2.0,
                     tab_width,
                     2.0,
-                    theme.accent,
+                    style.color(StyleKey::Accent),
                 );
             }
 
@@ -114,22 +114,22 @@ impl<'a> Tabs<'a> {
                     rect.y + 4.0,
                     1.0,
                     self.tab_height - 8.0,
-                    theme.tab_border,
+                    style.color(StyleKey::TabBorder),
                 );
             }
 
             // Tab label (centered)
             let text_color = if is_active {
-                theme.text_highlight
+                style.color(StyleKey::TextHighlight)
             } else {
-                theme.text
+                style.color(StyleKey::Text)
             };
-            let font_size = theme.font_size * 0.8;
+            let font_size = style.scalar(StyleKey::FontSize) * 0.8;
             let text_y = list.vcentered_text_y(
                 rect.y,
                 self.tab_height,
                 font_size,
-                theme.font.as_ref(),
+                style.theme().font.as_ref(),
                 label,
             );
             let (text_width, _) = list.measure_text(label, font_size, None);
@@ -142,7 +142,7 @@ impl<'a> Tabs<'a> {
                     (text_color[1] * 255.0) as u8,
                     (text_color[2] * 255.0) as u8,
                 )
-                .with_font_opt(theme.font.clone());
+                .with_font_opt(style.theme().font.clone());
             list.text(text);
         }
 
@@ -152,7 +152,7 @@ impl<'a> Tabs<'a> {
             rect.y + self.tab_height - 1.0,
             rect.width,
             1.0,
-            theme.tab_border,
+            style.color(StyleKey::TabBorder),
         );
 
         TabsOutput {

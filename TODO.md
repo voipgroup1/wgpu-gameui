@@ -130,7 +130,17 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `.bare()` drops the chrome (image is the hit target, overlay-only
       feedback); `.padding()` insets the image. Disabled dims via overlay so
       string-key sources without tint still read as disabled.
-- [ ] **P1 — Radio button group.**
+- [x] **P1 — Radio button group.** `RadioGroup<'a>`
+      (`src/widgets/radio.rs`) draws a mutually-exclusive option set from vector
+      primitives (dot = `input_background` fill + `input_border` ring; selected
+      adds an `accent` inner dot — no atlas assets needed). Caller owns the
+      selected index: `draw(selected, rect, ctx) -> Option<usize>` returns the
+      new index on change (click or, while focused, arrow keys). Builders:
+      `new(&[&str])`, `.focusable(FocusId)` (one Tab stop for the whole group +
+      arrow nav: Up/Down vertical, Left/Right horizontal, clamped no-wrap),
+      `.horizontal()` (cells sized to measured label width), `.spacing(px)`.
+      Façade verb `UiContext::radio_group(options, selected) -> usize`
+      auto-places/advances like `checkbox`.
 - [x] **P1 — Tree view / collapsing header.** `TreeNode`
       (`src/widgets/tree.rs`) draws one row — a disclosure triangle + indented
       label for *branches*, a terminal *leaf* otherwise — against a `Rect`/
@@ -386,9 +396,27 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [x] **P1 — Multiple fonts / sizes / weights** (see font system above) —
       per-`TextBlock` family/size/weight/style, `Theme.font`, and the
       `UiContext` font stack all land this.
-- [ ] **P1 — Per-widget style override** without copying the whole `Theme`.
-- [ ] **P1 — Extensible theme** (typed style map / `HashMap<StyleKey,
-      StyleValue>`) so custom widgets don't need core changes.
+- [x] **P1 — Per-widget style override** without copying the whole `Theme`.
+      Added a no-clone **style resolver** (`src/style.rs`): `StyleKey` (one
+      variant per theme field + `Custom(u64)` name-hash), `StyleValue`
+      (`Color`/`Scalar`), `StyleOverlay` (caller-owned sparse override set), and
+      `StyleResolver` (precedence: overlay → theme). Every widget now resolves
+      style through the resolver — `DrawContext` carries an optional
+      `&StyleOverlay` (`ctx.color(key)`/`ctx.scalar(key)`, set via
+      `DrawContext::with_style(&overlay)`); bare-`&Theme` widgets/free-fns
+      (`Panel`, `ProgressBar`, `Tabs`, `Table`, `Tooltip`, `List`, `ScrollView`,
+      `label`/`title`/…) now take `&StyleResolver`. `UiContext` gained a scoped
+      style stack (`set_style`/`set_style_color`/`set_style_scalar`/`clear_style`,
+      pushed/popped with `push`/`pop` like the tint/font stacks) so a subtree
+      restyles without a theme clone. No-overlay path is value-identical to the
+      old `theme.<field>` reads.
+- [x] **P1 — Extensible theme** (typed style map / `HashMap<StyleKey,
+      StyleValue>`) so custom widgets don't need core changes. `Theme` keeps its
+      flat typed fields as the source of truth and bridges them through
+      `Theme::get`/`set(StyleKey, StyleValue)`; a `custom: HashMap<u64,
+      StyleValue>` map holds mod-defined keys. `StyleKey::custom(name)` addresses
+      them by FNV-1a name-hash (no global interner). A custom widget can carry
+      its own keys via an overlay or `Theme::register_style`.
 - [ ] **P1 — Hover/press animation clock + transitions / easing.** Today
       colors switch immediately.
 - [ ] **P2 — Theme stack** (push tint/color), tied to A5/D8 above.
@@ -414,8 +442,13 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       point to UI pixel space (None behind the camera).
 - [ ] **P1 — UI sound hooks.** `UiSound`/`UiSoundLoop` and button
       hover/press sounds.
-- [ ] **P1 — Mod-friendly registration** of custom widgets/styles
-      (`register_widget(name, draw_fn)`, `register_style(name, value)`).
+- [~] **P1 — Mod-friendly registration** of custom widgets/styles.
+      `register_style(name, value)` landed: `Theme::register_style(&mut self,
+      name, StyleValue)` + `Theme::style(name) -> Option<StyleValue>` store/read
+      custom keys by name-hash (and `StyleOverlay` can carry them per-subtree).
+      `register_widget(name, draw_fn)` is **deferred** — widgets have
+      heterogeneous signatures and there's no uniform draw-fn contract yet;
+      designing that trait/registry is its own task.
 - [ ] **P1 — `UiMakeInteractive` / hit-zones independent of draw** for
       sensors over 3D things.
 - [ ] **P2 — Cursor state control** (`UiSetCursorState`, I-beam over text).

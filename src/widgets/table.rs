@@ -2,7 +2,7 @@
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::{InputState, Theme};
+use crate::{InputState, StyleKey, StyleResolver};
 
 use super::DrawList;
 use super::scroll_view::{ScrollState, ScrollView};
@@ -161,7 +161,7 @@ impl<'a> Table<'a> {
         rows: &[Vec<TableCell>],
         scroll: &mut ScrollState,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
         input: &mut InputState,
     ) -> TableOutput {
         let header_h = if self.show_header {
@@ -185,13 +185,13 @@ impl<'a> Table<'a> {
 
         // Draw header
         if self.show_header {
-            self.draw_header(rect, &col_widths, list, theme);
+            self.draw_header(rect, &col_widths, list, style);
         }
 
         // Track interaction results from inside the closure.
         let mut clicked_row = None;
         let mut hovered_row = None;
-        let font_size = theme.font_size * 0.75;
+        let font_size = style.scalar(StyleKey::FontSize) * 0.75;
 
         let mouse_over_content =
             content_rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
@@ -208,7 +208,7 @@ impl<'a> Table<'a> {
         ScrollView::new(content_rect).vertical_only().draw(
             scroll,
             list,
-            theme,
+            style,
             input,
             |list, vp| {
                 // The ScrollView has translated by -scroll.offset and clipped
@@ -248,9 +248,9 @@ impl<'a> Table<'a> {
                     }
 
                     let bg_color = if row_hovered {
-                        theme.button_hover
+                        style.color(StyleKey::ButtonHover)
                     } else if self.zebra_stripe && row_idx % 2 == 1 {
-                        let mut c = theme.panel;
+                        let mut c = style.color(StyleKey::Panel);
                         c[0] *= 1.1;
                         c[1] *= 1.1;
                         c[2] *= 1.1;
@@ -274,7 +274,7 @@ impl<'a> Table<'a> {
                                 cell_rect,
                                 font_size,
                                 list,
-                                theme,
+                                style,
                             );
                         }
                         x += col_width;
@@ -323,7 +323,7 @@ impl<'a> Table<'a> {
         widths
     }
 
-    fn draw_header(&self, rect: Rect, col_widths: &[f32], list: &mut DrawList, theme: &Theme) {
+    fn draw_header(&self, rect: Rect, col_widths: &[f32], list: &mut DrawList, style: &StyleResolver) {
         let header_rect = Rect::new(rect.x, rect.y, rect.width, self.header_height);
 
         // Header background
@@ -332,7 +332,7 @@ impl<'a> Table<'a> {
             header_rect.y,
             header_rect.width,
             header_rect.height,
-            theme.tab_inactive,
+            style.color(StyleKey::TabInactive),
         );
 
         // Header bottom border
@@ -341,11 +341,11 @@ impl<'a> Table<'a> {
             rect.y + self.header_height - 1.0,
             rect.width,
             1.0,
-            theme.panel_border,
+            style.color(StyleKey::PanelBorder),
         );
 
         // Header labels
-        let font_size = theme.font_size * 0.7;
+        let font_size = style.scalar(StyleKey::FontSize) * 0.7;
         let mut x = rect.x;
 
         for (i, col) in self.columns.iter().enumerate() {
@@ -368,17 +368,18 @@ impl<'a> Table<'a> {
                 rect.y,
                 self.header_height,
                 font_size,
-                theme.font.as_ref(),
+                style.theme().font.as_ref(),
                 &col.label,
             );
+            let text_dim = style.color(StyleKey::TextDim);
             let text = TextBlock::new(&col.label, text_x, text_y)
                 .with_size(font_size)
                 .with_color(
-                    (theme.text_dim[0] * 255.0) as u8,
-                    (theme.text_dim[1] * 255.0) as u8,
-                    (theme.text_dim[2] * 255.0) as u8,
+                    (text_dim[0] * 255.0) as u8,
+                    (text_dim[1] * 255.0) as u8,
+                    (text_dim[2] * 255.0) as u8,
                 )
-                .with_font_opt(theme.font.clone());
+                .with_font_opt(style.theme().font.clone());
             list.text(text);
 
             x += col_width;
@@ -392,14 +393,14 @@ impl<'a> Table<'a> {
         rect: Rect,
         font_size: f32,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
     ) {
         let padding = 4.0;
         let text_y = list.vcentered_text_y(
             rect.y,
             rect.height,
             font_size,
-            theme.font.as_ref(),
+            style.theme().font.as_ref(),
             &cell.text,
         );
 
@@ -415,7 +416,7 @@ impl<'a> Table<'a> {
             }
         };
 
-        let color = cell.color.unwrap_or(theme.text);
+        let color = cell.color.unwrap_or_else(|| style.color(StyleKey::Text));
         let text = TextBlock::new(&cell.text, text_x, text_y)
             .with_size(font_size)
             .with_color(
@@ -423,7 +424,7 @@ impl<'a> Table<'a> {
                 (color[1] * 255.0) as u8,
                 (color[2] * 255.0) as u8,
             )
-            .with_font_opt(theme.font.clone());
+            .with_font_opt(style.theme().font.clone());
         list.text(text);
     }
 }
@@ -431,6 +432,7 @@ impl<'a> Table<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Theme;
 
     fn cols() -> Vec<TableColumn> {
         vec![
@@ -489,7 +491,7 @@ mod tests {
             &row_data,
             &mut scroll,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
         );
         assert_eq!(
@@ -531,7 +533,7 @@ mod tests {
             &row_data,
             &mut scroll,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
         );
         assert_eq!(out.clicked_row, None);

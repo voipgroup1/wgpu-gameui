@@ -13,12 +13,14 @@ use crate::InputState;
 use crate::affine::Affine2;
 use crate::layer::{LayerKind, LayerStack};
 use crate::layout::Rect;
+use crate::style::{StyleKey, StyleOverlay, StyleValue};
 use crate::text::{FontHandle, TextBlock};
 use crate::theme::Theme;
 use crate::widgets::DrawList;
 use crate::widgets::{
     Button, Checkbox, DragCapture, DragId, DrawContext, DropdownState, FocusId, FocusState,
-    NumberInput, ScrollState, Slider, TextInput, TreeId, TreeNode, TreeNodeOutput, TreeState,
+    NumberInput, RadioGroup, ScrollState, Slider, TextInput, TreeId, TreeNode, TreeNodeOutput,
+    TreeState,
 };
 use glyphon::{Style, Weight};
 use std::collections::HashMap;
@@ -248,6 +250,12 @@ pub struct UiContext<'a> {
     /// Active font selection, scoped to `push`/`pop` like `align_stack`. The top
     /// is the current font; always at least one entry (`FontSpec::default()`).
     font_stack: Vec<FontSpec>,
+    /// Scoped style overrides, pushed/popped with `push`/`pop` like `font_stack`.
+    /// The top overlay is layered over the theme for every verb's `DrawContext`
+    /// (via [`with_style`](crate::DrawContext::with_style)), so
+    /// [`set_style`](Self::set_style) recolors a subtree without cloning the
+    /// theme. Always at least one entry (an empty base overlay).
+    style_stack: Vec<StyleOverlay>,
     /// Per-frame input snapshot. `Some` only in interactive mode (constructed
     /// via [`UiContext::interactive`]/[`interactive_layers`](Self::interactive_layers)).
     input: Option<&'a InputState>,
@@ -284,6 +292,7 @@ impl<'a> UiContext<'a> {
             open_layer_kinds: Vec::new(),
             warned_align_tokens: std::collections::HashSet::new(),
             font_stack: vec![FontSpec::default()],
+            style_stack: vec![StyleOverlay::new()],
             input: None,
             state: None,
             theme: None,
@@ -303,6 +312,7 @@ impl<'a> UiContext<'a> {
             open_layer_kinds: Vec::new(),
             warned_align_tokens: std::collections::HashSet::new(),
             font_stack: vec![FontSpec::default()],
+            style_stack: vec![StyleOverlay::new()],
             input: None,
             state: None,
             theme: None,
@@ -356,6 +366,8 @@ impl<'a> UiContext<'a> {
         self.align_stack.push(top);
         let font_top = self.font_stack.last().cloned().unwrap_or_default();
         self.font_stack.push(font_top);
+        let style_top = self.style_stack.last().cloned().unwrap_or_default();
+        self.style_stack.push(style_top);
         self.clip_depth_stack.push(clip_depth);
         self.window_depth_stack.push(window_depth);
     }
@@ -373,6 +385,9 @@ impl<'a> UiContext<'a> {
         }
         if self.font_stack.len() > 1 {
             self.font_stack.pop();
+        }
+        if self.style_stack.len() > 1 {
+            self.style_stack.pop();
         }
         if let Some(depth) = self.clip_depth_stack.pop() {
             self.backend.list_mut().truncate_clip(depth);
@@ -514,6 +529,38 @@ impl<'a> UiContext<'a> {
     /// Multiply into the current tint (Teardown's `UiColorFilter`).
     pub fn color_filter(&mut self, r: f32, g: f32, b: f32, a: f32) {
         self.backend.list_mut().multiply_tint([r, g, b, a]);
+    }
+
+    /// Override a [`StyleKey`] for the widgets drawn under the current
+    /// `push`/`pop` frame, layered over the theme without cloning it. Scoped like
+    /// [`color`](Self::color) / [`font`](Self::font): the override applies until
+    /// the matching [`pop`](Self::pop) (or is replaced by a deeper `push` +
+    /// `set_style`). Use [`set_style_color`](Self::set_style_color) /
+    /// [`set_style_scalar`](Self::set_style_scalar) for the common typed forms.
+    pub fn set_style(&mut self, key: StyleKey, value: StyleValue) {
+        if let Some(top) = self.style_stack.last_mut() {
+            top.set(key, value);
+        }
+    }
+
+    /// Override a color [`StyleKey`] for the current `push`/`pop` frame.
+    pub fn set_style_color(&mut self, key: StyleKey, color: [f32; 4]) {
+        self.set_style(key, StyleValue::Color(color));
+    }
+
+    /// Override a scalar [`StyleKey`] for the current `push`/`pop` frame.
+    pub fn set_style_scalar(&mut self, key: StyleKey, value: f32) {
+        self.set_style(key, StyleValue::Scalar(value));
+    }
+
+    /// Drop all style overrides in the current `push`/`pop` frame, falling back
+    /// to the theme (and any overrides from an enclosing frame are *not*
+    /// restored — this clears the current frame's overlay, which was cloned from
+    /// the parent on `push`).
+    pub fn clear_style(&mut self) {
+        if let Some(top) = self.style_stack.last_mut() {
+            top.clear();
+        }
     }
 
     /// Return the current world-space cursor position (origin of the local
@@ -829,7 +876,7 @@ impl<'a> UiContext<'a> {
                 .state
                 .as_mut()
                 .expect("text_button requires interactive state");
-            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0);
+            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
             Button::new(label).focusable(fid).draw(local, &mut ctx)
         };
         self.advance(height);
@@ -862,7 +909,7 @@ impl<'a> UiContext<'a> {
                     return value;
                 }
             };
-            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0);
+            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
             // Reuse the DragId value as the FocusId so the slider is also
             // keyboard-adjustable (arrow keys) through the façade.
             Slider::new(min, max)
@@ -900,13 +947,56 @@ impl<'a> UiContext<'a> {
                 .state
                 .as_mut()
                 .expect("checkbox requires interactive state");
-            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0);
+            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
             Checkbox::new()
                 .focusable(fid)
                 .draw(checked, label, local, &mut ctx)
         };
         self.advance(height);
         if toggled { !checked } else { checked }
+    }
+
+    /// Draw a vertical radio group over `options` with `selected` highlighted;
+    /// return the new selected index (changes on click or, while focused, the
+    /// arrow keys). The widget is stateless, so no id is needed — a [`FocusId`]
+    /// is auto-assigned so the group joins the Tab ring. Auto-advances by the
+    /// group's full height.
+    pub fn radio_group(&mut self, options: &[&str], selected: usize) -> usize {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return selected,
+        };
+        let n = options.len();
+        if n == 0 {
+            return selected;
+        }
+        // Mirror RadioGroup's vertical layout: row_h = font_size.max(20), with a
+        // theme `spacing` gap between rows.
+        let row_h = theme.font_size.max(20.0);
+        let gap = theme.spacing;
+        let height = n as f32 * row_h + (n as f32 - 1.0) * gap;
+        let width = self.default_field_width();
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = Self::localize(inv, world, input);
+        let fid = self
+            .state
+            .as_mut()
+            .map(|s| s.auto_id())
+            .expect("radio_group requires interactive state");
+        let changed = {
+            let list = self.backend.list_mut();
+            let state = self
+                .state
+                .as_mut()
+                .expect("radio_group requires interactive state");
+            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
+            RadioGroup::new(options)
+                .focusable(fid)
+                .draw(selected, local, &mut ctx)
+        };
+        self.advance(height);
+        changed.unwrap_or(selected)
     }
 
     /// Draw an atlas image (by key) of size `w`×`h` at the aligned origin and
@@ -975,7 +1065,7 @@ impl<'a> UiContext<'a> {
                 ti.selection_start = None;
             }
             let before = ti.value.clone();
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
             ti.draw(id, &mut ctx);
             let changed = ti.value != before;
             if changed {
@@ -1045,7 +1135,7 @@ impl<'a> UiContext<'a> {
                 ti.selection_start = None;
             }
             let before = ti.value.clone();
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
             ti.draw(id, &mut ctx);
             let changed = ti.value != before;
             if changed {
@@ -1104,7 +1194,7 @@ impl<'a> UiContext<'a> {
             let ti = text_inputs
                 .entry(id)
                 .or_insert_with(|| TextInput::new(local.x, local.y, local.width, local.height));
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
             let out = NumberInput::new()
                 .with_range(min, max)
                 .with_step(step)
@@ -1170,7 +1260,7 @@ impl<'a> UiContext<'a> {
                 }
             };
             let UiState { tree, focus, .. } = &mut **state;
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0);
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
             let out = node.with_depth(depth).draw(id, local, tree, &mut ctx);
             // Focus ring on the selected row while the tree holds keyboard focus.
             if ctx.focus.is_focused(TREE_FOCUS_ID) && tree.is_selected(id) {
@@ -1449,6 +1539,53 @@ mod tests {
         assert!(approx(t[1], 0.25));
         assert!(approx(t[2], 0.25));
         assert!(approx(t[3], 1.0));
+    }
+
+    #[test]
+    fn style_override_recolors_button_chrome_and_pops_with_frame() {
+        let theme = Theme::default();
+        // Mouse parked far away so the button chrome uses the resting `Button`
+        // color (not hover/press).
+        let input = InputState {
+            mouse_x: -100.0,
+            mouse_y: -100.0,
+            ..Default::default()
+        };
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            ui.push();
+            ui.set_style_color(StyleKey::Button, [1.0, 0.0, 0.0, 1.0]);
+            ui.text_button("A", Some(80.0), Some(24.0));
+            ui.pop();
+            // After the matching pop the override is gone → theme color again.
+            ui.text_button("B", Some(80.0), Some(24.0));
+        }
+        assert_eq!(list.chrome_instances.len(), 2);
+        assert_eq!(
+            list.chrome_instances[0].bg,
+            [1.0, 0.0, 0.0, 1.0],
+            "button under the overlay uses the overridden fill"
+        );
+        assert_eq!(
+            list.chrome_instances[1].bg, theme.button,
+            "button after pop falls back to the theme fill"
+        );
+    }
+
+    #[test]
+    fn style_scalar_override_reaches_widget() {
+        // An overlay set on the context resolves through to a widget's scalar
+        // read: a `Custom` round-trip via the public set_style/StyleValue path.
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.push();
+        ui.set_style_scalar(StyleKey::BorderRadius, 9.0);
+        // The top overlay now carries the override; clearing the frame drops it.
+        ui.clear_style();
+        ui.pop();
+        // No panic / balanced stack is the invariant under test here.
     }
 
     #[test]

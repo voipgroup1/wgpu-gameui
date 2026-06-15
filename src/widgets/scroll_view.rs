@@ -14,7 +14,7 @@
 //! let mut scroll = ScrollState::default();
 //!
 //! ScrollView::new(viewport_rect, [200.0, 800.0])
-//!     .draw(&mut scroll, list, theme, input, |list, content_origin| {
+//!     .draw(&mut scroll, list, &style, input, |list, content_origin| {
 //!         // Draw your content here. The transform stack has already been
 //!         // translated by `-offset`, so draw in content-local coordinates
 //!         // anchored at `content_origin` (which equals the viewport's top-left
@@ -27,7 +27,7 @@
 //! draw at world-space rects derived from `viewport.x + col, viewport.y + row`.
 
 use crate::layout::Rect;
-use crate::{InputState, Theme};
+use crate::{InputState, StyleKey, StyleResolver};
 
 use super::DrawList;
 
@@ -167,15 +167,15 @@ impl ScrollView {
         &self,
         state: &mut ScrollState,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
         input: &mut InputState,
         mut content: F,
     ) where
         F: FnMut(&mut DrawList, Rect),
     {
-        let begun = self.begin(state, list, theme, input);
+        let begun = self.begin(state, list, style, input);
         content(list, begun.inner);
-        self.end(state, list, theme, input, begun);
+        self.end(state, list, style, input, begun);
     }
 
     /// Begin a scroll region: handle wheel + thumb-drag input, push the clip and
@@ -189,7 +189,7 @@ impl ScrollView {
         &self,
         state: &mut ScrollState,
         list: &mut DrawList,
-        _theme: &Theme,
+        _style: &StyleResolver,
         input: &mut InputState,
     ) -> ScrollBegin {
         // Force-disable axes where content fits.
@@ -275,7 +275,7 @@ impl ScrollView {
         &self,
         state: &mut ScrollState,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
         input: &InputState,
         begun: ScrollBegin,
     ) {
@@ -284,10 +284,10 @@ impl ScrollView {
 
         // Draw scrollbars.
         if begun.v_visible {
-            self.draw_v_bar(state, list, theme, input, begun.inner_h);
+            self.draw_v_bar(state, list, style, input, begun.inner_h);
         }
         if begun.h_visible {
-            self.draw_h_bar(state, list, theme, input, begun.inner_w);
+            self.draw_h_bar(state, list, style, input, begun.inner_w);
         }
 
         // Fill the bottom-right corner gap when both scrollbars are visible
@@ -304,7 +304,7 @@ impl ScrollView {
                 corner.y,
                 corner.width,
                 corner.height,
-                theme.input_background,
+                style.color(StyleKey::InputBackground),
             );
         }
     }
@@ -313,7 +313,7 @@ impl ScrollView {
         &self,
         state: &mut ScrollState,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
         input: &InputState,
         inner_h: f32,
     ) {
@@ -324,7 +324,7 @@ impl ScrollView {
         let radius = self.bar_thickness * 0.5;
 
         // Track
-        list.rounded_rect(track, radius, theme.input_background);
+        list.rounded_rect(track, radius, style.color(StyleKey::InputBackground));
 
         let thumb_h = thumb_extent(track_h, state.content_size[1], self.min_thumb);
         let max_off = state.max_offset(1, inner_h).max(1e-6);
@@ -335,11 +335,11 @@ impl ScrollView {
         let hovered = thumb.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
         let active = state.drag_axis == Some(ScrollAxis::Vertical);
         let color = if active {
-            theme.accent
+            style.color(StyleKey::Accent)
         } else if hovered {
-            theme.button_hover
+            style.color(StyleKey::ButtonHover)
         } else {
-            theme.button_border
+            style.color(StyleKey::ButtonBorder)
         };
         list.rounded_rect(thumb, radius, color);
 
@@ -354,7 +354,7 @@ impl ScrollView {
         &self,
         state: &mut ScrollState,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
         input: &InputState,
         inner_w: f32,
     ) {
@@ -364,7 +364,7 @@ impl ScrollView {
         let track = Rect::new(track_x, track_y, track_w, self.bar_thickness);
         let radius = self.bar_thickness * 0.5;
 
-        list.rounded_rect(track, radius, theme.input_background);
+        list.rounded_rect(track, radius, style.color(StyleKey::InputBackground));
 
         let thumb_w = thumb_extent(track_w, state.content_size[0], self.min_thumb);
         let max_off = state.max_offset(0, inner_w).max(1e-6);
@@ -375,11 +375,11 @@ impl ScrollView {
         let hovered = thumb.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
         let active = state.drag_axis == Some(ScrollAxis::Horizontal);
         let color = if active {
-            theme.accent
+            style.color(StyleKey::Accent)
         } else if hovered {
-            theme.button_hover
+            style.color(StyleKey::ButtonHover)
         } else {
-            theme.button_border
+            style.color(StyleKey::ButtonBorder)
         };
         list.rounded_rect(thumb, radius, color);
 
@@ -402,6 +402,7 @@ fn thumb_extent(track: f32, content: f32, min_thumb: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Theme;
 
     fn theme() -> Theme {
         Theme::default()
@@ -473,7 +474,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 200.0, 200.0)).draw(
             &mut state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_l, _r| {},
         );
@@ -494,7 +495,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 200.0, 200.0)).draw(
             &mut state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_, _| {},
         );
@@ -516,7 +517,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 200.0, 200.0)).draw(
             &mut state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_, _| {},
         );
@@ -553,14 +554,14 @@ mod tests {
             mouse_clicked: true,
             ..InputState::default()
         };
-        ScrollView::new(viewport).draw(&mut state, &mut list, &theme, &mut input, |_, _| {});
+        ScrollView::new(viewport).draw(&mut state, &mut list, &StyleResolver::new(&theme), &mut input, |_, _| {});
         assert!(state.drag_axis.is_some());
 
         // Now drag down by 80 pixels with mouse held.
         list.clear();
         input.mouse_clicked = false;
         input.mouse_y = 90.0;
-        ScrollView::new(viewport).draw(&mut state, &mut list, &theme, &mut input, |_, _| {});
+        ScrollView::new(viewport).draw(&mut state, &mut list, &StyleResolver::new(&theme), &mut input, |_, _| {});
 
         // Thumb travel = 200 - 40 = 160px.  Content travel = 1000 - 200 = 800px.
         // 80px of mouse drag -> 80 * (800/160) = 400px content offset.
@@ -589,7 +590,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 200.0, 200.0)).draw(
             &mut state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_, _| {},
         );
@@ -611,7 +612,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 200.0, 200.0)).draw(
             &mut state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_, _| {},
         );
@@ -632,7 +633,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 200.0, 200.0)).draw(
             &mut state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_, _| {},
         );
@@ -662,7 +663,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 100.0, 100.0)).draw(
             &mut inner_state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_, _| {},
         );
@@ -671,7 +672,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 200.0, 200.0)).draw(
             &mut outer_state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_, _| {},
         );
@@ -702,7 +703,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 50.0, 50.0)).draw(
             &mut inner_state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_, _| {},
         );
@@ -712,7 +713,7 @@ mod tests {
         ScrollView::new(Rect::new(100.0, 100.0, 200.0, 200.0)).draw(
             &mut outer_state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |_, _| {},
         );
@@ -730,7 +731,7 @@ mod tests {
         let mut input = input_at(-10.0, -10.0);
 
         let viewport = Rect::new(0.0, 0.0, 100.0, 100.0);
-        ScrollView::new(viewport).draw(&mut state, &mut list, &theme, &mut input, |_, _| {});
+        ScrollView::new(viewport).draw(&mut state, &mut list, &StyleResolver::new(&theme), &mut input, |_, _| {});
 
         // The corner quad should sit at (viewport.x + width - bar, y + height - bar)
         // = (100 - 6, 100 - 6) = (94, 94). `quad` now records a chrome instance
@@ -759,7 +760,7 @@ mod tests {
         ScrollView::new(Rect::new(0.0, 0.0, 200.0, 200.0)).draw(
             &mut state,
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |l, _vp| {
                 // Quad at (0, 100) — should appear in world at (0, 50) due to

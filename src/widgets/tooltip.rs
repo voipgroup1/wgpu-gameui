@@ -9,7 +9,7 @@
 use crate::layer::LayerStack;
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::{InputState, Theme};
+use crate::{InputState, StyleKey, StyleResolver};
 
 use super::DrawList;
 
@@ -100,7 +100,7 @@ struct HoverRegion {
 ///
 /// // Either route into a LayerStack popup layer, or draw directly onto a
 /// // DrawList that's the last thing drawn this frame.
-/// tooltips.draw_into_layers(&mut layers, &input, &theme, screen_w, screen_h);
+/// tooltips.draw_into_layers(&mut layers, &input, &style, screen_w, screen_h);
 /// ```
 pub struct TooltipLayer {
     regions: Vec<HoverRegion>,
@@ -173,7 +173,7 @@ impl TooltipLayer {
         &self,
         layers: &mut LayerStack,
         input: &InputState,
-        theme: &Theme,
+        style: &StyleResolver,
         screen_width: f32,
         screen_height: f32,
     ) {
@@ -190,7 +190,7 @@ impl TooltipLayer {
         let bounds = Rect::new(0.0, 0.0, screen_width, screen_height);
         layers.push_tooltip(bounds);
         let list = layers.current_mut();
-        draw_tooltip_body(list, theme, input, region, screen_width, screen_height);
+        draw_tooltip_body(list, style, input, region, screen_width, screen_height);
         layers.pop_layer();
     }
 
@@ -201,7 +201,7 @@ impl TooltipLayer {
         &self,
         input: &InputState,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
         screen_width: f32,
         screen_height: f32,
     ) {
@@ -212,21 +212,22 @@ impl TooltipLayer {
             Some(r) => r,
             None => return,
         };
-        draw_tooltip_body(list, theme, input, region, screen_width, screen_height);
+        draw_tooltip_body(list, style, input, region, screen_width, screen_height);
     }
 }
 
 fn draw_tooltip_body(
     list: &mut DrawList,
-    theme: &Theme,
+    style: &StyleResolver,
     input: &InputState,
     region: &HoverRegion,
     screen_width: f32,
     screen_height: f32,
 ) {
     let padding = 8.0;
-    let title_size = theme.font_size * 0.85;
-    let body_size = theme.font_size * 0.75;
+    let font_size = style.scalar(StyleKey::FontSize);
+    let title_size = font_size * 0.85;
+    let body_size = font_size * 0.75;
     let line_height = body_size + 3.0;
     let title_height = title_size + 4.0;
 
@@ -287,7 +288,7 @@ fn draw_tooltip_body(
     y = y.max(margin);
 
     let bg_color = [0.10, 0.10, 0.15, 0.95];
-    let border_color = theme.panel_border;
+    let border_color = style.color(StyleKey::PanelBorder);
     list.quad(x, y, width, height, bg_color);
 
     let border = 1.0;
@@ -299,29 +300,34 @@ fn draw_tooltip_body(
     let content_x = x + padding;
     let mut cursor_y = y + padding;
 
+    let highlight = style.color(StyleKey::TextHighlight);
+    let text_color = style.color(StyleKey::Text);
+    let text_dim = style.color(StyleKey::TextDim);
+    let font = style.theme().font.clone();
+
     match &region.content {
         TooltipContent::Text { title, body } => {
             if let Some(t) = title {
                 let title_block = TextBlock::new(t, content_x, cursor_y)
                     .with_size(title_size)
                     .with_color(
-                        (theme.text_highlight[0] * 255.0) as u8,
-                        (theme.text_highlight[1] * 255.0) as u8,
-                        (theme.text_highlight[2] * 255.0) as u8,
+                        (highlight[0] * 255.0) as u8,
+                        (highlight[1] * 255.0) as u8,
+                        (highlight[2] * 255.0) as u8,
                     )
-                    .with_font_opt(theme.font.clone());
+                    .with_font_opt(font.clone());
                 list.text(title_block);
                 cursor_y += title_height;
             }
             let body_block = TextBlock::new(body, content_x, cursor_y)
                 .with_size(body_size)
                 .with_color(
-                    (theme.text[0] * 255.0) as u8,
-                    (theme.text[1] * 255.0) as u8,
-                    (theme.text[2] * 255.0) as u8,
+                    (text_color[0] * 255.0) as u8,
+                    (text_color[1] * 255.0) as u8,
+                    (text_color[2] * 255.0) as u8,
                 )
                 .with_max_width(width - padding * 2.0)
-                .with_font_opt(theme.font.clone());
+                .with_font_opt(font.clone());
             list.text(body_block);
         }
         TooltipContent::Lines { title, lines } => {
@@ -329,11 +335,11 @@ fn draw_tooltip_body(
                 let title_block = TextBlock::new(t, content_x, cursor_y)
                     .with_size(title_size)
                     .with_color(
-                        (theme.text_highlight[0] * 255.0) as u8,
-                        (theme.text_highlight[1] * 255.0) as u8,
-                        (theme.text_highlight[2] * 255.0) as u8,
+                        (highlight[0] * 255.0) as u8,
+                        (highlight[1] * 255.0) as u8,
+                        (highlight[2] * 255.0) as u8,
                     )
-                    .with_font_opt(theme.font.clone());
+                    .with_font_opt(font.clone());
                 list.text(title_block);
                 cursor_y += title_height;
             }
@@ -341,11 +347,11 @@ fn draw_tooltip_body(
                 let line_block = TextBlock::new(line, content_x, cursor_y)
                     .with_size(body_size)
                     .with_color(
-                        (theme.text[0] * 255.0) as u8,
-                        (theme.text[1] * 255.0) as u8,
-                        (theme.text[2] * 255.0) as u8,
+                        (text_color[0] * 255.0) as u8,
+                        (text_color[1] * 255.0) as u8,
+                        (text_color[2] * 255.0) as u8,
                     )
-                    .with_font_opt(theme.font.clone());
+                    .with_font_opt(font.clone());
                 list.text(line_block);
                 cursor_y += line_height;
             }
@@ -358,23 +364,23 @@ fn draw_tooltip_body(
             let title_block = TextBlock::new(title, content_x, cursor_y)
                 .with_size(title_size)
                 .with_color(
-                    (theme.text_highlight[0] * 255.0) as u8,
-                    (theme.text_highlight[1] * 255.0) as u8,
-                    (theme.text_highlight[2] * 255.0) as u8,
+                    (highlight[0] * 255.0) as u8,
+                    (highlight[1] * 255.0) as u8,
+                    (highlight[2] * 255.0) as u8,
                 )
-                .with_font_opt(theme.font.clone());
+                .with_font_opt(font.clone());
             list.text(title_block);
             cursor_y += title_height;
 
             let desc_block = TextBlock::new(description, content_x, cursor_y)
                 .with_size(body_size)
                 .with_color(
-                    (theme.text[0] * 255.0) as u8,
-                    (theme.text[1] * 255.0) as u8,
-                    (theme.text[2] * 255.0) as u8,
+                    (text_color[0] * 255.0) as u8,
+                    (text_color[1] * 255.0) as u8,
+                    (text_color[2] * 255.0) as u8,
                 )
                 .with_max_width(width - padding * 2.0)
-                .with_font_opt(theme.font.clone());
+                .with_font_opt(font.clone());
             list.text(desc_block);
 
             cursor_y += rich_desc_h;
@@ -386,11 +392,11 @@ fn draw_tooltip_body(
                     let detail_block = TextBlock::new(&detail_text, content_x, cursor_y)
                         .with_size(body_size)
                         .with_color(
-                            (theme.text_dim[0] * 255.0) as u8,
-                            (theme.text_dim[1] * 255.0) as u8,
-                            (theme.text_dim[2] * 255.0) as u8,
+                            (text_dim[0] * 255.0) as u8,
+                            (text_dim[1] * 255.0) as u8,
+                            (text_dim[2] * 255.0) as u8,
                         )
-                        .with_font_opt(theme.font.clone());
+                        .with_font_opt(font.clone());
                     list.text(detail_block);
                     cursor_y += line_height;
                 }

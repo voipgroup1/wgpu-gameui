@@ -32,7 +32,8 @@
 //! Dropdown::new(&items, sel).draw(MY_ID, rect, &mut dropdowns, &mut ctx);
 //! drop(ctx); // release the borrow on layers.base_mut()
 //! // after the base scope:
-//! if let Some((id, idx)) = dropdowns.draw_open_layer(&mut layers, popup, &theme, &raw_input) {
+//! let style = StyleResolver::new(&theme);
+//! if let Some((id, idx)) = dropdowns.draw_open_layer(&mut layers, popup, &style, &raw_input) {
 //!     if id == MY_ID { sel = idx; }
 //! }
 //! dropdowns.end_frame();
@@ -47,7 +48,7 @@
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::{InputState, LayerStack, Theme};
+use crate::{InputState, LayerStack, StyleKey, StyleResolver};
 
 use super::{DrawContext, DrawList};
 
@@ -198,7 +199,7 @@ impl DropdownState {
         &mut self,
         layers: &mut LayerStack,
         popup: Option<usize>,
-        theme: &Theme,
+        style: &StyleResolver,
         input: &InputState,
     ) -> Option<(DropdownId, usize)> {
         let geom = self.geom.clone()?;
@@ -258,18 +259,23 @@ impl DropdownState {
             }
         }
 
-        let (sel_r, sel_g, sel_b) = rgb(theme.background);
-        let (txt_r, txt_g, txt_b) = rgb(theme.text);
+        let (sel_r, sel_g, sel_b) = rgb(style.color(StyleKey::Background));
+        let (txt_r, txt_g, txt_b) = rgb(style.color(StyleKey::Text));
+        let pad = style.scalar(StyleKey::Padding);
+        let font_size = style.scalar(StyleKey::FontSize);
+        let font = style.theme().font.clone();
+        let accent = style.color(StyleKey::Accent);
+        let hover = style.color(StyleKey::ButtonHover);
 
         {
             let l = &mut layers.layers_mut()[idx].list;
             // List background + border.
             l.chrome_rect(
                 list_rect,
-                theme.border_radius,
-                theme.border_width,
-                theme.panel,
-                theme.panel_border,
+                style.scalar(StyleKey::BorderRadius),
+                style.scalar(StyleKey::BorderWidth),
+                style.color(StyleKey::Panel),
+                style.color(StyleKey::PanelBorder),
             );
             l.push_clip(list_rect);
             for (i, item) in geom.items.iter().enumerate() {
@@ -285,29 +291,17 @@ impl DropdownState {
                 let is_selected = i == geom.selected;
                 let is_highlighted = self.highlighted == i;
                 if is_selected {
-                    l.quad(list_rect.x, iy, list_rect.width, geom.item_h, theme.accent);
+                    l.quad(list_rect.x, iy, list_rect.width, geom.item_h, accent);
                 } else if is_highlighted {
                     // Keyboard highlight: a brighter/stronger hover.
-                    l.quad(
-                        list_rect.x,
-                        iy,
-                        list_rect.width,
-                        geom.item_h,
-                        theme.button_hover,
-                    );
+                    l.quad(list_rect.x, iy, list_rect.width, geom.item_h, hover);
                 } else if hovered {
                     // Mouse hover only when keyboard isn't already highlighting
                     // a different item (to avoid fighting the user).
                     if !input.key_up && !input.key_down {
                         self.highlighted = i;
                     }
-                    l.quad(
-                        list_rect.x,
-                        iy,
-                        list_rect.width,
-                        geom.item_h,
-                        theme.button_hover,
-                    );
+                    l.quad(list_rect.x, iy, list_rect.width, geom.item_h, hover);
                 }
                 let (r, g, b) = if is_selected {
                     (sel_r, sel_g, sel_b)
@@ -315,13 +309,13 @@ impl DropdownState {
                     (txt_r, txt_g, txt_b)
                 };
                 let text_y =
-                    l.vcentered_text_y(iy, geom.item_h, theme.font_size, theme.font.as_ref(), item);
+                    l.vcentered_text_y(iy, geom.item_h, font_size, font.as_ref(), item);
                 l.text(
-                    TextBlock::new(item.clone(), list_rect.x + theme.padding, text_y)
-                        .with_size(theme.font_size)
+                    TextBlock::new(item.clone(), list_rect.x + pad, text_y)
+                        .with_size(font_size)
                         .with_color(r, g, b)
-                        .with_max_width(list_rect.width - theme.padding * 2.0)
-                        .with_font_opt(theme.font.clone()),
+                        .with_max_width(list_rect.width - pad * 2.0)
+                        .with_font_opt(font.clone()),
                 );
             }
             l.pop_clip();
@@ -420,6 +414,26 @@ impl<'a> Dropdown<'a> {
         self
     }
 
+    /// The screen-space rect the open option list occupies when this dropdown is
+    /// open below `button_rect` — it floats directly below the button and is as
+    /// tall as `min(items, max_visible)` rows.
+    ///
+    /// The live widget draws the list into a popup layer (so it overlays, not
+    /// reserves), but this lets a caller that *does* need the footprint reason
+    /// about it: reserve layout space beneath the button, or decide whether to
+    /// flip the list upward when it would run off-screen.
+    pub fn open_list_rect(&self, button_rect: Rect) -> Rect {
+        // Mirror the private `list_rect` geometry (same GAP_BELOW_BUTTON /
+        // ITEM_HEIGHT / max_visible clamp) from this frame's config.
+        let visible = self.items.len().min(self.max_visible).max(1);
+        Rect::new(
+            button_rect.x,
+            button_rect.y + button_rect.height + GAP_BELOW_BUTTON,
+            button_rect.width,
+            visible as f32 * ITEM_HEIGHT,
+        )
+    }
+
     /// Draw the dropdown **button** at `rect` and handle open/close toggling.
     /// The open option list is drawn separately by
     /// [`DropdownState::draw_open_layer`]. Returns whether the button was
@@ -434,8 +448,8 @@ impl<'a> Dropdown<'a> {
         // Register as focusable for Tab nav (scoped to active layer).
         ctx.register_focus(id);
 
+        let s = ctx.styles();
         let list = &mut *ctx.draw_list;
-        let theme = ctx.theme;
         let input = ctx.input;
 
         let hovered = input.is_hovered(rect.x, rect.y, rect.width, rect.height);
@@ -483,44 +497,46 @@ impl<'a> Dropdown<'a> {
 
         // Button chrome: focus-style border when open, accent on hover.
         let border = if open {
-            theme.input_focus_border
+            s.color(StyleKey::InputFocusBorder)
         } else if hovered {
-            theme.accent
+            s.color(StyleKey::Accent)
         } else {
-            theme.input_border
+            s.color(StyleKey::InputBorder)
         };
         list.chrome_rect(
             rect,
-            theme.border_radius,
-            theme.border_width,
-            theme.input_background,
+            s.scalar(StyleKey::BorderRadius),
+            s.scalar(StyleKey::BorderWidth),
+            s.color(StyleKey::InputBackground),
             border,
         );
 
         // Selected label.
         let label = self.items.get(self.selected).copied().unwrap_or("");
         let (r, g, b) = rgb(if self.items.is_empty() {
-            theme.text_dim
+            s.color(StyleKey::TextDim)
         } else {
-            theme.text
+            s.color(StyleKey::Text)
         });
+        let font_size = s.scalar(StyleKey::FontSize);
+        let pad = s.scalar(StyleKey::Padding);
         let text_y = list.vcentered_text_y(
             rect.y,
             rect.height,
-            theme.font_size,
-            theme.font.as_ref(),
+            font_size,
+            s.theme().font.as_ref(),
             label,
         );
         list.text(
-            TextBlock::new(label, rect.x + theme.padding, text_y)
-                .with_size(theme.font_size)
+            TextBlock::new(label, rect.x + pad, text_y)
+                .with_size(font_size)
                 .with_color(r, g, b)
-                .with_max_width(rect.width - theme.padding * 2.0 - CHEVRON * 3.0)
-                .with_font_opt(theme.font.clone()),
+                .with_max_width(rect.width - pad * 2.0 - CHEVRON * 3.0)
+                .with_font_opt(s.theme().font.clone()),
         );
 
         // Chevron at the right edge: down when closed, up when open.
-        draw_chevron(list, rect, theme, open);
+        draw_chevron(list, rect, &s, open);
 
         // Snapshot geometry for the deferred list draw (this frame's
         // draw_open_layer reads last frame's; next begin_frame promotes this).
@@ -541,11 +557,11 @@ impl<'a> Dropdown<'a> {
 }
 
 /// Draw a small chevron (▼ closed / ▲ open) at the button's right edge.
-fn draw_chevron(list: &mut DrawList, rect: Rect, theme: &Theme, open: bool) {
-    let cx = rect.x + rect.width - theme.padding - CHEVRON;
+fn draw_chevron(list: &mut DrawList, rect: Rect, s: &StyleResolver, open: bool) {
+    let cx = rect.x + rect.width - s.scalar(StyleKey::Padding) - CHEVRON;
     let cy = rect.y + rect.height / 2.0;
     let dy = if open { -CHEVRON * 0.5 } else { CHEVRON * 0.5 };
-    let color = theme.text_dim;
+    let color = s.color(StyleKey::TextDim);
     // Two strokes meeting at the point.
     list.line([cx - CHEVRON, cy - dy], [cx, cy + dy], 1.5, color);
     list.line([cx + CHEVRON, cy - dy], [cx, cy + dy], 1.5, color);
@@ -554,7 +570,7 @@ fn draw_chevron(list: &mut DrawList, rect: Rect, theme: &Theme, open: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FocusState;
+    use crate::{FocusState, Theme};
 
     fn input(clicked: bool, escape: bool, mouse: (f32, f32)) -> InputState {
         InputState {
@@ -585,6 +601,27 @@ mod tests {
         Dropdown::new(&ITEMS, 0).draw(2, rect_b(), state, &mut ctx);
         state.end_frame();
         focus.end_frame(None);
+    }
+
+    #[test]
+    fn open_list_rect_floats_below_button_sized_to_rows() {
+        let btn = rect_a();
+        let menu = Dropdown::new(&ITEMS, 0).open_list_rect(btn);
+        // Floats just below the button, same x/width.
+        assert_eq!(menu.x, btn.x);
+        assert_eq!(menu.width, btn.width);
+        assert_eq!(menu.y, btn.y + btn.height + GAP_BELOW_BUTTON);
+        // Height = all 3 rows (under the default max_visible).
+        assert_eq!(menu.height, ITEMS.len() as f32 * ITEM_HEIGHT);
+    }
+
+    #[test]
+    fn open_list_rect_clamps_height_to_max_visible() {
+        let btn = rect_a();
+        let menu = Dropdown::new(&ITEMS, 0)
+            .with_max_visible(2)
+            .open_list_rect(btn);
+        assert_eq!(menu.height, 2.0 * ITEM_HEIGHT, "scrollable list caps at max_visible rows");
     }
 
     #[test]
@@ -715,7 +752,7 @@ mod tests {
         let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &input_open, 800.0, 600.0);
         Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
         drop(ctx);
-        let pick = s.draw_open_layer(&mut layers, popup, &theme, &input_open);
+        let pick = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &input_open);
         assert_eq!(pick, None);
         s.end_frame();
         focus.end_frame(None);
@@ -735,7 +772,7 @@ mod tests {
         // Button isn't clicked this frame (cursor is over the list, not the button).
         Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
         drop(ctx);
-        let pick = s.draw_open_layer(&mut layers, popup, &theme, &click_row1);
+        let pick = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &click_row1);
         assert_eq!(pick, Some((1, 1)), "clicking row 1 returns (id=1, index=1)");
         s.end_frame();
         focus.end_frame(None);
@@ -775,11 +812,11 @@ mod tests {
         let mut layers = LayerStack::new();
         let popup = s.push_open_layer(&mut layers);
         // draw_open_layer processes arrow-down from input
-        let _ = s.draw_open_layer(&mut layers, popup, &theme, &kbd);
+        let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &kbd);
         assert_eq!(s.highlighted, 1, "arrow down moves to index 1");
 
         let kbd2 = input_keys(false, true, false);
-        let _ = s.draw_open_layer(&mut layers, popup, &theme, &kbd2);
+        let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &kbd2);
         assert_eq!(s.highlighted, 2, "arrow down moves to index 2");
         s.end_frame();
     }
@@ -807,7 +844,7 @@ mod tests {
         s.begin_frame(&kbd);
         let mut layers = LayerStack::new();
         let popup = s.push_open_layer(&mut layers);
-        let _ = s.draw_open_layer(&mut layers, popup, &theme, &kbd);
+        let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &kbd);
         assert_eq!(s.highlighted, 1, "arrow up moves to index 1");
         s.end_frame();
     }
@@ -842,7 +879,7 @@ mod tests {
         let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &kbd, 800.0, 600.0);
         Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
         drop(ctx);
-        let _ = s.draw_open_layer(&mut layers, popup, &theme, &kbd);
+        let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &kbd);
         assert_eq!(s.highlighted, 1);
         s.end_frame();
         focus.end_frame(None);
@@ -859,7 +896,7 @@ mod tests {
         let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &enter, 800.0, 600.0);
         Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
         drop(ctx);
-        let result = s.draw_open_layer(&mut layers, popup, &theme, &enter);
+        let result = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &enter);
         assert_eq!(result, Some((1, 1)), "Enter selects highlighted item");
         s.end_frame();
         assert!(!s.is_open(1), "selecting closes the dropdown");

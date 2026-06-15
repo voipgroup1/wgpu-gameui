@@ -15,7 +15,9 @@ use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList, Dropdown,
     DropdownState, FocusState, ImageButton, ImageFit, InputState, LayerStack, List, ListItem,
-    ListState, NumberInput, ProgressBar, ScrollState, ScrollView, SelectionMode, Slider, Table,
+    ListState, NumberInput, ProgressBar, RadioGroup, ScrollState, ScrollView, SelectionMode, Slider,
+    StyleKey, StyleOverlay, StyleResolver,
+    Table,
     TableCell, TableColumn, Tabs, TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent,
     TooltipLayer, TreeAction, TreeNode, TreeState, UiContext, UiRenderer, UiState,
 };
@@ -107,6 +109,15 @@ impl Flow {
         self.cur_x += cell_w + self.col_gap;
         self.row_h = self.row_h.max(LABEL_H + h);
         content
+    }
+
+    /// Reserve at least `content_h` of vertical space (measured from the last
+    /// cell's content-rect top) for the current row. Use this for content that
+    /// *paints taller than the `cell` rect it was handed* — an open `Dropdown`
+    /// overlay or an auto-advancing `UiContext` verb stack — so the following
+    /// row starts below it instead of underneath it.
+    fn reserve(&mut self, content_h: f32) {
+        self.row_h = self.row_h.max(LABEL_H + content_h);
     }
 
     /// The y just below all content drawn so far.
@@ -616,7 +627,13 @@ fn render_widget_gallery() {
                 let _ = ui.checkbox("checkbox()", true);
                 let _ = ui.text_input(1, &mut buf, "type…", Some(200.0));
             }
+            // The verbs auto-advanced the transform cursor down from `r.y`; the
+            // delta is the stack's true painted height. Reserve it so the cell's
+            // 168px nominal height doesn't let the next section overlap (the
+            // stack is taller than that). Read before `pop_transform` restores it.
+            let stack_h = list.current_transform().ty - r.y;
             list.pop_transform();
+            flow.reserve(stack_h);
             vstate.end_frame();
         }
 
@@ -669,8 +686,17 @@ fn render_widget_gallery() {
         let r = flow.cell(list, "Checkbox (checked)", 120.0, 20.0);
         cb.draw(true, "On", r, &mut ctx(list, &mut focus, &theme, &input));
 
+        let radio_opts = ["Low", "Medium", "High"];
+        let r = flow.cell(list, "Radio group", 120.0, 76.0);
+        RadioGroup::new(&radio_opts).draw(1, r, &mut ctx(list, &mut focus, &theme, &input));
+
+        let r = flow.cell(list, "Radio (horizontal)", 260.0, 24.0);
+        RadioGroup::new(&radio_opts)
+            .horizontal()
+            .draw(0, r, &mut ctx(list, &mut focus, &theme, &input));
+
         let r = flow.cell(list, "Progress bar", 150.0, 20.0);
-        ProgressBar::new(0.65).draw(r, list, &theme);
+        ProgressBar::new(0.65).draw(r, list, &StyleResolver::new(&theme));
 
         let r = flow.cell(list, "Slider", 160.0, 24.0);
         let mut capture = DragCapture::default();
@@ -702,7 +728,7 @@ fn render_widget_gallery() {
         );
 
         let r = flow.cell(list, "Tabs", 240.0, 30.0);
-        Tabs::new(&["Tab A", "Tab B", "Tab C"]).draw(r, 0, list, &theme, &input);
+        Tabs::new(&["Tab A", "Tab B", "Tab C"]).draw(r, 0, list, &StyleResolver::new(&theme), &input);
 
         let r = flow.cell(list, "Text input", 200.0, 28.0);
         TextInput::new(r.x, r.y, r.width, r.height)
@@ -837,7 +863,13 @@ fn render_widget_gallery() {
         // renders above whatever cells sit below it.
         let r = flow.cell(list, "Dropdown (open)", 160.0, 28.0);
         dropdowns.open_for_test(DROPDOWN_ID, r, &DROPDOWN_ITEMS, 2);
-        Dropdown::new(&DROPDOWN_ITEMS, 2).draw(
+        let dropdown = Dropdown::new(&DROPDOWN_ITEMS, 2);
+        // The open list is an overlay (drawn later into a popup layer), so the
+        // cell only nominally reserves the 28px button. Reserve its full open
+        // footprint too, so the floating list doesn't paint over the rows below.
+        let menu = dropdown.open_list_rect(r);
+        flow.reserve(menu.y + menu.height - r.y);
+        dropdown.draw(
             DROPDOWN_ID,
             r,
             &mut dropdowns,
@@ -851,7 +883,7 @@ fn render_widget_gallery() {
         ScrollView::new(r).vertical_only().draw(
             &mut scroll_state,
             list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
             |list, vp| {
                 for i in 0..12usize {
@@ -902,7 +934,7 @@ fn render_widget_gallery() {
             &rows,
             &mut ScrollState::default(),
             list,
-            &theme,
+            &StyleResolver::new(&theme),
             &mut input,
         );
 
@@ -910,21 +942,21 @@ fn render_widget_gallery() {
         ImageButton::sprite(duck)
             .fit(ImageFit::Contain)
             .natural_size(48.0, 48.0)
-            .draw(r, list, &theme, &input);
+            .draw(r, list, &StyleResolver::new(&theme), &input);
 
         let r = flow.cell(list, "Image button (bare)", 40.0, 40.0);
         ImageButton::sprite(board)
             .bare()
             .fit(ImageFit::Contain)
             .natural_size(48.0, 48.0)
-            .draw(r, list, &theme, &input);
+            .draw(r, list, &StyleResolver::new(&theme), &input);
 
         let r = flow.cell(list, "Image button (disabled)", 40.0, 40.0);
         ImageButton::sprite(suitcase)
             .enabled(false)
             .fit(ImageFit::Contain)
             .natural_size(48.0, 48.0)
-            .draw(r, list, &theme, &input);
+            .draw(r, list, &StyleResolver::new(&theme), &input);
 
         // ---- Lists / Grids (virtualized) --------------------------------
         flow.section(list, "Lists / Grids");
@@ -955,7 +987,7 @@ fn render_widget_gallery() {
                     items.len(),
                     &mut state,
                     list,
-                    &theme,
+                    &StyleResolver::new(&theme),
                     &mut hover_in,
                     |list, cell, it: ListItem| {
                         // Debug: outline the cell rect handed to the closure, so
@@ -996,7 +1028,7 @@ fn render_widget_gallery() {
                     24,
                     &mut state,
                     list,
-                    &theme,
+                    &StyleResolver::new(&theme),
                     &mut idle_in,
                     |list, cell, it: ListItem| {
                         // Debug: outline the cell rect handed to the closure.
@@ -1044,7 +1076,7 @@ fn render_widget_gallery() {
                 1000,
                 &mut state,
                 list,
-                &theme,
+                &StyleResolver::new(&theme),
                 &mut idle_in,
                 |list, cell, it: ListItem| {
                     // Debug: outline the cell rect handed to the closure. The
@@ -1098,6 +1130,44 @@ fn render_widget_gallery() {
         );
         list.pop_transform();
 
+        // --- Styling / overrides -------------------------------------------
+        // Per-widget restyling with NO theme clone: a scoped `StyleOverlay`
+        // layered over the theme via `DrawContext::with_style`, plus a custom
+        // (mod-defined) key resolved by name.
+        flow.section(list, "Styling / overrides");
+
+        // Baseline button — straight theme colors.
+        let r = flow.cell(list, "Button (theme)", 120.0, 32.0);
+        Button::new("Normal").draw(r, &mut ctx(list, &mut focus, &theme, &input));
+
+        // Same widget under an overlay — recolored fill/border/text only.
+        let mut overlay = StyleOverlay::new();
+        overlay
+            .set_color(StyleKey::Button, [0.45, 0.12, 0.55, 1.0])
+            .set_color(StyleKey::ButtonBorder, [0.85, 0.55, 0.95, 1.0])
+            .set_color(StyleKey::Text, [1.0, 0.92, 1.0, 1.0]);
+        let r = flow.cell(list, "Button (overlay)", 120.0, 32.0);
+        {
+            let mut octx = DrawContext::new(list, &mut focus, &theme, &input, W as f32, 600.0)
+                .with_style(&overlay);
+            Button::new("Restyled").draw(r, &mut octx);
+        }
+
+        // Custom key: a mod-defined style resolved through the overlay (a custom
+        // widget can carry its own style with zero core changes). Swatch + name.
+        let mut custom = StyleOverlay::new();
+        let glow_key = StyleKey::custom("mywidget.glow");
+        custom.set_color(glow_key, [0.20, 0.85, 0.65, 1.0]);
+        let r = flow.cell(list, "Custom key", 170.0, 32.0);
+        let resolver = StyleResolver::with_overlay(&theme, &custom);
+        let c = resolver.color_or(glow_key, [1.0, 0.0, 1.0, 1.0]);
+        list.rounded_rect(Rect::new(r.x, r.y, 28.0, 28.0), 6.0, c);
+        list.text(
+            TextBlock::new("mywidget.glow", r.x + 36.0, r.y + 8.0)
+                .with_size(12.0)
+                .with_color(200, 210, 230),
+        );
+
         // Tooltip target last: its popup floats down-and-right into the empty
         // headroom below, overlapping no other widget.
         let r = flow.cell(list, "Tooltip target", 120.0, 24.0);
@@ -1120,7 +1190,7 @@ fn render_widget_gallery() {
     // Floating dropdown list (Popup layer above the base content).
     {
         let popup = dropdowns.push_open_layer(&mut layers);
-        dropdowns.draw_open_layer(&mut layers, popup, &theme, &InputState::default());
+        dropdowns.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &InputState::default());
     }
 
     // Tooltip layer, hovering the reserved target.
@@ -1131,7 +1201,7 @@ fn render_widget_gallery() {
         tip_input.mouse_x = tooltip_rect.x + tooltip_rect.width / 2.0;
         tip_input.mouse_y = tooltip_rect.y + tooltip_rect.height / 2.0;
         tooltip.tick(999.0, &tip_input);
-        tooltip.draw_into_layers(&mut layers, &tip_input, &theme, W as f32, h as f32);
+        tooltip.draw_into_layers(&mut layers, &tip_input, &StyleResolver::new(&theme), W as f32, h as f32);
     }
 
     let target = device.create_texture(&wgpu::TextureDescriptor {

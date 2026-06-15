@@ -30,7 +30,7 @@
 //!     .with_item_height(22.0)
 //!     .selection(SelectionMode::Multi)
 //!     .focused(panel_has_focus)
-//!     .draw(rect, items.len(), &mut state, list, &theme, &mut input,
+//!     .draw(rect, items.len(), &mut state, list, &style, &mut input,
 //!         |list, cell, it| {
 //!             let color = if it.selected { [255, 255, 255] } else { [200, 210, 230] };
 //!             list.text(TextBlock::new(items[it.index], cell.x + 6.0, cell.y + 3.0)
@@ -42,7 +42,7 @@
 use std::collections::BTreeSet;
 
 use crate::layout::Rect;
-use crate::{InputState, Theme};
+use crate::{InputState, StyleKey, StyleResolver};
 
 use super::DrawList;
 use super::scroll_view::{ScrollState, ScrollView};
@@ -320,14 +320,17 @@ impl List {
         count: usize,
         state: &mut ListState,
         list: &mut DrawList,
-        theme: &Theme,
+        style: &StyleResolver,
         input: &mut InputState,
         mut item: F,
     ) -> ListOutput
     where
         F: FnMut(&mut DrawList, Rect, ListItem),
     {
-        let item_h = self.item_height.unwrap_or(theme.font_size + 10.0).max(1.0);
+        let item_h = self
+            .item_height
+            .unwrap_or(style.scalar(StyleKey::FontSize) + 10.0)
+            .max(1.0);
         let cols = self.columns.max(1);
         let row_pitch = item_h + self.row_gap;
 
@@ -453,7 +456,7 @@ impl List {
 
         ScrollView::new(rect)
             .vertical_only()
-            .draw(scroll, list, theme, input, |list, vp| {
+            .draw(scroll, list, style, input, |list, vp| {
                 let cell_w = if cols == 1 {
                     vp.width
                 } else {
@@ -505,11 +508,11 @@ impl List {
 
                         let is_selected = selected.contains(&idx);
                         let bg = if is_selected {
-                            theme.accent
+                            style.color(StyleKey::Accent)
                         } else if over_cell {
-                            theme.button_hover
+                            style.color(StyleKey::ButtonHover)
                         } else if zebra && cols == 1 && idx % 2 == 1 {
-                            let mut c = theme.panel;
+                            let mut c = style.color(StyleKey::Panel);
                             c[0] *= 1.12;
                             c[1] *= 1.12;
                             c[2] *= 1.12;
@@ -547,6 +550,7 @@ impl List {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Theme;
 
     fn theme() -> Theme {
         Theme::default()
@@ -580,7 +584,15 @@ mod tests {
     ) -> ListOutput {
         let mut dl = DrawList::new();
         let th = theme();
-        list_w.draw(rect, count, st, &mut dl, &th, input, |_, _, _| {})
+        list_w.draw(
+            rect,
+            count,
+            st,
+            &mut dl,
+            &StyleResolver::new(&th),
+            input,
+            |_, _, _| {},
+        )
     }
 
     #[test]
@@ -637,7 +649,7 @@ mod tests {
             1000,
             &mut st,
             &mut dl,
-            &th,
+            &StyleResolver::new(&th),
             &mut input,
             |_, _, _| calls += 1,
         );

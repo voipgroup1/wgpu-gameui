@@ -2,7 +2,7 @@
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::{SpriteId, Theme};
+use crate::{SpriteId, StyleKey, StyleResolver};
 
 use super::{DrawContext, DrawList, FocusId};
 
@@ -36,7 +36,7 @@ enum BoxStyle {
 
 /// Checkbox widget - a toggleable box with an optional label.
 ///
-/// By default the box is drawn from vector primitives using [`Theme`] colors,
+/// By default the box is drawn from vector primitives using [`Theme`](crate::Theme) colors,
 /// so it renders correctly with zero atlas assets. Callers that registered
 /// checkbox textures can opt into them with [`Checkbox::with_icons`] (passing
 /// pre-resolved [`SpriteId`]s) or [`Checkbox::with_icon_keys`].
@@ -105,7 +105,7 @@ impl Checkbox {
     /// with the label to its right.
     pub fn draw(&self, checked: bool, label: &str, rect: Rect, ctx: &mut DrawContext) -> bool {
         let input = ctx.input;
-        let theme = ctx.theme;
+        let s = ctx.styles();
         // Honor layer capture (`mouse_consumed`) so a checkbox under a
         // modal/popup doesn't react to clicks meant for the overlay.
         let hovered = rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
@@ -119,7 +119,7 @@ impl Checkbox {
         {
             let list = &mut *ctx.draw_list;
             match &self.style {
-                BoxStyle::Vector => draw_vector_box(list, theme, box_rect, checked),
+                BoxStyle::Vector => draw_vector_box(list, &s, box_rect, checked),
                 BoxStyle::Sprites {
                     unchecked,
                     checked: checked_id,
@@ -154,19 +154,19 @@ impl Checkbox {
                 let text_y = list.vcentered_text_y(
                     rect.y,
                     rect.height,
-                    theme.font_size,
-                    theme.font.as_ref(),
+                    s.scalar(StyleKey::FontSize),
+                    s.theme().font.as_ref(),
                     label,
                 );
-                let text_color = theme.text;
+                let text_color = s.color(StyleKey::Text);
                 let text = TextBlock::new(label, text_x, text_y)
-                    .with_size(theme.font_size)
+                    .with_size(s.scalar(StyleKey::FontSize))
                     .with_color(
                         (text_color[0] * 255.0) as u8,
                         (text_color[1] * 255.0) as u8,
                         (text_color[2] * 255.0) as u8,
                     )
-                    .with_font_opt(theme.font.clone());
+                    .with_font_opt(s.theme().font.clone());
                 list.text(text);
             }
         }
@@ -193,15 +193,16 @@ impl Checkbox {
 
 /// Draw the theme-driven vector checkbox: a rounded box, filled with the accent
 /// color and stamped with a contrast checkmark when `checked`.
-fn draw_vector_box(list: &mut DrawList, theme: &Theme, box_rect: Rect, checked: bool) {
+fn draw_vector_box(list: &mut DrawList, s: &StyleResolver, box_rect: Rect, checked: bool) {
     let size = box_rect.width.min(box_rect.height);
-    let radius = theme.border_radius.min(size * 0.3).max(0.0);
-    let border = theme.border_width.max(1.0).min(size * 0.5);
+    let radius = s.scalar(StyleKey::BorderRadius).min(size * 0.3).max(0.0);
+    let border = s.scalar(StyleKey::BorderWidth).max(1.0).min(size * 0.5);
 
     if checked {
         // Filled box in accent + contrasting checkmark.
-        list.rounded_rect(box_rect, radius, theme.accent);
-        let mark = contrast_color(theme.accent);
+        let accent = s.color(StyleKey::Accent);
+        list.rounded_rect(box_rect, radius, accent);
+        let mark = contrast_color(accent);
         let t = (size * 0.14).max(1.5);
         // Tick: down-stroke into the low-left, up-stroke to the high-right.
         let pts = [
@@ -212,8 +213,8 @@ fn draw_vector_box(list: &mut DrawList, theme: &Theme, box_rect: Rect, checked: 
         list.polyline(&pts, t, mark);
     } else {
         // Empty box: subtle fill + border.
-        list.rounded_rect(box_rect, radius, theme.input_background);
-        list.rounded_rect_outline(box_rect, radius, border, theme.input_border);
+        list.rounded_rect(box_rect, radius, s.color(StyleKey::InputBackground));
+        list.rounded_rect_outline(box_rect, radius, border, s.color(StyleKey::InputBorder));
     }
 }
 
@@ -231,7 +232,7 @@ fn contrast_color(bg: [f32; 4]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FocusState, InputState};
+    use crate::{FocusState, InputState, Theme};
 
     fn theme() -> Theme {
         Theme::default()

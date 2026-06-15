@@ -17,11 +17,11 @@
 //! let clicked = ImageButton::key("play.png")
 //!     .natural_size(w as f32, h as f32)
 //!     .fit(ImageFit::Contain)
-//!     .draw(rect, &mut list, &theme, &input);
+//!     .draw(rect, &mut list, &StyleResolver::new(&theme), &input);
 //! ```
 
 use crate::layout::Rect;
-use crate::{InputState, SpriteId, Theme};
+use crate::{InputState, SpriteId, StyleKey, StyleResolver};
 
 use super::button::{ButtonVisual, draw_chrome};
 use super::{DrawList, Image, ImageAlign, ImageFit};
@@ -104,7 +104,16 @@ impl ImageButton {
     }
 
     /// Draw the button at `rect` and return true if clicked.
-    pub fn draw(&self, rect: Rect, list: &mut DrawList, theme: &Theme, input: &InputState) -> bool {
+    ///
+    /// Takes a [`StyleResolver`] so a scoped overlay can recolor the chrome;
+    /// callers with only a [`Theme`](crate::Theme) pass `&StyleResolver::new(&theme)`.
+    pub fn draw(
+        &self,
+        rect: Rect,
+        list: &mut DrawList,
+        style: &StyleResolver,
+        input: &InputState,
+    ) -> bool {
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return false;
         }
@@ -117,9 +126,9 @@ impl ImageButton {
         if self.chrome {
             draw_chrome(
                 list,
-                theme,
+                style,
                 rect,
-                theme.border_radius,
+                style.scalar(StyleKey::BorderRadius),
                 &ButtonVisual {
                     enabled: self.enabled,
                     hovered,
@@ -129,7 +138,9 @@ impl ImageButton {
         }
 
         // Image content, inset by padding.
-        let pad = self.padding.unwrap_or(theme.padding * 0.25);
+        let pad = self
+            .padding
+            .unwrap_or(style.scalar(StyleKey::Padding) * 0.25);
         let inner = Rect::new(
             rect.x + pad,
             rect.y + pad,
@@ -176,6 +187,7 @@ impl ImageButton {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Theme;
 
     const ID: SpriteId = 0;
 
@@ -199,7 +211,7 @@ mod tests {
         let mut list = DrawList::new();
         let theme = Theme::default();
         let input = input_at(50.0, 50.0, true, true);
-        assert!(ImageButton::sprite(ID).draw(rect(), &mut list, &theme, &input));
+        assert!(ImageButton::sprite(ID).draw(rect(), &mut list, &StyleResolver::new(&theme), &input));
     }
 
     #[test]
@@ -207,7 +219,7 @@ mod tests {
         let mut list = DrawList::new();
         let theme = Theme::default();
         let input = input_at(200.0, 200.0, true, true);
-        assert!(!ImageButton::sprite(ID).draw(rect(), &mut list, &theme, &input));
+        assert!(!ImageButton::sprite(ID).draw(rect(), &mut list, &StyleResolver::new(&theme), &input));
     }
 
     #[test]
@@ -218,7 +230,7 @@ mod tests {
         assert!(
             !ImageButton::sprite(ID)
                 .enabled(false)
-                .draw(rect(), &mut list, &theme, &input)
+                .draw(rect(), &mut list, &StyleResolver::new(&theme), &input)
         );
     }
 
@@ -228,7 +240,7 @@ mod tests {
         let theme = Theme::default();
         let mut input = input_at(50.0, 50.0, true, true);
         input.mouse_consumed = true;
-        assert!(!ImageButton::sprite(ID).draw(rect(), &mut list, &theme, &input));
+        assert!(!ImageButton::sprite(ID).draw(rect(), &mut list, &StyleResolver::new(&theme), &input));
     }
 
     #[test]
@@ -238,7 +250,7 @@ mod tests {
         let input = input_at(0.0, 0.0, false, false);
         ImageButton::sprite(ID)
             .padding(12.0)
-            .draw(rect(), &mut list, &theme, &input);
+            .draw(rect(), &mut list, &StyleResolver::new(&theme), &input);
         // Stretch fills the inset box; recover it from the last icon's TL corner.
         let c = list.icons.last().expect("an icon was drawn").corners;
         assert!((c[0][0] - 22.0).abs() < 1e-3, "inset x: {}", c[0][0]); // 10 + 12
@@ -253,10 +265,10 @@ mod tests {
         let mut bare = DrawList::new();
         let theme = Theme::default();
         let input = input_at(0.0, 0.0, false, false);
-        ImageButton::sprite(ID).draw(rect(), &mut chrome, &theme, &input);
+        ImageButton::sprite(ID).draw(rect(), &mut chrome, &StyleResolver::new(&theme), &input);
         ImageButton::sprite(ID)
             .bare()
-            .draw(rect(), &mut bare, &theme, &input);
+            .draw(rect(), &mut bare, &StyleResolver::new(&theme), &input);
         // Chrome records one instanced rounded-rect (background + border); the
         // bare variant draws no chrome instance.
         assert_eq!(
@@ -274,14 +286,14 @@ mod tests {
         ImageButton::sprite(ID).bare().draw(
             rect(),
             &mut idle,
-            &theme,
+            &StyleResolver::new(&theme),
             &input_at(0.0, 0.0, false, false),
         );
         let mut hot = DrawList::new();
         ImageButton::sprite(ID).bare().draw(
             rect(),
             &mut hot,
-            &theme,
+            &StyleResolver::new(&theme),
             &input_at(50.0, 50.0, false, false),
         );
         assert!(
@@ -297,14 +309,14 @@ mod tests {
         ImageButton::sprite(ID).bare().draw(
             rect(),
             &mut enabled,
-            &theme,
+            &StyleResolver::new(&theme),
             &input_at(0.0, 0.0, false, false),
         );
         let mut disabled = DrawList::new();
         ImageButton::sprite(ID).bare().enabled(false).draw(
             rect(),
             &mut disabled,
-            &theme,
+            &StyleResolver::new(&theme),
             &input_at(0.0, 0.0, false, false),
         );
         assert!(
@@ -321,7 +333,7 @@ mod tests {
         assert!(!ImageButton::sprite(ID).draw(
             Rect::new(0.0, 0.0, 0.0, 50.0),
             &mut list,
-            &theme,
+            &StyleResolver::new(&theme),
             &input
         ));
         assert!(list.icons.is_empty());
@@ -336,7 +348,7 @@ mod tests {
         ImageButton::sprite(ID)
             .bare()
             .tint([1.0, 0.0, 0.0, 1.0])
-            .draw(rect(), &mut list, &theme, &input);
+            .draw(rect(), &mut list, &StyleResolver::new(&theme), &input);
         assert_eq!(list.icons.last().unwrap().tint, [1.0, 0.0, 0.0, 1.0]);
     }
 }

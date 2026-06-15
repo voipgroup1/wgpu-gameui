@@ -13,7 +13,7 @@ use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
     Button, ClickTracker, DragCapture, DragHandle, DragTracker, DrawContext, Dropdown,
     DropdownState, FocusState, FontHandle, InputState, LayerStack, ScrollState, ScrollView,
-    TextAlign, TextBlock, TextInput, Theme, UiContext, UiRenderer,
+    StyleResolver, TextAlign, TextBlock, TextInput, Theme, UiContext, UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -457,7 +457,7 @@ impl ApplicationHandler for App {
                 ScrollView::new(scroll_viewport).vertical_only().draw(
                     &mut self.state.scroll,
                     list,
-                    &self.theme,
+                    &StyleResolver::new(&self.theme),
                     &mut base_input,
                     |list, vp| {
                         for i in 0..30usize {
@@ -705,7 +705,7 @@ impl ApplicationHandler for App {
                 if let Some((id, idx)) = self.state.dropdowns.draw_open_layer(
                     &mut layers,
                     dropdown_popup,
-                    &self.theme,
+                    &StyleResolver::new(&self.theme),
                     &self.input,
                 ) {
                     if id == DROPDOWN_ID {
