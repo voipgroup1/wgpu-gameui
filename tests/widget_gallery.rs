@@ -16,7 +16,8 @@ use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList, Dropdown,
     DropdownState, Easing, FocusState, HitZone, ImageButton, ImageFit, InputState, LayerStack, List,
     ListItem, ListState, NumberInput, ProgressBar, RadioGroup, ScrollState, ScrollView,
-    SelectionMode, Slider, StyleKey, StyleOverlay, StyleResolver, Table, TableCell, TableColumn,
+    SelectionMode, Separator, Slider, StyleKey, StyleOverlay, StyleResolver, Table, TableCell,
+    TableColumn,
     Tabs, TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer,
     TreeAction, TreeNode, TreeState, UiContext, UiRenderer, UiState, ease, lerp_color,
 };
@@ -1308,6 +1309,44 @@ fn render_widget_gallery() {
             for rc in res.children() {
                 list.rounded_rect(rc, 4.0, [0.30, 0.55, 0.90, 1.0]);
             }
+        }
+
+        // --- Separators / dividers -----------------------------------------
+        // Thin rules, centered in their cell. Defaults pull thickness from the
+        // theme border width and color from the panel-border; the third row
+        // overrides both. The vertical demo splits a cell into two columns.
+        flow.section(list, "Separator / divider");
+        {
+            let style = StyleResolver::new(&theme);
+
+            // Plain horizontal rule (theme defaults), centered in a tall cell.
+            let r = flow.cell(list, "horizontal", 200.0, 20.0);
+            Separator::horizontal().draw(r, list, &style);
+
+            // Inset horizontal rule between two faux text lines.
+            let r = flow.cell(list, "inset 16px", 200.0, 40.0);
+            list.text(TextBlock::new("above", r.x, r.y).with_size(13.0));
+            Separator::horizontal()
+                .with_inset(16.0)
+                .draw(Rect::new(r.x, r.y + 18.0, r.width, 4.0), list, &style);
+            list.text(TextBlock::new("below", r.x, r.y + 24.0).with_size(13.0));
+
+            // Thick accent rule (overridden thickness + color).
+            let r = flow.cell(list, "thick accent", 200.0, 20.0);
+            Separator::horizontal()
+                .with_thickness(4.0)
+                .with_color(theme.accent)
+                .draw(r, list, &style);
+
+            // Vertical divider splitting a cell into two columns.
+            let r = flow.cell(list, "vertical", 120.0, 48.0);
+            list.text(TextBlock::new("L", r.x + 16.0, r.y + 16.0).with_size(13.0));
+            Separator::vertical().with_inset(6.0).draw(
+                Rect::new(r.x + r.width * 0.5 - 2.0, r.y, 4.0, r.height),
+                list,
+                &style,
+            );
+            list.text(TextBlock::new("R", r.x + r.width - 28.0, r.y + 16.0).with_size(13.0));
         }
 
         // --- Hover animation (easing) --------------------------------------

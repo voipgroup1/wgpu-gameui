@@ -208,7 +208,15 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       InputState` (it consumes the wheel), not a `DrawContext`. No `UiContext`
       façade yet (raw widget first, as Tree shipped).
 - [ ] **P2 — Color picker.**
-- [ ] **P2 — Separator / divider.**
+- [x] **P2 — Separator / divider.** `Separator` (`src/widgets/separator.rs`)
+      + `Orientation { Horizontal, Vertical }`. Stateless, non-interactive: draws
+      through a `&StyleResolver` like `Panel` (no `DrawContext`). Builder:
+      `Separator::horizontal()`/`vertical()` then `.with_thickness(px)` /
+      `.with_color([f32;4])` / `.with_inset(px)`; `.draw(rect, list, style)`. The
+      rule is centered on its cross axis within the given `Rect` (hand it a taller
+      cell and it sits mid-line), inset trims both ends, and length ≤ 0 draws
+      nothing. Defaults are theme-relative: thickness = `StyleKey::BorderWidth`
+      (min 1px), color = `StyleKey::PanelBorder`.
 - [ ] **P2 — Toast / notification / banner.**
 - [ ] **P2 — Group / titled panel** (workshop equivalent of `UiWindow`).
 - [x] **P1 — Tooltip hover delay actually works.** `TooltipLayer::tick(dt,
