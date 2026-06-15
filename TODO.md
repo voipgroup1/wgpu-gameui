@@ -471,9 +471,12 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `register_style(name, value)` landed: `Theme::register_style(&mut self,
       name, StyleValue)` + `Theme::style(name) -> Option<StyleValue>` store/read
       custom keys by name-hash (and `StyleOverlay` can carry them per-subtree).
-      `register_widget(name, draw_fn)` is **deferred** — widgets have
-      heterogeneous signatures and there's no uniform draw-fn contract yet;
-      designing that trait/registry is its own task.
+      `register_widget(name, draw_fn)` is **deferred until Lua integration**
+      (decision 2026-06) — widgets have heterogeneous signatures and there's no
+      uniform draw-fn contract yet, and the right shape is hard to know without a
+      concrete modding consumer driving the requirements. Design it against a
+      real `register_widget` call site (the Lua binding layer) rather than in the
+      abstract.
 - [x] **P1 — `UiMakeInteractive` / hit-zones independent of draw** for
       sensors over 3D things. `HitZone` (`src/widgets/hit_zone.rs`) is the
       deliberate draw-free widget: `HitZone::new().test(rect, &input) ->
