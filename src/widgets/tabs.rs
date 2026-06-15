@@ -2,7 +2,7 @@
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::{InputState, StyleKey, StyleResolver};
+use crate::{AnimSlot, AnimationState, Easing, InputState, StyleKey, StyleResolver};
 
 use super::DrawList;
 
@@ -27,6 +27,11 @@ pub struct TabsOutput {
 pub struct Tabs<'a> {
     labels: &'a [&'a str],
     tab_height: f32,
+    /// Base id for per-tab animation. When set (and an
+    /// [`AnimationState`] is passed to [`draw`](Self::draw)), each tab's
+    /// background and label color ease between active/hover/inactive states under
+    /// the sub-key `base_id.wrapping_add(tab_index)`.
+    anim_id: Option<u64>,
 }
 
 impl<'a> Tabs<'a> {
@@ -34,11 +39,21 @@ impl<'a> Tabs<'a> {
         Self {
             labels,
             tab_height: 28.0,
+            anim_id: None,
         }
     }
 
     pub fn with_height(mut self, height: f32) -> Self {
         self.tab_height = height;
+        self
+    }
+
+    /// Smooth each tab's background + label color transitions, keyed off `base_id`
+    /// (per-tab sub-key `base_id.wrapping_add(i)`). Requires an
+    /// [`AnimationState`] passed to [`draw`](Self::draw); a no-op (byte-identical)
+    /// otherwise. `base_id` must be stable across frames.
+    pub fn animated(mut self, base_id: u64) -> Self {
+        self.anim_id = Some(base_id);
         self
     }
 
@@ -51,7 +66,9 @@ impl<'a> Tabs<'a> {
         list: &mut DrawList,
         style: &StyleResolver,
         input: &InputState,
+        mut anim: Option<&mut AnimationState>,
     ) -> TabsOutput {
+        let duration = style.scalar(StyleKey::AnimationDuration);
         let tab_count = self.labels.len();
         if tab_count == 0 {
             return TabsOutput {
@@ -86,13 +103,24 @@ impl<'a> Tabs<'a> {
                 clicked = Some(i);
             }
 
-            // Tab background
-            let bg_color = if is_active {
+            // Tab background — resolve the discrete target, then ease toward it
+            // (no-op without an AnimationState/anim_id → byte-identical).
+            let target_bg = if is_active {
                 style.color(StyleKey::TabActive)
             } else if is_hovered {
                 style.color(StyleKey::TabHover)
             } else {
                 style.color(StyleKey::TabInactive)
+            };
+            let bg_color = match (self.anim_id, anim.as_deref_mut()) {
+                (Some(base), Some(a)) => a.animate_color(
+                    base.wrapping_add(i as u64),
+                    AnimSlot::Bg,
+                    target_bg,
+                    duration,
+                    Easing::EaseOut,
+                ),
+                _ => target_bg,
             };
             list.quad(tab_x, rect.y, tab_width, self.tab_height, bg_color);
 
@@ -118,11 +146,21 @@ impl<'a> Tabs<'a> {
                 );
             }
 
-            // Tab label (centered)
-            let text_color = if is_active {
+            // Tab label (centered) — eased between active/inactive text colors.
+            let target_text = if is_active {
                 style.color(StyleKey::TextHighlight)
             } else {
                 style.color(StyleKey::Text)
+            };
+            let text_color = match (self.anim_id, anim.as_deref_mut()) {
+                (Some(base), Some(a)) => a.animate_color(
+                    base.wrapping_add(i as u64),
+                    AnimSlot::Text,
+                    target_text,
+                    duration,
+                    Easing::EaseOut,
+                ),
+                _ => target_text,
             };
             let font_size = style.scalar(StyleKey::FontSize) * 0.8;
             let text_y = list.vcentered_text_y(
@@ -159,5 +197,112 @@ impl<'a> Tabs<'a> {
             clicked,
             rect: bar_rect,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Theme;
+
+    const W: f32 = 240.0;
+    const H: f32 = 100.0;
+    const TAB_H: f32 = 28.0;
+
+    fn rect() -> Rect {
+        Rect::new(0.0, 0.0, W, H)
+    }
+
+    fn idle() -> InputState {
+        InputState {
+            mouse_x: -1.0,
+            mouse_y: -1.0,
+            ..Default::default()
+        }
+    }
+
+    /// Background fill of tab `i` (the full-size bg quad at that tab's x, height
+    /// `TAB_H` — distinguishes it from the 2px indicator and 1px separators).
+    fn tab_bg(list: &DrawList, i: usize, tab_width: f32) -> [f32; 4] {
+        let tab_x = i as f32 * tab_width;
+        list.chrome_instances
+            .iter()
+            .find(|c| {
+                (c.rect[0] - tab_x).abs() < 0.01
+                    && (c.rect[2] - tab_width).abs() < 0.01
+                    && (c.rect[3] - TAB_H).abs() < 0.01
+            })
+            .map(|c| c.bg)
+            .expect("tab should emit a background quad")
+    }
+
+    #[test]
+    fn animated_without_state_is_byte_identical() {
+        let theme = Theme::default();
+        let s = StyleResolver::new(&theme);
+        let labels = ["A", "B", "C"];
+        let tab_width = W / 3.0;
+
+        let mut plain = DrawList::new();
+        Tabs::new(&labels).draw(rect(), 0, &mut plain, &s, &idle(), None);
+        let mut anim = DrawList::new();
+        Tabs::new(&labels)
+            .animated(100)
+            .draw(rect(), 0, &mut anim, &s, &idle(), None);
+
+        for i in 0..3 {
+            assert_eq!(tab_bg(&plain, i, tab_width), tab_bg(&anim, i, tab_width));
+        }
+    }
+
+    #[test]
+    fn animated_active_bg_eases_on_switch() {
+        let theme = Theme::default();
+        let s = StyleResolver::new(&theme);
+        let labels = ["A", "B", "C"];
+        let tab_width = W / 3.0;
+        let mut state = AnimationState::new();
+
+        // Frame 1: tab 0 active → tab 1 settles at TabInactive.
+        let mut l1 = DrawList::new();
+        Tabs::new(&labels)
+            .animated(100)
+            .draw(rect(), 0, &mut l1, &s, &idle(), Some(&mut state));
+        assert_eq!(tab_bg(&l1, 1, tab_width), theme.tab_inactive);
+
+        // Tick a partial dt, switch active to tab 1: its bg eases toward TabActive.
+        state.tick(0.04);
+        let mut l2 = DrawList::new();
+        Tabs::new(&labels)
+            .animated(100)
+            .draw(rect(), 1, &mut l2, &s, &idle(), Some(&mut state));
+        let bg = tab_bg(&l2, 1, tab_width);
+        let (lo, hi) = (
+            theme.tab_inactive[0].min(theme.tab_active[0]),
+            theme.tab_inactive[0].max(theme.tab_active[0]),
+        );
+        assert!(
+            bg[0] > lo && bg[0] < hi,
+            "mid-transition tab bg {} should be strictly between {} and {}",
+            bg[0],
+            lo,
+            hi
+        );
+    }
+
+    #[test]
+    fn animated_first_frame_is_target_no_pop() {
+        let theme = Theme::default();
+        let s = StyleResolver::new(&theme);
+        let labels = ["A", "B", "C"];
+        let tab_width = W / 3.0;
+        let mut state = AnimationState::new();
+
+        // First sight: active tab 1 draws TabActive directly (no fade-in).
+        let mut l = DrawList::new();
+        Tabs::new(&labels)
+            .animated(100)
+            .draw(rect(), 1, &mut l, &s, &idle(), Some(&mut state));
+        assert_eq!(tab_bg(&l, 1, tab_width), theme.tab_active);
     }
 }

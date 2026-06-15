@@ -48,6 +48,12 @@ pub struct Theme {
     pub button_height: f32,
     pub input_height: f32,
 
+    /// Hover/press transition duration in seconds. `0.0` disables animation
+    /// (colors switch instantly). Read by widgets via
+    /// [`StyleKey::AnimationDuration`](crate::StyleKey::AnimationDuration) so a
+    /// [`StyleOverlay`](crate::StyleOverlay) can retune or disable it per subtree.
+    pub animation_duration: f32,
+
     /// UI-wide default font. `None` resolves to the default sans-serif (the
     /// bundled Noto Sans when the `bundled-font` feature is on, else the system
     /// sans-serif). Set to a loaded [`FontHandle`] to theme all widget text in a
@@ -105,6 +111,7 @@ impl Default for Theme {
             font_size_title: 28.0,
             button_height: 44.0,
             input_height: 40.0,
+            animation_duration: 0.12,
 
             font: None,
             custom: CustomStyles::default(),
@@ -170,6 +177,16 @@ mod tests {
     }
 
     #[test]
+    fn animation_duration_default_and_keyed_access() {
+        let theme = Theme::default();
+        assert_eq!(theme.animation_duration, 0.12);
+        assert_eq!(
+            theme.get(StyleKey::AnimationDuration).unwrap().as_scalar().unwrap(),
+            0.12
+        );
+    }
+
+    #[test]
     fn theme_font_applies_to_text_and_title() {
         let mut theme = Theme::default();
         theme.font = Some(FontHandle("Noto Sans".to_string()));
@@ -226,6 +243,7 @@ impl Theme {
             FontSizeTitle => StyleValue::Scalar(self.font_size_title),
             ButtonHeight => StyleValue::Scalar(self.button_height),
             InputHeight => StyleValue::Scalar(self.input_height),
+            AnimationDuration => StyleValue::Scalar(self.animation_duration),
             // Custom namespace
             Custom(id) => return self.custom.get(&id).copied(),
         };
@@ -276,6 +294,7 @@ impl Theme {
             (FontSizeTitle, StyleValue::Scalar(s)) => self.font_size_title = s,
             (ButtonHeight, StyleValue::Scalar(s)) => self.button_height = s,
             (InputHeight, StyleValue::Scalar(s)) => self.input_height = s,
+            (AnimationDuration, StyleValue::Scalar(s)) => self.animation_duration = s,
             (k, v) => debug_assert!(
                 false,
                 "Theme::set shape mismatch for {k:?}: built-in key got {v:?}"

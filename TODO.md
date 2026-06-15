@@ -417,8 +417,29 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       StyleValue>` map holds mod-defined keys. `StyleKey::custom(name)` addresses
       them by FNV-1a name-hash (no global interner). A custom widget can carry
       its own keys via an overlay or `Theme::register_style`.
-- [ ] **P1 — Hover/press animation clock + transitions / easing.** Today
-      colors switch immediately.
+- [x] **P1 — Hover/press animation clock + transitions / easing.**
+      egui-style "animate toward the resolved color": each frame a widget
+      resolves its discrete target color and the clock eases the *displayed*
+      color toward it, re-basing when the target changes (no muddy multi-state
+      blend). `src/animation.rs`: `AnimationState` (caller-owned, dt-driven,
+      keyed by `(u64 id, AnimSlot)`), `Easing{Linear,EaseIn,EaseOut,EaseInOut}`,
+      and public `ease`/`lerp`/`lerp_color` (endpoint-snapping). Duration is a
+      themeable scalar — `Theme::animation_duration` (default `0.12`) /
+      `StyleKey::AnimationDuration`, overridable per-subtree via `StyleOverlay`;
+      `0.0` snaps. Seam: `DrawContext::with_animations(&mut AnimationState)` +
+      `ctx.animate_color(id, slot, target)` / `animate_scalar(...)` (resolve
+      duration, ease-out; return `target` unchanged when no state is attached →
+      byte-identical to the instant path). Raw widgets opt in with `.animated(id)`
+      — adopted in **Button** (bg + border), **Checkbox** (box fill + hover
+      overlay alpha), **Tabs** (per-tab bg + label, sub-key
+      `base_id.wrapping_add(i)`). Façade auto-wires it: `UiState.anim` ticked by
+      `begin_frame(input, theme, dt)`, and `text_button`/`checkbox` pass
+      `.animated(auto_id)` + the shared state, so interactive-mode apps get
+      hover/press easing for free. Hard invariant held: with no state (or
+      `dt`/`duration == 0`) every drawn value is byte-identical, so existing
+      tests + the gallery stayed green. Gallery: "Hover animation (easing)" ramp
+      samples the ease-out curve at t∈{0,.25,.5,.75,1}. Other raw widgets adopt
+      the same `.animated(id)` pattern as needed.
 - [ ] **P2 — Theme stack** (push tint/color), tied to A5/D8 above.
 - [ ] **P2 — Move semantic policy out of theme.** `progress_fill`/`_low`
       colors encode "low = red"; should be a thresholds struct or callback.
@@ -441,7 +462,11 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `projection::world_to_screen`/`world_to_screen_na` project a world
       point to UI pixel space (None behind the camera).
 - [ ] **P1 — UI sound hooks.** `UiSound`/`UiSoundLoop` and button
-      hover/press sounds.
+      hover/press sounds. **Deferred to the integrating app** (decision
+      2026-06): this library is render-only and has no audio backend, so the
+      app owns sound — it already gets the interaction edges it needs from the
+      widget return values + `HitZoneOutput` (`clicked`/`pressed`/`hovered`/…)
+      to trigger its own SFX. Re-open only if a built-in hook proves necessary.
 - [~] **P1 — Mod-friendly registration** of custom widgets/styles.
       `register_style(name, value)` landed: `Theme::register_style(&mut self,
       name, StyleValue)` + `Theme::style(name) -> Option<StyleValue>` store/read

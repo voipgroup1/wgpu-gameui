@@ -18,7 +18,7 @@
 
 use crate::layout::Rect;
 use crate::text::{TextAlign, TextBlock};
-use crate::{StyleKey, StyleResolver};
+use crate::{AnimSlot, StyleKey, StyleResolver};
 
 use super::{DrawContext, DrawList, FocusId};
 
@@ -65,6 +65,21 @@ pub(crate) fn draw_chrome(
         s.color(StyleKey::ButtonBorder)
     };
     let border_width = s.scalar(StyleKey::BorderWidth);
+    draw_chrome_colors(list, rect, radius, bg, border_color, border_width);
+}
+
+/// Low-level chrome draw from already-resolved colors — the animation-aware path
+/// ([`Button::draw`]) computes eased `bg`/`border_color` and calls this directly,
+/// while [`draw_chrome`] resolves them discretely for the un-animated callers
+/// (e.g. [`ImageButton`](super::ImageButton)).
+pub(crate) fn draw_chrome_colors(
+    list: &mut DrawList,
+    rect: Rect,
+    radius: f32,
+    bg: [f32; 4],
+    border_color: [f32; 4],
+    border_width: f32,
+) {
     // One instanced SDF rounded-rect carries fill + border. When the border is
     // disabled (`border_width == 0`) a transparent border color collapses the
     // SDF to a plain fill. `chrome_rect` falls back to immediate tessellation
@@ -138,6 +153,10 @@ pub struct Button {
     /// When set, the button joins the Tab ring under this [`FocusId`] and can be
     /// activated by Space/Enter while focused.
     focus_id: Option<FocusId>,
+    /// When set (and the [`DrawContext`] carries an `AnimationState`), the
+    /// button's chrome fill + border ease between states under this id instead
+    /// of switching instantly.
+    anim_id: Option<u64>,
 }
 
 impl Button {
@@ -149,7 +168,18 @@ impl Button {
             chrome: true,
             radius: None,
             focus_id: None,
+            anim_id: None,
         }
+    }
+
+    /// Animate the chrome fill + border transitions under `id` (hover/press fade
+    /// in/out over [`Theme::animation_duration`](crate::Theme::animation_duration)).
+    /// Only takes effect when the [`DrawContext`] has an
+    /// [`AnimationState`](crate::AnimationState) attached; otherwise the button
+    /// switches instantly as before. `id` must be stable across frames.
+    pub fn animated(mut self, id: u64) -> Self {
+        self.anim_id = Some(id);
+        self
     }
 
     /// Override the chrome corner radius (default: [`Theme::border_radius`]). Use
@@ -201,12 +231,31 @@ impl Button {
             pressed,
         };
 
+        // `styles()` returns an 'a-lifetimed resolver that borrows nothing of
+        // `ctx`, so it stays valid across the `&mut self` `animate_color` calls
+        // below and the later `&mut *ctx.draw_list` borrow.
         let s = ctx.styles();
+        let radius = self.radius.unwrap_or_else(|| s.scalar(StyleKey::BorderRadius));
+        // Resolve discrete target colors, then ease toward them (no-op without an
+        // AnimationState/anim_id → returns the target unchanged, byte-identical).
+        let target_bg = v.bg_color(&s);
+        let target_border = if v.hovered && v.enabled {
+            s.color(StyleKey::Accent)
+        } else {
+            s.color(StyleKey::ButtonBorder)
+        };
+        let border_width = s.scalar(StyleKey::BorderWidth);
+        let (bg, border) = match self.anim_id {
+            Some(id) => (
+                ctx.animate_color(id, AnimSlot::Bg, target_bg),
+                ctx.animate_color(id, AnimSlot::Border, target_border),
+            ),
+            None => (target_bg, target_border),
+        };
         {
             let list = &mut *ctx.draw_list;
             if self.chrome {
-                let radius = self.radius.unwrap_or_else(|| s.scalar(StyleKey::BorderRadius));
-                draw_chrome(list, &s, rect, radius, &v);
+                draw_chrome_colors(list, rect, radius, bg, border, border_width);
             } else {
                 draw_bare_overlay(list, rect, &v);
             }
@@ -589,5 +638,114 @@ mod tests {
             !Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input)),
             "mouse_consumed must suppress the click"
         );
+    }
+
+    #[test]
+    fn animated_without_state_is_byte_identical() {
+        // `.animated(id)` with no AnimationState threaded must draw exactly the
+        // un-animated fill — the back-compat safety net.
+        let theme = Theme::default();
+        let input = input_at(0.0, 0.0, false, false);
+        let mut plain = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go").draw(rect(), &mut with_ctx(&mut plain, &mut focus, &theme, &input));
+        let mut anim = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go")
+            .animated(1)
+            .draw(rect(), &mut with_ctx(&mut anim, &mut focus, &theme, &input));
+        assert_eq!(plain.chrome_instances[0].bg, anim.chrome_instances[0].bg);
+        assert_eq!(
+            plain.chrome_instances[0].border,
+            anim.chrome_instances[0].border
+        );
+    }
+
+    #[test]
+    fn animated_first_frame_is_target_no_pop() {
+        // First sight of a hovered animated button must draw the hover color
+        // directly (no fade-in from a stale/zero start).
+        use crate::AnimationState;
+        let theme = Theme::default();
+        let hover = input_at(50.0, 25.0, false, false);
+        let mut state = AnimationState::new();
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go").animated(1).draw(
+            rect(),
+            &mut DrawContext::new(&mut list, &mut focus, &theme, &hover, 800.0, 600.0)
+                .with_animations(&mut state),
+        );
+        assert_eq!(list.chrome_instances[0].bg, theme.button_hover);
+    }
+
+    #[test]
+    fn animated_mid_transition_is_between_states() {
+        // idle frame settles the bg at `button`; a subsequent hover frame at
+        // dt < duration must land strictly between `button` and `button_hover`.
+        use crate::AnimationState;
+        let theme = Theme::default();
+        let idle = input_at(0.0, 0.0, false, false);
+        let hover = input_at(50.0, 25.0, false, false);
+        let mut state = AnimationState::new();
+
+        // Frame 1: idle, settles at `button`.
+        let mut l1 = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go").animated(1).draw(
+            rect(),
+            &mut DrawContext::new(&mut l1, &mut focus, &theme, &idle, 800.0, 600.0)
+                .with_animations(&mut state),
+        );
+        assert_eq!(l1.chrome_instances[0].bg, theme.button);
+
+        // Tick a partial dt (< 0.12 default), then draw a hover frame.
+        state.tick(0.04);
+        let mut l2 = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go").animated(1).draw(
+            rect(),
+            &mut DrawContext::new(&mut l2, &mut focus, &theme, &hover, 800.0, 600.0)
+                .with_animations(&mut state),
+        );
+        let bg = l2.chrome_instances[0].bg;
+        // Channel 0: button (0.2-ish) → button_hover; must be strictly between.
+        let (lo, hi) = (theme.button[0], theme.button_hover[0]);
+        let (lo, hi) = (lo.min(hi), lo.max(hi));
+        assert!(
+            bg[0] > lo && bg[0] < hi,
+            "mid-transition bg {} should be strictly between {} and {}",
+            bg[0],
+            lo,
+            hi
+        );
+    }
+
+    #[test]
+    fn animated_zero_duration_snaps() {
+        // animation_duration == 0 disables easing: hover draws the target at once.
+        use crate::AnimationState;
+        let mut theme = Theme::default();
+        theme.animation_duration = 0.0;
+        let idle = input_at(0.0, 0.0, false, false);
+        let hover = input_at(50.0, 25.0, false, false);
+        let mut state = AnimationState::new();
+
+        let mut l1 = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go").animated(1).draw(
+            rect(),
+            &mut DrawContext::new(&mut l1, &mut focus, &theme, &idle, 800.0, 600.0)
+                .with_animations(&mut state),
+        );
+        state.tick(0.001);
+        let mut l2 = DrawList::new();
+        let mut focus = FocusState::new();
+        Button::new("Go").animated(1).draw(
+            rect(),
+            &mut DrawContext::new(&mut l2, &mut focus, &theme, &hover, 800.0, 600.0)
+                .with_animations(&mut state),
+        );
+        assert_eq!(l2.chrome_instances[0].bg, theme.button_hover);
     }
 }

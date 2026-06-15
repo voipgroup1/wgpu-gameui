@@ -55,7 +55,7 @@ pub use text_input::TextInput;
 pub use tooltip::{TooltipContent, TooltipLayer};
 pub use tree::{TreeAction, TreeIcon, TreeId, TreeNode, TreeNodeOutput, TreeState};
 
-use crate::{InputState, StyleKey, StyleOverlay, StyleResolver, Theme};
+use crate::{AnimSlot, AnimationState, Easing, InputState, StyleKey, StyleOverlay, StyleResolver, Theme};
 
 /// Context for drawing UI elements.
 ///
@@ -84,6 +84,13 @@ pub struct DrawContext<'a> {
     /// cloning the theme. Widgets read styles through [`color`](Self::color) /
     /// [`scalar`](Self::scalar), which consult this first.
     pub style: Option<&'a StyleOverlay>,
+    /// Optional caller-owned animation clock for smoothing hover/press color
+    /// transitions. `None` (the default) makes every state change instant
+    /// (byte-identical to the un-animated path); set via
+    /// [`with_animations`](Self::with_animations). Widgets that take a stable id
+    /// read eased values through [`animate_color`](Self::animate_color) /
+    /// [`animate_scalar`](Self::animate_scalar).
+    pub animations: Option<&'a mut AnimationState>,
 }
 
 impl<'a> DrawContext<'a> {
@@ -105,6 +112,7 @@ impl<'a> DrawContext<'a> {
             screen_height,
             active_layer: None,
             style: None,
+            animations: None,
         }
     }
 
@@ -115,6 +123,41 @@ impl<'a> DrawContext<'a> {
     pub fn with_style(mut self, overlay: &'a StyleOverlay) -> Self {
         self.style = Some(overlay);
         self
+    }
+
+    /// Attach a caller-owned [`AnimationState`] so widgets that take a stable id
+    /// ease their hover/press color changes instead of switching instantly.
+    /// Builder-style; chain after [`new`](Self::new). The state must be
+    /// [`tick`](AnimationState::tick)ed once per frame by the caller.
+    pub fn with_animations(mut self, animations: &'a mut AnimationState) -> Self {
+        self.animations = Some(animations);
+        self
+    }
+
+    /// Eased color to draw this frame for `(id, slot)` walking toward `target`,
+    /// using the theme's [`AnimationDuration`](StyleKey::AnimationDuration) and a
+    /// default ease-out curve. Returns `target` unchanged when no
+    /// [`AnimationState`] is attached (so the un-animated path is byte-identical).
+    ///
+    /// Borrow note: this takes `&mut self`, so call it (and store the returned
+    /// value) **before** taking `let list = &mut *ctx.draw_list` — never
+    /// interleave it with a live mutable borrow of `draw_list`.
+    pub fn animate_color(&mut self, id: u64, slot: AnimSlot, target: [f32; 4]) -> [f32; 4] {
+        let duration = self.scalar(StyleKey::AnimationDuration);
+        match self.animations.as_deref_mut() {
+            Some(anim) => anim.animate_color(id, slot, target, duration, Easing::EaseOut),
+            None => target,
+        }
+    }
+
+    /// Scalar counterpart of [`animate_color`](Self::animate_color) (e.g. a hover
+    /// overlay's alpha). Same borrow note applies.
+    pub fn animate_scalar(&mut self, id: u64, slot: AnimSlot, target: f32) -> f32 {
+        let duration = self.scalar(StyleKey::AnimationDuration);
+        match self.animations.as_deref_mut() {
+            Some(anim) => anim.animate_scalar(id, slot, target, duration, Easing::EaseOut),
+            None => target,
+        }
     }
 
     /// A [`StyleResolver`] bound to this context's theme + optional overlay — the

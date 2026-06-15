@@ -40,6 +40,7 @@ pub use text::{
 /// for `TextBlock::with_weight`/`with_style` and the `UiContext` font stack.
 pub use glyphon::{Style, Weight};
 
+mod animation;
 pub mod affine;
 mod click_tracker;
 mod drag_tracker;
@@ -53,6 +54,7 @@ mod ui_context;
 mod widgets;
 
 pub use affine::Affine2;
+pub use animation::{AnimSlot, AnimationState, Easing, ease, lerp, lerp_color};
 pub use click_tracker::{ClickTracker, DEFAULT_DOUBLE_CLICK_THRESHOLD, DEFAULT_HOLD_THRESHOLD};
 pub use drag_tracker::{DEFAULT_DRAG_THRESHOLD, DragTracker};
 pub use layer::{Layer, LayerKind, LayerStack};

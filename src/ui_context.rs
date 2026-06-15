@@ -17,6 +17,7 @@ use crate::style::{StyleKey, StyleOverlay, StyleValue};
 use crate::text::{FontHandle, TextBlock};
 use crate::theme::Theme;
 use crate::widgets::DrawList;
+use crate::animation::AnimationState;
 use crate::widgets::{
     Button, Checkbox, DragCapture, DragId, DrawContext, DropdownState, FocusId, FocusState,
     HitZone, HitZoneOutput, NumberInput, RadioGroup, ScrollState, Slider, TextInput, TreeId,
@@ -168,6 +169,11 @@ pub struct UiState {
     /// Whether the tree's single Tab stop has been registered this frame (so it
     /// joins the Tab ring exactly once even across many tree rows).
     tree_focus_registered: bool,
+    /// Hover/press color-transition clock for animated verbs. Ticked once per
+    /// frame by [`begin_frame`](Self::begin_frame) with the caller-supplied `dt`;
+    /// a `dt` of `0.0` (or `theme.animation_duration == 0`) keeps every verb's
+    /// drawn color instant/byte-identical to the un-animated path.
+    pub anim: AnimationState,
 }
 
 impl UiState {
@@ -178,14 +184,18 @@ impl UiState {
     }
 
     /// Per-frame setup: arm focus navigation for this frame's Tab/Escape/click
-    /// edges and seed the auto-advance gap from the theme. Call before building
-    /// the frame's interactive verbs (mirrors [`InputState::end_frame`] timing).
-    pub fn begin_frame(&mut self, input: &InputState, theme: &Theme) {
+    /// edges, seed the auto-advance gap from the theme, and advance the animation
+    /// clock by `dt` seconds. Call before building the frame's interactive verbs
+    /// (mirrors [`InputState::end_frame`] timing). Pass `0.0` for `dt` to freeze
+    /// animations (e.g. a paused frame or a static render); the eased verbs then
+    /// hold their current value.
+    pub fn begin_frame(&mut self, input: &InputState, theme: &Theme, dt: f32) {
         self.focus.begin_frame(input);
         self.tree.begin_frame(input);
         self.item_gap = theme.spacing;
         self.next_auto_id = 0;
         self.tree_focus_registered = false;
+        self.anim.tick(dt);
     }
 
     /// Per-frame teardown: resolve tree arrow-navigation (gated on the tree
@@ -876,8 +886,16 @@ impl<'a> UiContext<'a> {
                 .state
                 .as_mut()
                 .expect("text_button requires interactive state");
-            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
-            Button::new(label).focusable(fid).draw(local, &mut ctx)
+            // Two disjoint `UiState` fields at once: focus (Tab ring) + anim
+            // (hover/press easing). The eased path reuses `fid` as the anim key.
+            let UiState { focus, anim, .. } = &mut **state;
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"))
+                .with_animations(anim);
+            Button::new(label)
+                .focusable(fid)
+                .animated(fid)
+                .draw(local, &mut ctx)
         };
         self.advance(height);
         clicked
@@ -990,9 +1008,13 @@ impl<'a> UiContext<'a> {
                 .state
                 .as_mut()
                 .expect("checkbox requires interactive state");
-            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
+            let UiState { focus, anim, .. } = &mut **state;
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"))
+                .with_animations(anim);
             Checkbox::new()
                 .focusable(fid)
+                .animated(fid)
                 .draw(checked, label, local, &mut ctx)
         };
         self.advance(height);
@@ -2143,6 +2165,59 @@ mod tests {
     }
 
     #[test]
+    fn animated_text_button_eases_bg_mid_transition() {
+        // The façade auto-wires `.animated(auto_id)` + the shared AnimationState,
+        // so an interactive `text_button` eases its hover fill once `begin_frame`
+        // is ticked with a non-zero dt.
+        let theme = Theme::default();
+        let mut state = UiState::new();
+        // Idle pointer parked far off the button so frame 1 settles at `button`.
+        let idle = InputState {
+            mouse_x: -100.0,
+            mouse_y: -100.0,
+            ..Default::default()
+        };
+
+        // Frame 1: idle, dt = 0 settles the bg at `theme.button`.
+        state.begin_frame(&idle, &theme, 0.0);
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::interactive(&mut list, &idle, &mut state, &theme);
+            ui.text_button("OK", Some(100.0), Some(30.0));
+        }
+        assert_eq!(list.chrome_instances[0].bg, theme.button);
+        state.end_frame();
+
+        // Frame 2: hover the same (call-order-stable) button at dt < duration →
+        // the fill is strictly between `button` and `button_hover`.
+        let hover = InputState {
+            mouse_x: 10.0,
+            mouse_y: 10.0,
+            ..Default::default()
+        };
+        state.begin_frame(&hover, &theme, 0.04);
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::interactive(&mut list, &hover, &mut state, &theme);
+            ui.text_button("OK", Some(100.0), Some(30.0));
+        }
+        let bg = list.chrome_instances[0].bg;
+        state.end_frame();
+
+        let (lo, hi) = (
+            theme.button[0].min(theme.button_hover[0]),
+            theme.button[0].max(theme.button_hover[0]),
+        );
+        assert!(
+            bg[0] > lo && bg[0] < hi,
+            "façade text_button bg {} should be mid-transition between {} and {}",
+            bg[0],
+            lo,
+            hi
+        );
+    }
+
+    #[test]
     fn checkbox_toggles_on_click() {
         let theme = Theme::default();
         let input = click_at(5.0, 5.0); // inside the box (fitted to row height)
@@ -2205,7 +2280,7 @@ mod tests {
         let mut buffer = String::from("ab");
         // Frame 1: click inside to take focus.
         let input1 = click_at(5.0, 5.0);
-        state.begin_frame(&input1, &theme);
+        state.begin_frame(&input1, &theme, 0.0);
         {
             let mut list = DrawList::new();
             let mut ui = UiContext::interactive(&mut list, &input1, &mut state, &theme);
@@ -2215,7 +2290,7 @@ mod tests {
         // Frame 2: type a character while focused.
         let mut input2 = InputState::default();
         input2.text_input = "c".to_string();
-        state.begin_frame(&input2, &theme);
+        state.begin_frame(&input2, &theme, 0.0);
         let changed = {
             let mut list = DrawList::new();
             let mut ui = UiContext::interactive(&mut list, &input2, &mut state, &theme);
@@ -2232,7 +2307,7 @@ mod tests {
         let theme = Theme::default();
         let input = InputState::default();
         let mut state = UiState::new();
-        state.begin_frame(&input, &theme); // seeds item_gap = theme.spacing
+        state.begin_frame(&input, &theme, 0.0); // seeds item_gap = theme.spacing
         let mut list = DrawList::new();
         let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
         let c0 = ui.cursor();
@@ -2251,7 +2326,7 @@ mod tests {
         let theme = Theme::default();
         let input = InputState::default();
         let mut state = UiState::new();
-        state.begin_frame(&input, &theme);
+        state.begin_frame(&input, &theme, 0.0);
         let mut list = DrawList::new();
         {
             let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);

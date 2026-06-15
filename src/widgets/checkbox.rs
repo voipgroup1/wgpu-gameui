@@ -2,7 +2,7 @@
 
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::{SpriteId, StyleKey, StyleResolver};
+use crate::{AnimSlot, SpriteId, StyleKey, StyleResolver};
 
 use super::{DrawContext, DrawList, FocusId};
 
@@ -54,6 +54,10 @@ pub struct Checkbox {
     /// When set, the checkbox joins the Tab ring under this [`FocusId`] and can
     /// be toggled by Space/Enter while focused.
     focus_id: Option<FocusId>,
+    /// When set (and an [`AnimationState`](crate::AnimationState) is attached to
+    /// the context), the box fill and hover highlight ease between states instead
+    /// of switching instantly.
+    anim_id: Option<u64>,
 }
 
 impl Default for Checkbox {
@@ -68,7 +72,17 @@ impl Checkbox {
         Self {
             style: BoxStyle::Vector,
             focus_id: None,
+            anim_id: None,
         }
+    }
+
+    /// Smooth the box fill (check/uncheck) and hover highlight transitions using
+    /// the context's [`AnimationState`](crate::AnimationState), keyed by `id`. A
+    /// no-op when no animation state is attached (byte-identical to the instant
+    /// path). `id` must be stable across frames for the same checkbox.
+    pub fn animated(mut self, id: u64) -> Self {
+        self.anim_id = Some(id);
+        self
     }
 
     /// Make the checkbox keyboard-focusable under `id`: it joins the Tab ring,
@@ -116,10 +130,28 @@ impl Checkbox {
         let size = rect.height;
         let box_rect = Rect::new(rect.x, rect.y, size, size);
 
+        // Resolve animated values *before* borrowing `draw_list` (the
+        // `animate_*` helpers take `&mut ctx`). Without an AnimationState/anim_id
+        // these return their targets unchanged, so geometry is byte-identical:
+        // the unchecked fill stays `InputBackground`, checked stays `Accent`, and
+        // the hover quad is emitted only when its alpha is non-zero.
+        let target_fill = if checked {
+            s.color(StyleKey::Accent)
+        } else {
+            s.color(StyleKey::InputBackground)
+        };
+        let (fill, hover_alpha) = match self.anim_id {
+            Some(id) => (
+                ctx.animate_color(id, AnimSlot::Fill, target_fill),
+                ctx.animate_scalar(id, AnimSlot::Overlay, if hovered { 1.0 } else { 0.0 }) * 0.08,
+            ),
+            None => (target_fill, if hovered { 0.08 } else { 0.0 }),
+        };
+
         {
             let list = &mut *ctx.draw_list;
             match &self.style {
-                BoxStyle::Vector => draw_vector_box(list, &s, box_rect, checked),
+                BoxStyle::Vector => draw_vector_box(list, &s, box_rect, checked, fill),
                 BoxStyle::Sprites {
                     unchecked,
                     checked: checked_id,
@@ -143,9 +175,9 @@ impl Checkbox {
                 }
             }
 
-            // Hover highlight over the box area.
-            if hovered {
-                list.quad(box_rect.x, box_rect.y, size, size, [1.0, 1.0, 1.0, 0.08]);
+            // Hover highlight over the box area (eased alpha when animated).
+            if hover_alpha > 0.0 {
+                list.quad(box_rect.x, box_rect.y, size, size, [1.0, 1.0, 1.0, hover_alpha]);
             }
 
             // Label to the right of the checkbox.
@@ -193,16 +225,17 @@ impl Checkbox {
 
 /// Draw the theme-driven vector checkbox: a rounded box, filled with the accent
 /// color and stamped with a contrast checkmark when `checked`.
-fn draw_vector_box(list: &mut DrawList, s: &StyleResolver, box_rect: Rect, checked: bool) {
+fn draw_vector_box(list: &mut DrawList, s: &StyleResolver, box_rect: Rect, checked: bool, fill: [f32; 4]) {
     let size = box_rect.width.min(box_rect.height);
     let radius = s.scalar(StyleKey::BorderRadius).min(size * 0.3).max(0.0);
     let border = s.scalar(StyleKey::BorderWidth).max(1.0).min(size * 0.5);
 
     if checked {
-        // Filled box in accent + contrasting checkmark.
-        let accent = s.color(StyleKey::Accent);
-        list.rounded_rect(box_rect, radius, accent);
-        let mark = contrast_color(accent);
+        // Filled box (eased toward accent) + contrasting checkmark. The mark
+        // contrast is computed from the resolved accent so it stays crisp through
+        // the fill transition.
+        list.rounded_rect(box_rect, radius, fill);
+        let mark = contrast_color(s.color(StyleKey::Accent));
         let t = (size * 0.14).max(1.5);
         // Tick: down-stroke into the low-left, up-stroke to the high-right.
         let pts = [
@@ -212,8 +245,8 @@ fn draw_vector_box(list: &mut DrawList, s: &StyleResolver, box_rect: Rect, check
         ];
         list.polyline(&pts, t, mark);
     } else {
-        // Empty box: subtle fill + border.
-        list.rounded_rect(box_rect, radius, s.color(StyleKey::InputBackground));
+        // Empty box: subtle fill (eased toward InputBackground) + border.
+        list.rounded_rect(box_rect, radius, fill);
         list.rounded_rect_outline(box_rect, radius, border, s.color(StyleKey::InputBorder));
     }
 }
@@ -442,6 +475,100 @@ mod tests {
         assert!(
             focus.is_focused(5),
             "clicking a focusable checkbox focuses it"
+        );
+    }
+
+    // ---- Animation ----
+
+    /// Find the box-fill chrome instance (the first translate-only rounded rect
+    /// at the box origin).
+    fn box_fill(list: &DrawList) -> [f32; 4] {
+        list.chrome_instances
+            .iter()
+            .find(|c| c.rect[0] == 0.0 && c.rect[1] == 0.0)
+            .map(|c| c.bg)
+            .expect("vector box should emit a fill chrome instance at the origin")
+    }
+
+    #[test]
+    fn animated_without_state_is_byte_identical() {
+        let th = theme();
+        let idle = input_at(-1.0, -1.0);
+        let (plain, _) = draw_cb(&Checkbox::new(), true, "", rect(), &idle);
+        let (anim, _) = draw_cb(&Checkbox::new().animated(1), true, "", rect(), &idle);
+        assert_eq!(box_fill(&plain), box_fill(&anim));
+        // Both checked boxes resolve to the accent fill.
+        assert_eq!(box_fill(&anim), th.accent);
+    }
+
+    #[test]
+    fn animated_fill_eases_between_checked_states() {
+        use crate::AnimationState;
+        let th = theme();
+        let idle = input_at(-1.0, -1.0);
+        let mut state = AnimationState::new();
+
+        // Frame 1: unchecked, settles fill at InputBackground.
+        let mut l1 = DrawList::new();
+        let mut focus = FocusState::new();
+        {
+            let mut ctx = DrawContext::new(&mut l1, &mut focus, &th, &idle, 800.0, 600.0)
+                .with_animations(&mut state);
+            Checkbox::new().animated(1).draw(false, "", rect(), &mut ctx);
+        }
+        assert_eq!(box_fill(&l1), th.input_background);
+
+        // Tick a partial dt then draw checked: fill must be mid-way to accent.
+        state.tick(0.04);
+        let mut l2 = DrawList::new();
+        let mut focus = FocusState::new();
+        {
+            let mut ctx = DrawContext::new(&mut l2, &mut focus, &th, &idle, 800.0, 600.0)
+                .with_animations(&mut state);
+            Checkbox::new().animated(1).draw(true, "", rect(), &mut ctx);
+        }
+        let fill = box_fill(&l2);
+        let (lo, hi) = (th.input_background[0].min(th.accent[0]), th.input_background[0].max(th.accent[0]));
+        assert!(
+            fill[0] > lo && fill[0] < hi,
+            "mid-transition fill {} should be strictly between {} and {}",
+            fill[0],
+            lo,
+            hi
+        );
+    }
+
+    #[test]
+    fn animated_hover_overlay_fades_in() {
+        use crate::AnimationState;
+        let th = theme();
+        let mut state = AnimationState::new();
+
+        // Frame 1: not hovered → overlay alpha settles at 0 (no extra quad).
+        let idle = input_at(-1.0, -1.0);
+        let mut l1 = DrawList::new();
+        let mut focus = FocusState::new();
+        {
+            let mut ctx = DrawContext::new(&mut l1, &mut focus, &th, &idle, 800.0, 600.0)
+                .with_animations(&mut state);
+            Checkbox::new().animated(1).draw(false, "", rect(), &mut ctx);
+        }
+        let base_quads = l1.chrome_instances.len();
+
+        // Tick then hover: overlay quad appears (a translate-only quad records an
+        // extra chrome instance).
+        state.tick(0.04);
+        let hover = input_at(5.0, 10.0);
+        let mut l2 = DrawList::new();
+        let mut focus = FocusState::new();
+        {
+            let mut ctx = DrawContext::new(&mut l2, &mut focus, &th, &hover, 800.0, 600.0)
+                .with_animations(&mut state);
+            Checkbox::new().animated(1).draw(false, "", rect(), &mut ctx);
+        }
+        assert!(
+            l2.chrome_instances.len() > base_quads,
+            "fading-in hover overlay should add quad geometry"
         );
     }
 }

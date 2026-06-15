@@ -14,12 +14,11 @@
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList, Dropdown,
-    DropdownState, FocusState, HitZone, ImageButton, ImageFit, InputState, LayerStack, List, ListItem,
-    ListState, NumberInput, ProgressBar, RadioGroup, ScrollState, ScrollView, SelectionMode, Slider,
-    StyleKey, StyleOverlay, StyleResolver,
-    Table,
-    TableCell, TableColumn, Tabs, TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent,
-    TooltipLayer, TreeAction, TreeNode, TreeState, UiContext, UiRenderer, UiState,
+    DropdownState, Easing, FocusState, HitZone, ImageButton, ImageFit, InputState, LayerStack, List,
+    ListItem, ListState, NumberInput, ProgressBar, RadioGroup, ScrollState, ScrollView,
+    SelectionMode, Slider, StyleKey, StyleOverlay, StyleResolver, Table, TableCell, TableColumn,
+    Tabs, TextAlign, TextBlock, TextInput, TextSpan, Theme, TooltipContent, TooltipLayer,
+    TreeAction, TreeNode, TreeState, UiContext, UiRenderer, UiState, ease, lerp_color,
 };
 #[cfg(feature = "phosphor-icons")]
 use wgpu_gameui::{Icon, PhosphorIcon};
@@ -610,7 +609,9 @@ fn render_widget_gallery() {
         {
             let r = flow.cell(list, "Stacked verbs", 200.0, 168.0);
             let mut vstate = UiState::new();
-            vstate.begin_frame(&input, &theme);
+            // Static render: dt = 0 freezes the animation clock so the verbs draw
+            // their resolved (settled) colors, keeping the PNG deterministic.
+            vstate.begin_frame(&input, &theme, 0.0);
             let mut buf = String::from("editable");
             // Scope the `ui.translate` to this block: `UiContext::translate`
             // mutates the shared list's transform-stack top in place and is not
@@ -728,7 +729,14 @@ fn render_widget_gallery() {
         );
 
         let r = flow.cell(list, "Tabs", 240.0, 30.0);
-        Tabs::new(&["Tab A", "Tab B", "Tab C"]).draw(r, 0, list, &StyleResolver::new(&theme), &input);
+        Tabs::new(&["Tab A", "Tab B", "Tab C"]).draw(
+            r,
+            0,
+            list,
+            &StyleResolver::new(&theme),
+            &input,
+            None,
+        );
 
         let r = flow.cell(list, "Text input", 200.0, 28.0);
         TextInput::new(r.x, r.y, r.width, r.height)
@@ -1230,6 +1238,27 @@ fn render_widget_gallery() {
                 .with_size(12.0)
                 .with_color(200, 210, 230),
         );
+
+        // --- Hover animation (easing) --------------------------------------
+        // The animation system eases a widget's fill from its idle color toward
+        // the hover color over `theme.animation_duration`. There's no time axis
+        // in a static PNG, so we sample the *same* ease-out curve at five points
+        // t ∈ {0, .25, .5, .75, 1} and paint a Button at each — left = idle fill,
+        // right = full hover fill — using the public `ease`/`lerp_color` through a
+        // per-button `StyleOverlay`. This is exactly the ramp an animated button
+        // walks frame-to-frame on hover.
+        flow.section(list, "Hover animation (easing)");
+        for &t in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let eased = ease(Easing::EaseOut, t);
+            let fill = lerp_color(theme.button, theme.button_hover, eased);
+            let mut ramp = StyleOverlay::new();
+            ramp.set_color(StyleKey::Button, fill);
+            let label = format!("t={t:.2}");
+            let r = flow.cell(list, &label, 90.0, 32.0);
+            let mut rctx = DrawContext::new(list, &mut focus, &theme, &input, W as f32, 600.0)
+                .with_style(&ramp);
+            Button::new(&label).draw(r, &mut rctx);
+        }
 
         // Tooltip target last: its popup floats down-and-right into the empty
         // headroom below, overlapping no other widget.

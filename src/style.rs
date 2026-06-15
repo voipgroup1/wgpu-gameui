@@ -104,6 +104,10 @@ pub enum StyleKey {
     FontSizeTitle,
     ButtonHeight,
     InputHeight,
+    /// Hover/press transition duration in seconds (see
+    /// [`AnimationState`](crate::AnimationState)). `0.0` disables animation
+    /// (instant color switches).
+    AnimationDuration,
     /// A mod-defined key, addressed by the FNV-1a hash of its name (see
     /// [`StyleKey::custom`]). Lives in [`Theme`]'s custom map / a [`StyleOverlay`].
     Custom(u64),
@@ -362,6 +366,7 @@ pub(crate) const SCALAR_KEYS: &[StyleKey] = &[
     StyleKey::FontSizeTitle,
     StyleKey::ButtonHeight,
     StyleKey::InputHeight,
+    StyleKey::AnimationDuration,
 ];
 
 /// Internal helper for [`Theme`]'s custom map type (kept here so the key/value
