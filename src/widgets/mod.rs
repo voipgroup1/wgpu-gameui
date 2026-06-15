@@ -101,6 +101,13 @@ pub struct DrawContext<'a> {
     /// read eased values through [`animate_color`](Self::animate_color) /
     /// [`animate_scalar`](Self::animate_scalar).
     pub animations: Option<&'a mut AnimationState>,
+    /// Optional caller-owned cursor-request accumulator. `None` (the default)
+    /// makes [`request_cursor`](Self::request_cursor) a no-op; set via
+    /// [`with_cursor`](Self::with_cursor) so hovered widgets can ask for an
+    /// I-beam / hand / grab cursor. The application reads the resolved
+    /// [`CursorIcon`](crate::CursorIcon) after the frame and applies it to its
+    /// window.
+    pub cursor: Option<&'a mut crate::CursorState>,
 }
 
 impl<'a> DrawContext<'a> {
@@ -123,6 +130,7 @@ impl<'a> DrawContext<'a> {
             active_layer: None,
             style: None,
             animations: None,
+            cursor: None,
         }
     }
 
@@ -142,6 +150,27 @@ impl<'a> DrawContext<'a> {
     pub fn with_animations(mut self, animations: &'a mut AnimationState) -> Self {
         self.animations = Some(animations);
         self
+    }
+
+    /// Attach a caller-owned [`CursorState`](crate::CursorState) so hovered
+    /// widgets can request an OS cursor shape (I-beam over text, hand over
+    /// buttons, grab over drag handles). Builder-style; chain after
+    /// [`new`](Self::new). The caller [`begin_frame`](crate::CursorState::begin_frame)s
+    /// it before drawing and applies [`resolve`](crate::CursorState::resolve)
+    /// to its window afterwards.
+    pub fn with_cursor(mut self, cursor: &'a mut crate::CursorState) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    /// Request an OS cursor shape for this frame on behalf of a hovered widget.
+    /// No-op when no [`CursorState`](crate::CursorState) is attached (so the
+    /// un-wired path is unaffected). Conflicts are arbitrated by
+    /// [`CursorState::request`](crate::CursorState::request).
+    pub fn request_cursor(&mut self, icon: crate::CursorIcon) {
+        if let Some(cursor) = self.cursor.as_deref_mut() {
+            cursor.request(icon);
+        }
     }
 
     /// Eased color to draw this frame for `(id, slot)` walking toward `target`,

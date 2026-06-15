@@ -123,6 +123,9 @@ impl Checkbox {
         // Honor layer capture (`mouse_consumed`) so a checkbox under a
         // modal/popup doesn't react to clicks meant for the overlay.
         let hovered = rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
+        if hovered {
+            ctx.request_cursor(crate::CursorIcon::Pointer);
+        }
         let clicked = hovered && input.mouse_clicked;
         let key_activate = input.enter_pressed || input.key_space;
 

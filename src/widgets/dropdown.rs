@@ -448,6 +448,11 @@ impl<'a> Dropdown<'a> {
         // Register as focusable for Tab nav (scoped to active layer).
         ctx.register_focus(id);
 
+        // Hand cursor over the closed dropdown button (before borrowing ctx).
+        if ctx.input.is_hovered(rect.x, rect.y, rect.width, rect.height) {
+            ctx.request_cursor(crate::CursorIcon::Pointer);
+        }
+
         let s = ctx.styles();
         let list = &mut *ctx.draw_list;
         let input = ctx.input;

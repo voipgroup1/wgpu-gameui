@@ -578,7 +578,19 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       makes it inert. Façade verbs: `UiContext::hit_zone(w, h)` (flow-placed
       cell, auto-advances) and `UiContext::hit_zone_at(rect)` (explicit screen
       rect, no advance) for absolute sensors.
-- [ ] **P2 — Cursor state control** (`UiSetCursorState`, I-beam over text).
+- [x] **P2 — Cursor state control** (`UiSetCursorState`, I-beam over text).
+      Windowing-agnostic `CursorIcon` enum (Default/Pointer/Text/Grab/Grabbing/
+      ResizeHorizontal/ResizeVertical/NotAllowed) + caller-owned `CursorState`
+      accumulator (`request`/`resolve`/`take`/`begin_frame`, priority-arbitrated
+      so an active `Grabbing` beats a stray `Pointer`). Widgets request via a new
+      `DrawContext::with_cursor`/`request_cursor` seam (mirrors `with_animations`;
+      no-op when unset): TextInput/NumberInput field → Text, Button/Checkbox/
+      Dropdown → Pointer, Slider/DragHandle → Grab/Grabbing. The app reads
+      `CursorState::resolve()` after the frame and maps it to its windowing API;
+      `examples/hello_ui.rs` shows the winit `set_cursor` mapping. (Widgets that
+      take raw `list`/`style`/`input` rather than a `DrawContext` — Tabs,
+      ImageButton, the dropdown open-list — and the pure-hit-test HitZone have no
+      seam and are left to the caller.)
 - [ ] **P2 — Backdrop blur** (`UiBlur`) for menu screens.
 - [ ] **Out of scope but don't block:** depth-aware `DrawSprite`/`DrawLine`
       in 3D world space — keep UI overlay vs. world overlay passes

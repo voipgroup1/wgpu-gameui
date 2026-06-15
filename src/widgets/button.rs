@@ -222,6 +222,9 @@ impl Button {
         // clicks meant for the overlay.
         let hovered =
             self.enabled && !input.mouse_consumed && rect.contains(input.mouse_x, input.mouse_y);
+        if hovered {
+            ctx.request_cursor(crate::CursorIcon::Pointer);
+        }
         let pressed = hovered && input.mouse_down;
         let clicked = hovered && input.mouse_clicked;
         let key_activate = input.enter_pressed || input.key_space;
@@ -368,6 +371,40 @@ mod tests {
         assert!(
             !Button::new("Go").draw(rect(), &mut with_ctx(&mut list, &mut focus, &theme, &input))
         );
+    }
+
+    #[test]
+    fn hover_requests_pointer_cursor() {
+        use crate::{CursorIcon, CursorState};
+        let mut list = DrawList::new();
+        let mut focus = FocusState::new();
+        let theme = Theme::default();
+
+        // Hovering an enabled button requests the hand/pointer cursor.
+        let hover = input_at(50.0, 25.0, false, false);
+        let mut cursor = CursorState::new();
+        Button::new("Go").draw(
+            rect(),
+            &mut with_ctx(&mut list, &mut focus, &theme, &hover).with_cursor(&mut cursor),
+        );
+        assert_eq!(cursor.resolve(), CursorIcon::Pointer);
+
+        // Not hovering requests nothing (stays Default).
+        let away = input_at(500.0, 500.0, false, false);
+        let mut cursor = CursorState::new();
+        Button::new("Go").draw(
+            rect(),
+            &mut with_ctx(&mut list, &mut focus, &theme, &away).with_cursor(&mut cursor),
+        );
+        assert_eq!(cursor.resolve(), CursorIcon::Default);
+
+        // A disabled button doesn't request a pointer even when hovered.
+        let mut cursor = CursorState::new();
+        Button::new("Go").enabled(false).draw(
+            rect(),
+            &mut with_ctx(&mut list, &mut focus, &theme, &hover).with_cursor(&mut cursor),
+        );
+        assert_eq!(cursor.resolve(), CursorIcon::Default);
     }
 
     #[test]

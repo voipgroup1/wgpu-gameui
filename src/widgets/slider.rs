@@ -140,6 +140,13 @@ impl Slider {
         }
         let dragging = capture.is_active(id);
 
+        // Cursor: grabbing while scrubbing, grab when hovering the track.
+        if dragging {
+            ctx.request_cursor(crate::CursorIcon::Grabbing);
+        } else if hovered {
+            ctx.request_cursor(crate::CursorIcon::Grab);
+        }
+
         // Calculate new value from mouse position while dragging
         let mut new_value = value;
         if dragging && slide_range > 0.0 {

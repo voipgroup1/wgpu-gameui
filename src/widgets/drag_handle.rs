@@ -156,6 +156,13 @@ impl DragHandle {
         let dragging = capture.is_active(id);
         let released = was_active && !dragging;
 
+        // Cursor: grabbing while dragging, grab when hovering the handle.
+        if dragging {
+            ctx.request_cursor(crate::CursorIcon::Grabbing);
+        } else if hovered {
+            ctx.request_cursor(crate::CursorIcon::Grab);
+        }
+
         // The per-frame movement comes from the caller's DragTracker. It is
         // already `[0,0]` until the gesture crosses the threshold and is zeroed
         // when the pointer is consumed, so applying it only while we own the

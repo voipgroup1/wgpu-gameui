@@ -11,14 +11,31 @@ use std::time::Instant;
 
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
-    Button, ClickTracker, DragCapture, DragHandle, DragTracker, DrawContext, Dropdown,
-    DropdownState, FocusState, FontHandle, InputState, LayerStack, ScrollState, ScrollView,
-    StyleResolver, TextAlign, TextBlock, TextInput, Theme, UiContext, UiRenderer,
+    Button, ClickTracker, CursorIcon, CursorState, DragCapture, DragHandle, DragTracker,
+    DrawContext, Dropdown, DropdownState, FocusState, FontHandle, InputState, LayerStack,
+    ScrollState, ScrollView, StyleResolver, TextAlign, TextBlock, TextInput, Theme, UiContext,
+    UiRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
+
+/// Map the library's windowing-agnostic [`CursorIcon`] to winit's. This is the
+/// one place the application bridges UI cursor requests to the windowing system.
+fn to_winit_cursor(icon: CursorIcon) -> winit::window::CursorIcon {
+    use winit::window::CursorIcon as W;
+    match icon {
+        CursorIcon::Default => W::Default,
+        CursorIcon::Pointer => W::Pointer,
+        CursorIcon::Text => W::Text,
+        CursorIcon::Grab => W::Grab,
+        CursorIcon::Grabbing => W::Grabbing,
+        CursorIcon::ResizeHorizontal => W::EwResize,
+        CursorIcon::ResizeVertical => W::NsResize,
+        CursorIcon::NotAllowed => W::NotAllowed,
+    }
+}
 
 const CHECKER_SIZE: u32 = 32;
 
@@ -365,6 +382,11 @@ impl ApplicationHandler for App {
                 self.drag.update(&mut self.input);
                 self.clicks.update(&mut self.input, t);
 
+                // Per-frame cursor accumulator: hovered widgets request an icon
+                // through their DrawContext; we apply the winner to the window
+                // after drawing. Fresh each frame.
+                let mut frame_cursor = CursorState::new();
+
                 // Build a LayerStack so we can demo modal layers.
                 let mut layers = LayerStack::new();
 
@@ -508,7 +530,8 @@ impl ApplicationHandler for App {
                             &base_input,
                             gpu.config.width as f32,
                             gpu.config.height as f32,
-                        );
+                        )
+                        .with_cursor(&mut frame_cursor);
                         self.state.text_input.draw(TEXT_ID_A, &mut ctx);
                         self.state.text_input2.draw(TEXT_ID_B, &mut ctx);
                     }
@@ -536,7 +559,8 @@ impl ApplicationHandler for App {
                             &base_input,
                             gpu.config.width as f32,
                             gpu.config.height as f32,
-                        );
+                        )
+                        .with_cursor(&mut frame_cursor);
                         if Button::new("Click A")
                             .focusable(BTN_A_ID)
                             .draw(Rect::new(80.0, 390.0, 100.0, 28.0), &mut ctx)
@@ -571,7 +595,8 @@ impl ApplicationHandler for App {
                         &base_input,
                         gpu.config.width as f32,
                         gpu.config.height as f32,
-                    );
+                    )
+                    .with_cursor(&mut frame_cursor);
                     Dropdown::new(&DROPDOWN_ITEMS, self.state.dropdown_sel).draw(
                         DROPDOWN_ID,
                         dd_rect,
@@ -742,7 +767,8 @@ impl ApplicationHandler for App {
                             &base_input,
                             gpu.config.width as f32,
                             gpu.config.height as f32,
-                        );
+                        )
+                        .with_cursor(&mut frame_cursor);
                         DragHandle::bare().draw(
                             DRAG_BOX_ID,
                             &mut self.drag_capture,
@@ -796,6 +822,10 @@ impl ApplicationHandler for App {
                             .with_color(230, 235, 245),
                     );
                 }
+
+                // Apply the cursor requested by whichever widget the pointer is
+                // over this frame (Default if none asked).
+                window.set_cursor(to_winit_cursor(frame_cursor.resolve()));
 
                 let mut encoder =
                     gpu.device

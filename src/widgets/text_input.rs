@@ -632,6 +632,10 @@ impl TextInput {
     /// [`set_clipboard_get`](Self::set_clipboard_get) /
     /// [`set_clipboard_set`](Self::set_clipboard_set) before drawing.
     pub fn draw(&mut self, id: FocusId, ctx: &mut DrawContext) -> bool {
+        // I-beam cursor while hovering the field (before borrowing ctx fields).
+        if ctx.input.is_hovered(self.x, self.y, self.width, self.height) {
+            ctx.request_cursor(crate::CursorIcon::Text);
+        }
         let s = ctx.styles();
         let list = &mut *ctx.draw_list;
         let focus = &mut *ctx.focus;
@@ -1047,6 +1051,43 @@ mod tests {
         assert!(req.x >= 5.0, "caret x within the field");
         assert!(req.y >= 6.0, "caret y within the field");
         assert!(req.height > 0.0, "caret has a height for IME anchoring");
+    }
+
+    #[test]
+    fn hover_requests_text_cursor() {
+        use crate::{CursorIcon, CursorState};
+        let mut ti = TextInput::new(5.0, 6.0, 120.0, 24.0).with_value("hi".to_string());
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+
+        // Pointer over the field → I-beam.
+        let hover = InputState {
+            mouse_x: 30.0,
+            mouse_y: 12.0,
+            ..Default::default()
+        };
+        let mut cursor = CursorState::new();
+        {
+            let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &hover, 800.0, 600.0)
+                .with_cursor(&mut cursor);
+            ti.draw(0, &mut ctx);
+        }
+        assert_eq!(cursor.resolve(), CursorIcon::Text);
+
+        // Pointer elsewhere → no request.
+        let away = InputState {
+            mouse_x: 500.0,
+            mouse_y: 500.0,
+            ..Default::default()
+        };
+        let mut cursor = CursorState::new();
+        {
+            let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &away, 800.0, 600.0)
+                .with_cursor(&mut cursor);
+            ti.draw(0, &mut ctx);
+        }
+        assert_eq!(cursor.resolve(), CursorIcon::Default);
     }
 
     #[test]
