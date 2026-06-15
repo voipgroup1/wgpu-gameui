@@ -449,8 +449,20 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `register_widget(name, draw_fn)` is **deferred** — widgets have
       heterogeneous signatures and there's no uniform draw-fn contract yet;
       designing that trait/registry is its own task.
-- [ ] **P1 — `UiMakeInteractive` / hit-zones independent of draw** for
-      sensors over 3D things.
+- [x] **P1 — `UiMakeInteractive` / hit-zones independent of draw** for
+      sensors over 3D things. `HitZone` (`src/widgets/hit_zone.rs`) is the
+      deliberate draw-free widget: `HitZone::new().test(rect, &input) ->
+      HitZoneOutput` reports `hovered`/`pressed`/`clicked`/`released`/
+      `right_clicked`/`middle_clicked`/`double_clicked`/`held`/`scroll_delta`/
+      `local_pos` over a screen-space `Rect` without touching any `DrawList` — so
+      it lays over regions this UI didn't paint (a 3D viewport, a
+      `world_to_screen` rect). Takes a plain `&InputState` (nothing for a
+      `DrawContext` to carry); honors `InputState::mouse_consumed` for layer
+      capture; reports only (never sets `mouse_consumed`) like the other
+      per-layer widgets — gate world-picking on `!out.hovered`. `.enabled(false)`
+      makes it inert. Façade verbs: `UiContext::hit_zone(w, h)` (flow-placed
+      cell, auto-advances) and `UiContext::hit_zone_at(rect)` (explicit screen
+      rect, no advance) for absolute sensors.
 - [ ] **P2 — Cursor state control** (`UiSetCursorState`, I-beam over text).
 - [ ] **P2 — Backdrop blur** (`UiBlur`) for menu screens.
 - [ ] **Out of scope but don't block:** depth-aware `DrawSprite`/`DrawLine`

@@ -19,8 +19,8 @@ use crate::theme::Theme;
 use crate::widgets::DrawList;
 use crate::widgets::{
     Button, Checkbox, DragCapture, DragId, DrawContext, DropdownState, FocusId, FocusState,
-    NumberInput, RadioGroup, ScrollState, Slider, TextInput, TreeId, TreeNode, TreeNodeOutput,
-    TreeState,
+    HitZone, HitZoneOutput, NumberInput, RadioGroup, ScrollState, Slider, TextInput, TreeId,
+    TreeNode, TreeNodeOutput, TreeState,
 };
 use glyphon::{Style, Weight};
 use std::collections::HashMap;
@@ -883,6 +883,49 @@ impl<'a> UiContext<'a> {
         clicked
     }
 
+    /// Reserve an interactive `w`×`h` region in the layout flow and report its
+    /// pointer interaction — Teardown's `UiMakeInteractive`. Draws **nothing**:
+    /// it only senses hover/click/scroll over the cell, so the caller (or a
+    /// preceding draw verb) owns the pixels. Auto-advances by `h`. `w` defaults
+    /// to [`default_field_width`](Self::default_field_width).
+    ///
+    /// For a fixed-position sensor over something this UI didn't lay out (a 3D
+    /// viewport region, a world-projected label), use [`hit_zone_at`](Self::hit_zone_at).
+    pub fn hit_zone(&mut self, w: Option<f32>, h: f32) -> HitZoneOutput {
+        let (input, _theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return HitZoneOutput::idle(),
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        // place_rect already maps through the active transform into screen space,
+        // and HitZone never re-applies a draw transform, so we test the world
+        // rect against the raw screen-space pointer directly (no `localize`).
+        let world = self.place_rect(width, h);
+        let out = HitZone::new().test(world, input);
+        self.advance(h);
+        out
+    }
+
+    /// Sense pointer interaction over an explicit **screen-space** `rect`,
+    /// independent of the layout flow (no cursor advance, no transform applied).
+    /// The draw-free counterpart for sensors over things this UI didn't draw —
+    /// e.g. a region returned by [`world_to_screen`](crate::projection::world_to_screen)
+    /// sitting over a 3D object. Honors layer capture via
+    /// [`InputState::mouse_consumed`].
+    pub fn hit_zone_at(&self, rect: Rect) -> HitZoneOutput {
+        match self.input {
+            Some(input) => HitZone::new().test(rect, input),
+            None => {
+                debug_assert!(
+                    false,
+                    "hit_zone_at called on a draw-only context; \
+                     construct via UiContext::interactive(...)"
+                );
+                HitZoneOutput::idle()
+            }
+        }
+    }
+
     /// Draw a slider for `value` in `[min, max]` and return the (possibly
     /// updated) value. `id` is a stable per-slider [`DragId`]. `w` defaults to
     /// [`default_field_width`](Self::default_field_width); height is
@@ -1586,6 +1629,48 @@ mod tests {
         ui.clear_style();
         ui.pop();
         // No panic / balanced stack is the invariant under test here.
+    }
+
+    #[test]
+    fn hit_zone_senses_click_without_drawing() {
+        let theme = Theme::default();
+        // Pointer inside the cell that `hit_zone` will place at the origin.
+        let input = InputState {
+            mouse_x: 5.0,
+            mouse_y: 5.0,
+            mouse_down: true,
+            mouse_clicked: true,
+            ..Default::default()
+        };
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let out = {
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            ui.hit_zone(Some(100.0), 40.0)
+        };
+        assert!(out.hovered, "pointer is over the placed zone");
+        assert!(out.clicked, "primary click is reported");
+        assert!(
+            list.vertices.is_empty() && list.chrome_instances.is_empty(),
+            "a hit zone must draw nothing"
+        );
+    }
+
+    #[test]
+    fn hit_zone_at_senses_explicit_screen_rect() {
+        let theme = Theme::default();
+        let input = InputState {
+            mouse_x: 250.0,
+            mouse_y: 250.0,
+            mouse_right_clicked: true,
+            ..Default::default()
+        };
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        let out = ui.hit_zone_at(Rect::new(200.0, 200.0, 100.0, 100.0));
+        assert!(out.hovered);
+        assert!(out.right_clicked);
     }
 
     #[test]

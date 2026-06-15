@@ -14,7 +14,7 @@
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
     Button, Checkbox, ColumnWidth, DragCapture, DragHandle, DrawContext, DrawList, Dropdown,
-    DropdownState, FocusState, ImageButton, ImageFit, InputState, LayerStack, List, ListItem,
+    DropdownState, FocusState, HitZone, ImageButton, ImageFit, InputState, LayerStack, List, ListItem,
     ListState, NumberInput, ProgressBar, RadioGroup, ScrollState, ScrollView, SelectionMode, Slider,
     StyleKey, StyleOverlay, StyleResolver,
     Table,
@@ -1129,6 +1129,69 @@ fn render_widget_gallery() {
             [0.80, 0.90, 0.80, 1.0],
         );
         list.pop_transform();
+
+        // ---- Hit zone (draw-free sensor) --------------------------------
+        // `HitZone` draws NOTHING — it only senses pointer interaction over a
+        // rect (Teardown's UiMakeInteractive), for sensors over things the UI
+        // didn't draw (3D viewports, world-projected regions). The gallery
+        // can't show "nothing", so each cell paints its own outline + a caption
+        // reporting the state `HitZone::test` returns for a synthetic pointer.
+        flow.section(list, "Hit zone (sensor)");
+
+        // Idle: pointer parked far away → not hovered.
+        let r = flow.cell(list, "Idle (no pointer)", 150.0, 44.0);
+        {
+            let away = InputState {
+                mouse_x: -1.0,
+                mouse_y: -1.0,
+                ..InputState::default()
+            };
+            let out = HitZone::new().test(r, &away);
+            list.rounded_rect_outline(r, 4.0, 1.5, [0.40, 0.45, 0.55, 1.0]);
+            list.text(
+                TextBlock::new(
+                    if out.hovered { "hovered" } else { "idle" },
+                    r.x + 10.0,
+                    r.y + 14.0,
+                )
+                .with_size(12.0)
+                .with_color(150, 160, 180),
+            );
+        }
+
+        // Hovered + clicked: synthetic pointer at the cell centre with a click.
+        let r = flow.cell(list, "Hovered + click", 150.0, 44.0);
+        {
+            let over = InputState {
+                mouse_x: r.x + r.width / 2.0,
+                mouse_y: r.y + r.height / 2.0,
+                mouse_down: true,
+                mouse_clicked: true,
+                ..InputState::default()
+            };
+            let out = HitZone::new().test(r, &over);
+            // Highlight to reflect the sensed hover (the widget itself draws
+            // none of this — the gallery does, from the returned state).
+            let glow = if out.hovered {
+                [0.20, 0.55, 0.95, 0.18]
+            } else {
+                [0.0, 0.0, 0.0, 0.0]
+            };
+            list.rounded_rect(r, 4.0, glow);
+            list.rounded_rect_outline(r, 4.0, 1.5, [0.35, 0.65, 1.0, 1.0]);
+            let caption = if out.clicked {
+                "hovered + clicked"
+            } else if out.hovered {
+                "hovered"
+            } else {
+                "idle"
+            };
+            list.text(
+                TextBlock::new(caption, r.x + 10.0, r.y + 14.0)
+                    .with_size(12.0)
+                    .with_color(200, 215, 240),
+            );
+        }
 
         // --- Styling / overrides -------------------------------------------
         // Per-widget restyling with NO theme clone: a scoped `StyleOverlay`

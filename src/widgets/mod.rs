@@ -7,6 +7,7 @@ mod drag_handle;
 mod draw_list;
 mod dropdown;
 mod focus;
+mod hit_zone;
 #[cfg(feature = "phosphor-icons")]
 mod icon;
 mod image;
@@ -36,6 +37,7 @@ pub use draw_list::{
 };
 pub use dropdown::{Dropdown, DropdownId, DropdownOutput, DropdownState};
 pub use focus::{FocusId, FocusState};
+pub use hit_zone::{HitZone, HitZoneOutput};
 #[cfg(feature = "phosphor-icons")]
 pub use icon::Icon;
 pub use image::{Image, ImageAlign, ImageFit};
