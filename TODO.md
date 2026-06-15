@@ -86,7 +86,12 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       glyphs when it's off.
 - [ ] **P2 — Gradient helpers** (linear/radial). Per-vertex color exists but
       no constructor.
-- [ ] **P2 — Text outline / shadow** (`UiTextOutline`, `UiTextShadow`).
+- [x] **P2 — Text outline / shadow** (`UiTextOutline`, `UiTextShadow`). Already
+      shipped via the MSDF text path: `TextBlock::with_outline(r,g,b,a,width_px)`,
+      `with_shadow(r,g,b,a,dx,dy,softness)`, and a bonus `with_glow(r,g,b,a,
+      radius_px)`; backed by `TextOutline`/`TextShadow`/`TextGlow` (all exported).
+      Rendered by the back-to-front glyph sweep in `src/text.rs` (not feature-
+      gated); gallery has Outline/Shadow/Glow demo rows.
 
 ---
 
