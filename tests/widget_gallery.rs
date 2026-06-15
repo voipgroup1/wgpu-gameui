@@ -1414,14 +1414,16 @@ fn render_widget_gallery() {
         {
             let style = StyleResolver::new(&theme);
 
-            let banners: [(Banner, f32); 4] = [
-                (Banner::info("A new version is available."), 0.0),
-                (Banner::success("Your settings were saved.").with_title("Saved"), 0.0),
-                (Banner::warning("Low disk space (1.2 GB left)."), 0.0),
-                (Banner::error("Connection lost. Retrying…").with_title("Error"), 0.0),
+            let banners: [Banner; 4] = [
+                Banner::info("A new version is available."),
+                Banner::success("Your settings were saved.").with_title("Saved"),
+                Banner::warning("Low disk space (1.2 GB left)."),
+                Banner::error("Connection lost. Retrying…").with_title("Error"),
             ];
-            for (banner, _) in banners {
-                let h = 52.0;
+            for banner in banners {
+                // Size the cell to the banner's natural height so titled (two-line)
+                // banners aren't clipped.
+                let h = banner.measure_height(list, &style, 300.0);
                 let r = flow.cell(list, "", 300.0, h);
                 banner.draw(r, list, &style);
             }
