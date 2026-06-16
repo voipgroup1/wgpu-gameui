@@ -1,5 +1,7 @@
 //! Text input widget with selection, cursor navigation, and clipboard support.
 
+use std::borrow::Cow;
+
 use crate::InputState;
 use crate::StyleKey;
 use crate::layout::Rect;
@@ -195,6 +197,13 @@ pub struct TextInput {
     /// caret's x on the first vertical move and cleared by any horizontal
     /// move/edit, so a run of Up/Down keeps the original column.
     desired_caret_x: Option<f32>,
+    /// Password masking: when `Some(ch)`, every value character is *displayed*
+    /// (and measured) as `ch`, while `value` keeps the real plaintext. Masking
+    /// implies single-line behaviour (a `multiline` flag is ignored while masked)
+    /// and suppresses inline IME preedit so the composition can't leak. `None`
+    /// renders normally. Set via [`password`](Self::password) /
+    /// [`with_mask`](Self::with_mask).
+    pub mask: Option<char>,
     /// Clipboard getter — returns the current clipboard contents.
     clipboard_get: Option<Box<dyn FnMut() -> String>>,
     /// Clipboard setter — writes text to the clipboard.
@@ -215,6 +224,7 @@ impl Default for TextInput {
             multiline: false,
             scroll_offset: 0.0,
             desired_caret_x: None,
+            mask: None,
             clipboard_get: None,
             clipboard_set: None,
         }
@@ -235,6 +245,7 @@ impl TextInput {
             multiline: false,
             scroll_offset: 0.0,
             desired_caret_x: None,
+            mask: None,
             clipboard_get: None,
             clipboard_set: None,
         }
@@ -255,6 +266,60 @@ impl TextInput {
     pub fn with_placeholder(mut self, placeholder: impl Into<String>) -> Self {
         self.placeholder = placeholder.into();
         self
+    }
+
+    /// Make this a password field: characters are displayed as a bullet (`•`)
+    /// while [`value`](Self::value) keeps the real text. See [`mask`](Self::mask).
+    pub fn password(mut self) -> Self {
+        self.mask = Some('•');
+        self
+    }
+
+    /// Mask displayed characters with `ch` (e.g. `'*'`). See [`mask`](Self::mask).
+    pub fn with_mask(mut self, ch: char) -> Self {
+        self.mask = Some(ch);
+        self
+    }
+
+    // ---- Masking (display vs. value) ----
+
+    /// The string actually drawn and measured: the plaintext `value`, or — when
+    /// masked — one mask glyph per value character. Placeholder text is never
+    /// masked (it's handled separately at draw time).
+    fn display_value(&self) -> Cow<'_, str> {
+        match self.mask {
+            Some(ch) => Cow::Owned(std::iter::repeat_n(ch, self.value.chars().count()).collect()),
+            None => Cow::Borrowed(&self.value),
+        }
+    }
+
+    /// Map a byte offset in `value` to the matching byte offset in the displayed
+    /// (masked) string. Identity when unmasked. Relies on the 1:1 char mapping
+    /// between value and mask glyphs.
+    fn value_to_display_byte(&self, byte: usize) -> usize {
+        match self.mask {
+            None => byte,
+            Some(ch) => {
+                let clamped = byte.min(self.value.len());
+                self.value[..clamped].chars().count() * ch.len_utf8()
+            }
+        }
+    }
+
+    /// Inverse of [`value_to_display_byte`](Self::value_to_display_byte): map a
+    /// byte offset in the displayed string back to a `value` byte offset.
+    fn display_to_value_byte(&self, display_byte: usize) -> usize {
+        match self.mask {
+            None => display_byte,
+            Some(ch) => {
+                let char_index = display_byte / ch.len_utf8();
+                self.value
+                    .char_indices()
+                    .nth(char_index)
+                    .map(|(i, _)| i)
+                    .unwrap_or(self.value.len())
+            }
+        }
     }
 
     /// Set the clipboard getter closure (e.g. `|| arboard::Clipboard::new().unwrap().get_text().unwrap_or_default()`).
@@ -428,6 +493,8 @@ impl TextInput {
     }
 
     fn handle_keyboard(&mut self, input: &InputState, layout: &[CaretPos]) {
+        // Masking forces single-line semantics (Enter submits, Up/Down inert).
+        let multiline = self.multiline && self.mask.is_none();
         // Check for Ctrl shortcuts via text_input.
         // When Ctrl is held, `ReceivedCharacter` may send ASCII control codes
         // (0x01 = Ctrl+A, 0x03 = Ctrl+C, 0x16 = Ctrl+V, 0x18 = Ctrl+X)
@@ -475,7 +542,7 @@ impl TextInput {
 
         // Enter — insert a newline in multiline mode. (Single-line fields leave
         // `enter_pressed` for the caller to read as a submit signal.)
-        if input.enter_pressed && self.multiline {
+        if input.enter_pressed && multiline {
             if self.selection_start.is_some() {
                 self.delete_selection();
             }
@@ -487,7 +554,7 @@ impl TextInput {
         }
 
         // Up/Down — vertical line navigation (multiline only; needs layout).
-        if self.multiline && (input.key_up || input.key_down) && !layout.is_empty() {
+        if multiline && (input.key_up || input.key_down) && !layout.is_empty() {
             let dir = if input.key_up { -1 } else { 1 };
             // Seed the sticky column from the current caret on the first vertical
             // move; subsequent moves keep the original column.
@@ -567,7 +634,7 @@ impl TextInput {
             }
             // Multiline: jump to the start of the current visual line; single-line:
             // document start.
-            self.cursor_pos = if self.multiline && !layout.is_empty() {
+            self.cursor_pos = if multiline && !layout.is_empty() {
                 line_bounds(layout, self.cursor_pos).0
             } else {
                 0
@@ -587,7 +654,7 @@ impl TextInput {
             }
             // Multiline: jump to the end of the current visual line; single-line:
             // document end.
-            self.cursor_pos = if self.multiline && !layout.is_empty() {
+            self.cursor_pos = if multiline && !layout.is_empty() {
                 line_bounds(layout, self.cursor_pos).1
             } else {
                 self.value.len()
@@ -652,13 +719,17 @@ impl TextInput {
         }
         let focused = focus.is_focused(id);
 
+        // Masking forces single-line behaviour (passwords never wrap), so all the
+        // multiline branches below key off this effective flag, not `self.multiline`.
+        let multiline = self.multiline && self.mask.is_none();
+
         // ---- Geometry & layout policy ----
         let padding = s.scalar(StyleKey::Padding);
         let text_x = self.x + padding;
         let text_max_w = self.width - padding * 2.0;
         // Single-line never wraps (a long value overflows + clips); multiline
         // wraps to the field width.
-        let wrap = if self.multiline {
+        let wrap = if multiline {
             WrapMode::WordOrGlyph
         } else {
             WrapMode::None
@@ -666,7 +737,7 @@ impl TextInput {
         // Laid-out line height — matches `text_caret_layout` / `TextBlock::with_size`
         // (font_size * 1.25). Single-line keeps font_size for the selection/caret
         // quad height (unchanged behaviour).
-        let line_height = if self.multiline {
+        let line_height = if multiline {
             s.scalar(StyleKey::FontSize) * 1.25
         } else {
             s.scalar(StyleKey::FontSize)
@@ -676,7 +747,7 @@ impl TextInput {
         // must centre on a *content-independent* band so the text doesn't hop up
         // and down as the user types capitals vs lowercase — pin it to the
         // x-height band (the common typing case).
-        let text_top = if self.multiline {
+        let text_top = if multiline {
             self.y + padding
         } else {
             let m = list.font_vmetrics(s.theme().font.as_ref());
@@ -695,7 +766,7 @@ impl TextInput {
         // BEFORE keyboard/click so vertical nav, line Home/End, and click hit
         // testing see this frame's geometry (one-frame edit latency — see
         // `process_keyboard_with_layout`).
-        let nav_layout: Vec<CaretPos> = if self.multiline && focused {
+        let nav_layout: Vec<CaretPos> = if multiline && focused {
             list.text_caret_layout(&self.value, s.scalar(StyleKey::FontSize), Some(text_max_w), wrap)
         } else {
             Vec::new()
@@ -703,7 +774,7 @@ impl TextInput {
 
         // ---- Click-to-position ----
         if clicked && focused {
-            if self.multiline {
+            if multiline {
                 // Hit-test against the laid-out lines, accounting for the scroll
                 // offset and top-left text origin.
                 let local_x = input.mouse_x - text_x;
@@ -725,12 +796,15 @@ impl TextInput {
 
                 if click_x >= text_left && click_x <= text_right {
                     let local_x = click_x - text_left;
+                    // Measure against the masked display, then map the picked
+                    // display byte back to a real value byte.
+                    let display = self.display_value();
                     let positions = list.text_cursor_positions(
-                        &self.value,
+                        &display,
                         s.scalar(StyleKey::FontSize),
                         Some(text_max_w),
                     );
-                    let byte_pos = closest_cursor_pos(&positions, local_x);
+                    let byte_pos = self.display_to_value_byte(closest_cursor_pos(&positions, local_x));
                     if input.shift_pressed {
                         // Extend selection.
                         if self.selection_start.is_none() {
@@ -761,8 +835,9 @@ impl TextInput {
 
         // A live IME composition is shown inline (underlined) and supersedes the
         // value selection; commit reuses the normal `text_input` path so the
-        // preedit itself is display-only and never mutates `self.value`.
-        let composing = focused && !input.preedit.is_empty();
+        // preedit itself is display-only and never mutates `self.value`. Masked
+        // (password) fields suppress the inline preedit so it can't leak.
+        let composing = focused && !input.preedit.is_empty() && self.mask.is_none();
 
         // ---- Draw background + border ----
         // Honor `theme.border_radius` so text inputs match the other inputs
@@ -782,23 +857,16 @@ impl TextInput {
         list.rounded_rect(frame, radius, s.color(StyleKey::InputBackground));
         list.rounded_rect_outline(frame, radius, border, border_color);
 
-        // ---- Draw text content ----
-        let (text_content, text_color) = if self.value.is_empty() {
-            (&self.placeholder, s.color(StyleKey::TextDim))
-        } else {
-            (&self.value, s.color(StyleKey::Text))
-        };
-
         // Render-time caret layout (multiline+focused), reflecting any edits made
         // this frame — used for autoscroll, per-line selection, and the caret.
-        let render_layout: Vec<CaretPos> = if self.multiline && focused {
+        let render_layout: Vec<CaretPos> = if multiline && focused {
             list.text_caret_layout(&self.value, s.scalar(StyleKey::FontSize), Some(text_max_w), wrap)
         } else {
             Vec::new()
         };
 
         // ---- Autoscroll to keep the caret line visible (multiline) ----
-        if self.multiline && focused {
+        if multiline && focused {
             let inner_h = (self.height - padding * 2.0).max(0.0);
             let caret = caret_for_byte(&render_layout, self.cursor_pos);
             let caret_top = caret.line_top;
@@ -818,14 +886,25 @@ impl TextInput {
             }
         }
 
+        // ---- Resolve drawn text ----
+        // The drawn string is the masked display (plaintext when unmasked); the
+        // placeholder is shown unmasked when the value is empty. Built after the
+        // autoscroll mutation above so the borrow it holds on `self` doesn't clash.
+        let display = self.display_value();
+        let (text_content, text_color): (&str, [f32; 4]) = if self.value.is_empty() {
+            (&self.placeholder, s.color(StyleKey::TextDim))
+        } else {
+            (&display, s.color(StyleKey::Text))
+        };
+
         // Multiline content is clipped to the inner box (so wrapped + scrolled
         // lines, the selection, and the caret never spill past the field).
-        if self.multiline {
+        if multiline {
             list.push_clip(inner_rect);
         }
 
         // The vertical shift applied to text/selection/caret in multiline mode.
-        let scroll = if self.multiline {
+        let scroll = if multiline {
             self.scroll_offset
         } else {
             0.0
@@ -835,7 +914,7 @@ impl TextInput {
         if focused && !composing && !self.value.is_empty() {
             if let Some((sel_start, sel_end)) = self.selection_range() {
                 if sel_start < sel_end {
-                    if self.multiline {
+                    if multiline {
                         let start_line = caret_for_byte(&render_layout, sel_start).line;
                         let end_line = caret_for_byte(&render_layout, sel_end).line;
                         for line in start_line..=end_line {
@@ -867,19 +946,23 @@ impl TextInput {
                             );
                         }
                     } else {
+                        // Measure on the masked display; convert the selection's
+                        // value bytes to display bytes first.
                         let positions = list.text_cursor_positions(
-                            &self.value,
+                            &display,
                             s.scalar(StyleKey::FontSize),
                             Some(text_max_w),
                         );
+                        let ds = self.value_to_display_byte(sel_start);
+                        let de = self.value_to_display_byte(sel_end);
                         let sel_x1 = positions
                             .iter()
-                            .find(|&&(i, _)| i >= sel_start)
+                            .find(|&&(i, _)| i >= ds)
                             .map(|&(_, x)| x)
                             .unwrap_or(0.0);
                         let sel_x2 = positions
                             .iter()
-                            .find(|&&(i, _)| i >= sel_end)
+                            .find(|&&(i, _)| i >= de)
                             .map(|&(_, x)| x)
                             .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
 
@@ -939,7 +1022,7 @@ impl TextInput {
 
         // ---- Draw cursor ----
         if focused {
-            if self.multiline && composed.is_none() {
+            if multiline && composed.is_none() {
                 let caret = caret_for_byte(&render_layout, self.cursor_pos);
                 let caret_h = if caret.line_height > 0.0 {
                     caret.line_height
@@ -970,14 +1053,16 @@ impl TextInput {
                 } else if self.value.is_empty() {
                     text_x
                 } else {
+                    // Measure on the masked display; convert the caret's value byte.
                     let positions = list.text_cursor_positions(
-                        &self.value,
+                        &display,
                         s.scalar(StyleKey::FontSize),
                         Some(text_max_w),
                     );
+                    let caret_disp = self.value_to_display_byte(self.cursor_pos);
                     let offset = positions
                         .iter()
-                        .find(|&&(i, _)| i >= self.cursor_pos)
+                        .find(|&&(i, _)| i >= caret_disp)
                         .map(|&(_, x)| x)
                         .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
                     text_x + offset
@@ -988,7 +1073,7 @@ impl TextInput {
             }
         }
 
-        if self.multiline {
+        if multiline {
             list.pop_clip();
         }
 
@@ -1107,6 +1192,94 @@ mod tests {
             focus.ime_request().is_some(),
             "a focused multiline field requests IME"
         );
+    }
+
+    // ---- Password / masking ----
+
+    #[test]
+    fn password_builder_sets_bullet_mask() {
+        assert_eq!(TextInput::new(0.0, 0.0, 100.0, 24.0).password().mask, Some('•'));
+        assert_eq!(
+            TextInput::new(0.0, 0.0, 100.0, 24.0).with_mask('*').mask,
+            Some('*')
+        );
+        assert_eq!(make_input("x").mask, None, "unmasked by default");
+    }
+
+    #[test]
+    fn display_value_masks_per_char_but_value_is_plaintext() {
+        let ti = make_input("secret").password();
+        assert_eq!(ti.value, "secret", "value stays plaintext");
+        assert_eq!(&*ti.display_value(), "••••••", "display is one bullet per char");
+        // Unmasked borrows the value unchanged.
+        let plain = make_input("secret");
+        assert_eq!(&*plain.display_value(), "secret");
+    }
+
+    #[test]
+    fn masked_byte_mapping_roundtrips_multibyte() {
+        // "aé☃" — a=1 byte, é=2 bytes, ☃=3 bytes (value len 6); 3 chars.
+        let ti = make_input("aé☃").with_mask('*'); // '*' is 1 byte
+        // value byte → display byte (char index * 1).
+        assert_eq!(ti.value_to_display_byte(0), 0);
+        assert_eq!(ti.value_to_display_byte(1), 1); // after 'a' → char 1
+        assert_eq!(ti.value_to_display_byte(3), 2); // after 'é' → char 2
+        assert_eq!(ti.value_to_display_byte(6), 3); // end → char 3
+        // display byte → value byte.
+        assert_eq!(ti.display_to_value_byte(0), 0);
+        assert_eq!(ti.display_to_value_byte(1), 1);
+        assert_eq!(ti.display_to_value_byte(2), 3);
+        assert_eq!(ti.display_to_value_byte(3), 6);
+    }
+
+    #[test]
+    fn masked_byte_mapping_with_multibyte_mask_glyph() {
+        // '•' is 3 bytes; two value chars → display "••" (6 bytes).
+        let ti = make_input("hi").password();
+        assert_eq!(ti.value_to_display_byte(1), 3, "char 1 → 1 * 3 bytes");
+        assert_eq!(ti.value_to_display_byte(2), 6);
+        assert_eq!(ti.display_to_value_byte(3), 1);
+        assert_eq!(ti.display_to_value_byte(6), 2);
+    }
+
+    #[test]
+    fn masked_field_renders_bullets_not_plaintext() {
+        let mut ti = make_input("hunter2").password();
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        let input = InputState::default();
+        focus.begin_frame(&input);
+        draw_input(&mut ti, 0, &mut focus, &mut list, &theme, &input);
+        let drawn = &list.texts.last().expect("a text block was drawn").content;
+        assert_eq!(drawn, "•••••••", "renders one bullet per char");
+        assert!(!drawn.contains("hunter2"), "plaintext must never be drawn");
+    }
+
+    #[test]
+    fn masked_field_forces_single_line_enter() {
+        // multiline + mask: Enter must NOT insert a newline (passwords are single-line).
+        let mut ti = make_input("pw").with_multiline(true).password();
+        ti.cursor_pos = 1;
+        let mut ev = fake_input();
+        ev.enter_pressed = true;
+        ti.process_keyboard(&ev);
+        assert_eq!(ti.value, "pw", "masked field ignores multiline newline insertion");
+    }
+
+    #[test]
+    fn masked_editing_operates_on_plaintext() {
+        // Typing and backspace mutate the real value, not the mask.
+        let mut ti = make_input("").password();
+        let mut ev = fake_input();
+        ev.text_input = "ab".to_string();
+        ti.process_keyboard(&ev);
+        assert_eq!(ti.value, "ab");
+        let mut bs = fake_input();
+        bs.backspace_pressed = true;
+        ti.process_keyboard(&bs);
+        assert_eq!(ti.value, "a");
+        assert_eq!(&*ti.display_value(), "•");
     }
 
     #[test]

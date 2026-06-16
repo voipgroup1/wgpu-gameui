@@ -763,6 +763,12 @@ fn render_widget_gallery() {
             .with_placeholder("Placeholder...")
             .draw(1, &mut ctx(list, &mut focus, &theme, &input));
 
+        let r = flow.cell(list, "Password (masked)", 200.0, 28.0);
+        TextInput::new(r.x, r.y, r.width, r.height)
+            .with_value("hunter2")
+            .password()
+            .draw(201, &mut ctx(list, &mut focus, &theme, &input));
+
         // Text input mid-IME-composition: focused, with a non-empty preedit
         // spliced into the value at the caret and rendered underlined. Uses a
         // local focus+input so it doesn't disturb the shared focus owner above.

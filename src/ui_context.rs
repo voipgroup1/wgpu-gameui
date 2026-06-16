@@ -1085,6 +1085,33 @@ impl<'a> UiContext<'a> {
         placeholder: &str,
         w: Option<f32>,
     ) -> bool {
+        self.text_input_masked(id, buffer, placeholder, w, None)
+    }
+
+    /// Password field: like [`text_input`](Self::text_input) but characters are
+    /// displayed as bullets (`•`) while `buffer` keeps the real plaintext. Single
+    /// line; suppresses inline IME preedit. Returns whether the text changed.
+    pub fn password_input(
+        &mut self,
+        id: FocusId,
+        buffer: &mut String,
+        placeholder: &str,
+        w: Option<f32>,
+    ) -> bool {
+        self.text_input_masked(id, buffer, placeholder, w, Some('•'))
+    }
+
+    /// Shared body for [`text_input`](Self::text_input) /
+    /// [`password_input`](Self::password_input): `mask` selects plaintext (`None`)
+    /// vs masked (`Some(ch)`) display.
+    fn text_input_masked(
+        &mut self,
+        id: FocusId,
+        buffer: &mut String,
+        placeholder: &str,
+        w: Option<f32>,
+        mask: Option<char>,
+    ) -> bool {
         let (input, theme) = match self.interactive_refs() {
             Some(v) => v,
             None => return false,
@@ -1114,11 +1141,12 @@ impl<'a> UiContext<'a> {
                 t.cursor_pos = t.value.len();
                 t
             });
-            // Keep geometry + placeholder synced to this frame's placed rect.
+            // Keep geometry + placeholder + mask synced to this frame's placed rect.
             ti.x = local.x;
             ti.y = local.y;
             ti.width = local.width;
             ti.height = local.height;
+            ti.mask = mask;
             ti.placeholder.clear();
             ti.placeholder.push_str(placeholder);
             // External changes to the caller's buffer win over our cached value.
@@ -2300,6 +2328,41 @@ mod tests {
         assert!(changed, "typing should report a change");
         assert_eq!(buffer.len(), 3);
         assert!(buffer.contains('c'));
+    }
+
+    #[test]
+    fn password_input_edits_buffer_and_masks_render() {
+        let theme = Theme::default();
+        let mut state = UiState::new();
+        let mut buffer = String::from("pw");
+        // Frame 1: click inside to take focus.
+        let input1 = click_at(5.0, 5.0);
+        state.begin_frame(&input1, &theme, 0.0);
+        {
+            let mut list = DrawList::new();
+            let mut ui = UiContext::interactive(&mut list, &input1, &mut state, &theme);
+            ui.password_input(1, &mut buffer, "", Some(150.0));
+        }
+        state.end_frame();
+        // Frame 2: type a character while focused; the rendered glyphs are bullets.
+        let mut input2 = InputState::default();
+        input2.text_input = "x".to_string();
+        state.begin_frame(&input2, &theme, 0.0);
+        let (changed, drawn) = {
+            let mut list = DrawList::new();
+            let changed = {
+                let mut ui = UiContext::interactive(&mut list, &input2, &mut state, &theme);
+                ui.password_input(1, &mut buffer, "", Some(150.0))
+            };
+            let drawn = list.texts.last().map(|t| t.content.clone()).unwrap_or_default();
+            (changed, drawn)
+        };
+        state.end_frame();
+        assert!(changed, "typing should report a change");
+        assert_eq!(buffer.chars().count(), 3, "buffer keeps real plaintext char");
+        assert!(buffer.contains('x'), "typed char reached the plaintext buffer");
+        assert_eq!(drawn, "•••", "rendered field shows one bullet per char");
+        assert!(!drawn.contains('x'), "plaintext must not be drawn");
     }
 
     #[test]

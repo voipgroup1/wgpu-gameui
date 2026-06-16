@@ -466,7 +466,14 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       (`ellipsize_to_width` in `src/text.rs`); opt-in, no-op when the text fits.
 - [x] **P1 — Cursor x-position from real shaping**, not the same broken
       `len*0.5` formula.
-- [ ] **P2 — Password / masked input.**
+- [x] **P2 — Password / masked input.** Done. `TextInput.mask: Option<char>`
+      (builders `.password()` → `'•'`, `.with_mask(ch)`): `value` stays plaintext
+      while the field *displays* and *measures* one mask glyph per char. Masking
+      forces single-line semantics (Enter submits, Up/Down inert) and suppresses
+      inline IME preedit so it can't leak. All single-line hit-testing/caret/
+      selection geometry runs on the masked display via char-aligned byte mapping
+      (`value_to_display_byte`/`display_to_value_byte`). Façade verb:
+      `UiContext::password_input(id, buffer, placeholder, w)`.
 - [ ] **P2 — RTL / bidi exposure** (glyphon supports it; no public knob).
 
 ---
