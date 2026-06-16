@@ -486,6 +486,54 @@ fn render_widget_gallery() {
             );
         }
 
+        // ---- Vertical (stacked) text -----------------------------------
+        // `TextBlock::with_vertical` stacks each grapheme cluster on its own row,
+        // top-to-bottom, centered within the column — the casual upright look for
+        // Japanese game labels (not true CJK `vertical-rl`). Shown beside the same
+        // phrase laid out horizontally for contrast.
+        flow.section(list, "Vertical text");
+
+        let r = flow.cell(list, "Stacked JP", 40.0, 160.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        list.text(
+            TextBlock::new("こんにちは", r.x, r.y + 2.0)
+                .with_size(22.0)
+                .with_color(210, 220, 240)
+                .with_vertical(),
+        );
+
+        let r = flow.cell(list, "vs horizontal", 200.0, 28.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        list.text(
+            TextBlock::new("こんにちは", r.x + 4.0, r.y + 4.0)
+                .with_size(22.0)
+                .with_color(210, 220, 240),
+        );
+
+        // Mixed full-width kana + Latin digits: each cluster stacks individually
+        // (per-letter for the Latin run — the documented label-scope behaviour).
+        let r = flow.cell(list, "Mixed JP+digits", 56.0, 200.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        list.text(
+            TextBlock::new("レベル99", r.x, r.y + 2.0)
+                .with_size(24.0)
+                .with_color(255, 240, 200)
+                .with_vertical(),
+        );
+
+        // Tighter row pitch (line_height = font_size) reads better for full-width
+        // kana than the default 1.25× airy spacing.
+        let r = flow.cell(list, "Tight pitch", 40.0, 160.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        let mut tight = TextBlock::new("たてがき", r.x, r.y + 2.0)
+            .with_size(24.0)
+            .with_color(200, 230, 210)
+            .with_vertical();
+        tight.line_height = 24.0;
+        list.text(tight);
+
+        flow.reserve(200.0);
+
         // ---- Vertical centering (debug) --------------------------------
         // Visualises the per-label optical centerer (`DrawList::vcentered_text_y`).
         // The band it centres is chosen from the *text*: a label with lowercase

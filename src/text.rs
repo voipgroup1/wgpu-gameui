@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::layout::Rect;
 #[cfg(feature = "phosphor-icons")]
@@ -497,6 +498,7 @@ impl TextRenderer {
             Weight::NORMAL,
             Style::Normal,
             WrapMode::default(),
+            false,
         )
     }
 
@@ -667,6 +669,7 @@ impl TextRenderer {
                 style_disc(block.style),
                 block.wrap,
                 block.direction,
+                block.vertical,
             );
 
             // Fast path: a cached layout for this exact key + content. No
@@ -703,8 +706,10 @@ impl TextRenderer {
 
             // In ellipsis mode the block is a single line truncated to `max_width`
             // with a trailing '…'; otherwise it wraps at `max_width` as before.
+            // Vertical mode ignores ellipsis (mutually exclusive — it stacks the
+            // full content one cluster per row).
             let truncated;
-            let content: &str = if block.ellipsize {
+            let content: &str = if block.ellipsize && !block.vertical {
                 truncated = ellipsize_to_width(
                     &mut fs,
                     &block.content,
@@ -723,17 +728,27 @@ impl TextRenderer {
             // Force the base paragraph direction (if requested) by prepending a
             // zero-width strong mark; cosmic-text has no base-direction API. The
             // mark shifts every glyph's byte offset by its UTF-8 length, undone
-            // below via `prefix_len`.
-            let prefix = direction_prefix(block.direction);
+            // below via `prefix_len`. Vertical mode skips this — base direction is
+            // meaningless for a single-glyph-per-row column — and instead stacks
+            // each grapheme cluster on its own line (see `vertical_stack_string`).
+            let prefix = if block.vertical {
+                ""
+            } else {
+                direction_prefix(block.direction)
+            };
             let prefix_len = prefix.len();
-            let shaped_text: Cow<str> = if prefix.is_empty() {
+            let shaped_text: Cow<str> = if block.vertical {
+                Cow::Owned(vertical_stack_string(content))
+            } else if prefix.is_empty() {
                 Cow::Borrowed(content)
             } else {
                 Cow::Owned(format!("{prefix}{content}"))
             };
 
             let mut buffer = Buffer::new(&mut fs, Metrics::new(block.font_size, block.line_height));
-            if block.ellipsize {
+            if block.vertical || block.ellipsize {
+                // Vertical: each line is one cluster, no wrapping; shrink-to-content
+                // so manual centering (below) governs horizontal placement.
                 buffer.set_wrap(&mut fs, Wrap::None);
                 buffer.set_size(&mut fs, None, None);
             } else {
@@ -751,22 +766,57 @@ impl TextRenderer {
                 Shaping::Advanced,
             );
             // Horizontal alignment is set per buffer line before layout; `Start`
-            // is cosmic-text's default so we only override for the rest.
-            if let Some(align) = cosmic_align(block.align) {
+            // is cosmic-text's default so we only override for the rest. Vertical
+            // mode never sets a cosmic align — it centers each row manually within
+            // the column width (below), which is deterministic and font-agnostic
+            // regardless of the shrink-to-content buffer width.
+            if !block.vertical && let Some(align) = cosmic_align(block.align) {
                 for line in buffer.lines.iter_mut() {
                     line.set_align(Some(align));
                 }
             }
             buffer.shape_until_scroll(&mut fs, false);
 
+            // Vertical: the column is as wide as the widest cluster row; each row
+            // is then centered within it by shifting its glyphs right by half the
+            // slack. `line_w` is the row's advance width (one cluster per row).
+            let column_w = if block.vertical {
+                buffer
+                    .layout_runs()
+                    .fold(0.0f32, |m, run| m.max(run.line_w))
+            } else {
+                0.0
+            };
+
+            // Vertical: glyph byte offsets are per-buffer-line, so precompute each
+            // line's start byte in the *shaped* (newline-joined) string by scanning
+            // for `\n` — mirroring `text_visual_layout`. Subtracting `line_i` below
+            // removes the inserted separators to recover the caller's content byte.
+            let line_starts: Vec<usize> = if block.vertical {
+                let mut starts = vec![0usize];
+                for (i, b) in shaped_text.bytes().enumerate() {
+                    if b == b'\n' {
+                        starts.push(i + 1);
+                    }
+                }
+                starts
+            } else {
+                Vec::new()
+            };
+
             // Collect the relative layout. Whitespace / outline-less glyphs yield
             // no tile (atlas returns `None`) and are skipped — so every stored
             // glyph is guaranteed present in the atlas on later frames.
             let mut shaped: Vec<ShapedGlyph> = Vec::new();
             for run in buffer.layout_runs() {
+                let line_off_x = if block.vertical {
+                    (column_w - run.line_w) / 2.0
+                } else {
+                    0.0
+                };
                 for glyph in run.glyphs {
                     let font_size = glyph.font_size;
-                    let rel_x = glyph.x + font_size * glyph.x_offset;
+                    let rel_x = glyph.x + font_size * glyph.x_offset + line_off_x;
                     let rel_y = run.line_y + glyph.y - font_size * glyph.y_offset;
 
                     let font_key = resolve_font_key(
@@ -784,15 +834,23 @@ impl TextRenderer {
                     {
                         continue; // whitespace / outline-less
                     }
+                    // Map the per-buffer-line glyph offset back to the caller's
+                    // content. Horizontal: undo the direction-prefix shift.
+                    // Vertical: add the shaped line's start byte, then subtract the
+                    // `line_i` inserted `'\n'` separators that precede this cluster.
+                    let byte_start = if block.vertical {
+                        let line_base = line_starts.get(run.line_i).copied().unwrap_or(0);
+                        (line_base + glyph.start).saturating_sub(run.line_i)
+                    } else {
+                        glyph.start.saturating_sub(prefix_len)
+                    };
                     shaped.push(ShapedGlyph {
                         font_id: glyph.font_id,
                         glyph_id: glyph.glyph_id,
                         rel_x,
                         rel_y,
                         font_size,
-                        // Undo the direction-prefix byte shift so span-colour
-                        // lookup keys off the caller's real content offsets.
-                        byte_start: (glyph.start as usize).saturating_sub(prefix_len) as u32,
+                        byte_start: byte_start as u32,
                     });
                 }
             }
@@ -1053,7 +1111,23 @@ type ShapeKey = (
     u8,
     WrapMode,
     TextDirection,
+    bool,
 );
+
+/// Lay a string out for **vertical (stacked) text** by putting each grapheme
+/// cluster on its own line, so cosmic-text — which has no writing-mode API and
+/// only ever stacks *buffer lines* top-to-bottom — renders the clusters in a
+/// single descending column. Grapheme clusters (not `char`s) keep combining
+/// marks (e.g. dakuten) and ZWJ emoji sequences intact on one row.
+///
+/// Each inserted `'\n'` is one byte. A glyph's offset is per-buffer-line, so the
+/// caller's content byte is recovered as `line_start[line_i] + glyph.start -
+/// line_i` — the shaped line base, minus the `line_i` separators that precede the
+/// cluster (the correction applied in `build_vertices`). See
+/// [`TextBlock::with_vertical`].
+fn vertical_stack_string(s: &str) -> String {
+    s.graphemes(true).collect::<Vec<_>>().join("\n")
+}
 
 /// Stable discriminant for a cosmic-text [`Style`] so it can sit in a `Hash + Eq`
 /// cache key: `Normal = 0`, `Italic = 1`, `Oblique = 2`.
@@ -1623,14 +1697,19 @@ pub fn has_lowercase(text: &str) -> bool {
 /// first measurement (true for the system-font default). If fonts are loaded into the
 /// shared `FontSystem` after measuring, call [`TextMeasurer::clear_cache`] to drop
 /// stale metrics.
+///
+/// Cache key for [`TextMeasurer`]: quantized
+/// `(font_size_bits, max_width_bits, family_hash, weight, style_disc, wrap, vertical)`.
+/// `vertical` keeps the two orientations of the same string from colliding.
+type MeasureKey = (u32, Option<u32>, u64, u16, u8, WrapMode, bool);
+
 pub struct TextMeasurer {
     font_system: FontSystemHandle,
-    /// Keyed by quantized `(font_size_bits, max_width_bits, family_hash, weight,
-    /// style_disc)` so the inner `HashMap<String, _>` can be probed with a
-    /// borrowed `&str` — no key allocation on a cache hit, only on a miss when we
-    /// insert. `family_hash` is 0 for the default font; different fonts/weights/
-    /// styles have different advances so all three must be part of the key.
-    cache: HashMap<(u32, Option<u32>, u64, u16, u8, WrapMode), HashMap<String, (f32, f32)>>,
+    /// Keyed by [`MeasureKey`] so the inner `HashMap<String, _>` can be probed
+    /// with a borrowed `&str` — no key allocation on a cache hit, only on a miss
+    /// when we insert. `family_hash` is 0 for the default font; different fonts/
+    /// weights/styles have different advances so all must be part of the key.
+    cache: HashMap<MeasureKey, HashMap<String, (f32, f32)>>,
     cache_entries: usize,
     /// Per-font vertical metrics for optical centring, keyed by
     /// `(family_hash, weight, style_disc)`. Sampled once per font (a one-glyph
@@ -1759,6 +1838,42 @@ impl TextMeasurer {
         style: Style,
         wrap: WrapMode,
     ) -> (f32, f32) {
+        self.measure_keyed(text, font_size, max_width, font, weight, style, wrap, false)
+    }
+
+    /// Measure `text` laid out as **vertical (stacked) text** — one grapheme
+    /// cluster per row, top-to-bottom — returning `(column_width, stacked_height)`.
+    /// Matches a [`TextBlock`] rendered with [`with_vertical`](TextBlock::with_vertical)
+    /// at the same `font_size` in the default font. The result is tall-and-narrow,
+    /// the transpose of the horizontal measurement of the same string.
+    pub fn measure_vertical(&mut self, text: &str, font_size: f32) -> (f32, f32) {
+        self.measure_keyed(
+            text,
+            font_size,
+            None,
+            None,
+            Weight::NORMAL,
+            Style::Normal,
+            WrapMode::default(),
+            true,
+        )
+    }
+
+    /// Shared cache-keyed measurement backing [`measure_styled`] (horizontal) and
+    /// [`measure_vertical`]. `vertical` is part of the cache key so the two
+    /// orientations of the same string never collide.
+    #[allow(clippy::too_many_arguments)]
+    fn measure_keyed(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+        font: Option<&FontHandle>,
+        weight: Weight,
+        style: Style,
+        wrap: WrapMode,
+        vertical: bool,
+    ) -> (f32, f32) {
         let key = (
             font_size.to_bits(),
             max_width.map(f32::to_bits),
@@ -1766,12 +1881,13 @@ impl TextMeasurer {
             weight.0,
             style_disc(style),
             wrap,
+            vertical,
         );
 
-        if let Some(inner) = self.cache.get(&key) {
-            if let Some(&dims) = inner.get(text) {
-                return dims;
-            }
+        if let Some(inner) = self.cache.get(&key)
+            && let Some(&dims) = inner.get(text)
+        {
+            return dims;
         }
 
         let dims = {
@@ -1785,6 +1901,7 @@ impl TextMeasurer {
                 weight,
                 style,
                 wrap,
+                vertical,
             )
         };
 
@@ -1850,16 +1967,30 @@ fn measure_with_font_system(
     weight: Weight,
     style: Style,
     wrap: WrapMode,
+    vertical: bool,
 ) -> (f32, f32) {
     let line_height = font_size * LINE_HEIGHT_RATIO;
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    let shape_width = max_width.unwrap_or(f32::MAX / 4.0);
-    buffer.set_wrap(font_system, wrap.into());
-    buffer.set_size(font_system, Some(shape_width), None);
     let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
+
+    // Vertical (stacked) mode: lay out one grapheme cluster per line with no
+    // wrapping, mirroring `build_vertices`. The same `max(line_w)` / sum-of-
+    // `line_height` loop below then yields the column width × stacked height.
+    let stacked;
+    let shaped_text: &str = if vertical {
+        stacked = vertical_stack_string(text);
+        buffer.set_wrap(font_system, Wrap::None);
+        buffer.set_size(font_system, None, None);
+        &stacked
+    } else {
+        let shape_width = max_width.unwrap_or(f32::MAX / 4.0);
+        buffer.set_wrap(font_system, wrap.into());
+        buffer.set_size(font_system, Some(shape_width), None);
+        text
+    };
     buffer.set_text(
         font_system,
-        text,
+        shaped_text,
         Attrs::new().family(family).weight(weight).style(style),
         Shaping::Advanced,
     );
@@ -2838,6 +2969,14 @@ pub struct TextBlock {
     /// [`WrapMode::WordOrGlyph`], matching the historical implicit behaviour).
     /// Ignored in `ellipsize` mode, which always lays out on a single line.
     pub wrap: WrapMode,
+    /// Vertical (stacked) text mode (default `false`). When `true`, each grapheme
+    /// cluster is laid out on its own row so the label reads top-to-bottom, with
+    /// glyphs centered within the column — the casual look used for Japanese game
+    /// labels. This is upright stacking, **not** true CJK `vertical-rl` (no
+    /// vertical glyph variants, rotated kana/punctuation, or right-to-left
+    /// columns). `direction`, `wrap`, and `ellipsize` do not apply in this mode.
+    /// See [`with_vertical`](Self::with_vertical).
+    pub vertical: bool,
 }
 
 impl TextBlock {
@@ -2862,6 +3001,7 @@ impl TextBlock {
             style: Style::Normal,
             spans: Vec::new(),
             wrap: WrapMode::default(),
+            vertical: false,
         }
     }
 
@@ -2954,6 +3094,20 @@ impl TextBlock {
         self
     }
 
+    /// Lay this block out as **vertical (stacked) text**: each grapheme cluster
+    /// on its own row, top-to-bottom, glyphs centered within the column. This is
+    /// the casual upright stacking used for Japanese game labels — *not* true CJK
+    /// `vertical-rl` (no vertical glyph variants, rotated kana/punctuation, or
+    /// right-to-left columns); embedded Latin stacks per-letter too.
+    ///
+    /// The row pitch is the block's `line_height` (set via [`with_size`](Self::with_size));
+    /// a tighter `line_height` reads better for full-width kana/kanji. `direction`,
+    /// `wrap`, and ellipsis do not apply in this mode.
+    pub fn with_vertical(mut self) -> Self {
+        self.vertical = true;
+        self
+    }
+
     /// Enable single-line ellipsis: lay the text out on one line and truncate it
     /// with a trailing `'…'` if it would exceed [`Self::max_width`]. Use this for
     /// labels that must stay inside a fixed-width box (set `max_width` to that
@@ -3024,7 +3178,7 @@ mod tests {
         direction_prefix, ellipsize_to_width, field_reach, has_cjk, has_lowercase, load_font_bytes,
         measure_with_font_system, resolve_span_color, selection_rects, shared_font_system,
         text_caret_layout, text_cursor_positions, text_visual_layout, vcentered_line_y,
-        visual_caret_neighbor,
+        vertical_stack_string, visual_caret_neighbor,
     };
     use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping, Style, Weight};
 
@@ -4038,6 +4192,7 @@ mod tests {
             Weight::NORMAL,
             Style::Normal,
             WrapMode::default(),
+            false,
         );
         assert!(w <= max_width, "ellipsized width {w} must fit {max_width}");
     }
@@ -4134,6 +4289,7 @@ mod tests {
             Weight::NORMAL,
             Style::Normal,
             WrapMode::default(),
+            false,
         );
         let final_x = pos.last().map(|(_, x)| *x).unwrap_or(0.0);
         // The final x-position should approximate the measured width.
@@ -4519,6 +4675,148 @@ mod tests {
         assert!(
             (optical - line_box).abs() < 1e-4,
             "optical {optical} vs line-box {line_box}"
+        );
+    }
+
+    // ---- Vertical (stacked) text ----
+
+    #[test]
+    fn vertical_stack_string_one_cluster_per_line() {
+        // Three kana → three lines joined by '\n', clusters intact and in order.
+        assert_eq!(vertical_stack_string("あいう"), "あ\nい\nう");
+        // Empty stays empty; a single cluster has no separator.
+        assert_eq!(vertical_stack_string(""), "");
+        assert_eq!(vertical_stack_string("あ"), "あ");
+    }
+
+    #[test]
+    fn vertical_stack_string_keeps_grapheme_clusters_intact() {
+        // A base + combining dakuten is one grapheme cluster — it must NOT be split
+        // across rows (no newline injected between base and mark).
+        let combining = "\u{304B}\u{3099}"; // か + combining ゛ = が
+        assert_eq!(vertical_stack_string(combining), combining);
+        // A ZWJ emoji sequence (family) is a single cluster too.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(vertical_stack_string(family), family);
+        // Mixed: each of two clusters on its own line, the combining one whole.
+        assert_eq!(
+            vertical_stack_string(&format!("{combining}A")),
+            format!("{combining}\nA")
+        );
+    }
+
+    #[test]
+    fn vertical_measure_is_tall_and_narrow() {
+        // The vertical column of N clusters is ~N rows tall and one glyph wide —
+        // the transpose of the same string measured horizontally (wide and short).
+        let mut m = TextMeasurer::new();
+        let text = "あいうえお"; // 5 clusters
+        let (vw, vh) = m.measure_vertical(text, 24.0);
+        let (hw, hh) = m.measure(text, 24.0, None);
+
+        assert!(vh > vw, "vertical column should be taller than wide: {vw}x{vh}");
+        assert!(hw > hh, "horizontal run should be wider than tall: {hw}x{hh}");
+        // Stacked height ≈ 5 rows; clearly taller than the single-line height.
+        assert!(
+            vh > hh * 4.0,
+            "5-cluster column ({vh}) should dwarf one line ({hh})"
+        );
+        // Column width ≈ one glyph: far narrower than the 5-glyph horizontal run.
+        assert!(
+            vw < hw * 0.5,
+            "column width ({vw}) should be a fraction of the run width ({hw})"
+        );
+    }
+
+    #[test]
+    fn vertical_measure_height_scales_with_cluster_count() {
+        // Each extra cluster adds one row of `line_height` (= size * ratio).
+        let mut m = TextMeasurer::new();
+        let (_, h3) = m.measure_vertical("あいう", 20.0);
+        let (_, h6) = m.measure_vertical("あいうえおか", 20.0);
+        let row = 20.0 * LINE_HEIGHT_RATIO;
+        assert!(
+            (h6 - h3 - 3.0 * row).abs() < row * 0.5,
+            "doubling 3→6 clusters should add ~3 rows ({row} each): {h3} -> {h6}"
+        );
+    }
+
+    #[test]
+    fn vertical_and_horizontal_measure_cache_independently() {
+        // The orientation is part of the measure cache key, so the two never
+        // collide on the same (text, size).
+        let mut m = TextMeasurer::new();
+        let v = m.measure_vertical("漢字", 18.0);
+        let h = m.measure("漢字", 18.0, None);
+        assert_ne!(v, h, "vertical and horizontal dims must differ for CJK");
+        // Re-measuring returns the cached value unchanged.
+        assert_eq!(m.measure_vertical("漢字", 18.0), v);
+        assert_eq!(m.measure("漢字", 18.0, None), h);
+    }
+
+    // GPU-gated: exercise the real `build_vertices` vertical layout via the shape
+    // cache (stacking, in-column centering, and the byte→content offset map).
+
+    /// Pull the cached `ShapedGlyph`s for a block's content, sorted by `rel_y`
+    /// then `rel_x` (visual top→bottom, left→right within a row).
+    #[cfg(test)]
+    fn cached_vertical_glyphs(r: &TextRenderer, content: &str) -> Vec<(f32, f32, u32)> {
+        let mut out: Vec<(f32, f32, u32)> = r
+            .shape_cache
+            .values()
+            .filter_map(|inner| inner.get(content))
+            .flat_map(|cs| cs.glyphs.iter().map(|g| (g.rel_x, g.rel_y, g.byte_start)))
+            .collect();
+        out.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.total_cmp(&b.0)));
+        out
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn vertical_stacks_glyphs_top_to_bottom() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        let content = "あいう";
+        let block = TextBlock::new(content, 0.0, 0.0)
+            .with_size(24.0)
+            .with_font(font)
+            .with_vertical();
+        r.build_vertices(&[block]);
+
+        let glyphs = cached_vertical_glyphs(&r, content);
+        assert_eq!(glyphs.len(), 3, "three kana → three glyphs");
+        // Strictly descending rows.
+        assert!(glyphs[0].1 < glyphs[1].1 && glyphs[1].1 < glyphs[2].1);
+        // Byte offsets map back to the caller's content (3-byte kana: 0,3,6) —
+        // guards the `glyph.start - run.line_i` correction.
+        assert_eq!(glyphs[0].2, 0);
+        assert_eq!(glyphs[1].2, 3);
+        assert_eq!(glyphs[2].2, 6);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn vertical_centers_narrow_glyph_in_column() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        // A wide full-width kanji over a thin Latin 'l': the narrow row gets pushed
+        // right so it centers under the wide one (manual in-column centering).
+        let content = "漢l";
+        let block = TextBlock::new(content, 0.0, 0.0)
+            .with_size(28.0)
+            .with_font(font)
+            .with_vertical();
+        r.build_vertices(&[block]);
+
+        let glyphs = cached_vertical_glyphs(&r, content);
+        assert_eq!(glyphs.len(), 2);
+        let (wide_x, _, _) = glyphs[0]; // top row = 漢
+        let (thin_x, _, _) = glyphs[1]; // bottom row = l
+        assert!(
+            thin_x > wide_x,
+            "narrow glyph ({thin_x}) should be centered right of the wide one ({wide_x})"
         );
     }
 }

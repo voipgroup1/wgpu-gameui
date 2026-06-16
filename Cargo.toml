@@ -11,6 +11,9 @@ wgpu = "24"
 bytemuck = { version = "1", features = ["derive"] }
 glyphon = "0.8"
 log = "0.4"
+# Grapheme-cluster segmentation for vertical (stacked) text layout — splitting a
+# label into one cluster per line. Already in the tree transitively via cosmic-text.
+unicode-segmentation = "1"
 # Profiling (optional, behind "tracy" feature). Emits `tracing` spans that the
 # host application's tracing-tracy subscriber collects into the same capture.
 tracing = { version = "0.1", optional = true }

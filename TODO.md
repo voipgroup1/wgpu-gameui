@@ -517,6 +517,18 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       caret movement + edge-correct caret + multi-rect selection); multiline
       stays LTR-correct (multiline RTL caret edge-precision is a documented
       limitation, alongside direction-boundary caret affinity).
+- [x] **Vertical (stacked) text** for JP-style labels (ad-hoc, not on the original
+      backlog). API: `TextBlock::with_vertical()` stacks each grapheme cluster on
+      its own row, top-to-bottom, centered within the column; row pitch is the
+      block's `line_height`. `TextMeasurer::measure_vertical(text, font_size)`
+      returns the `(column_width, stacked_height)` for layout. cosmic-text has no
+      writing-mode API, so this lays the string out one cluster per buffer line
+      (`vertical_stack_string`) and lets cosmic's existing line stacking + manual
+      in-column centering do the rest — zero new rendering code, glyphs stay
+      upright. Scope is casual upright stacking (correct for full-width kana/kanji;
+      Latin stacks per-letter), **not** true CJK `vertical-rl` (no vertical glyph
+      variants / rotated kana-punctuation / tate-chu-yoko / right-to-left columns),
+      and labels only (no vertical `TextInput` editing).
 
 ---
 
