@@ -12,6 +12,7 @@
 //! reference implementation in citybuilder.
 
 mod atlas;
+mod blur;
 mod glyph_msdf;
 mod image_cache;
 mod msdf_atlas;
@@ -28,6 +29,7 @@ pub use phosphor::PhosphorIcon;
 pub(crate) use phosphor::{PHOSPHOR_FONT_ID, phosphor_font_data, phosphor_glyph_id};
 
 pub use atlas::{AtlasRegion, SpriteAtlas, SpriteId};
+pub use blur::{Backdrop, BlurParams};
 pub use image_cache::{ImageCache, ImageEntry, ImageError};
 pub(crate) use ui_renderer::ortho_matrix;
 pub use ui_renderer::{NineSliceMeta, UiRenderer};

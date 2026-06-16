@@ -620,7 +620,19 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       take raw `list`/`style`/`input` rather than a `DrawContext` — Tabs,
       ImageButton, the dropdown open-list — and the pure-hit-test HitZone have no
       seam and are left to the caller.)
-- [ ] **P2 — Backdrop blur** (`UiBlur`) for menu screens.
+- [x] **P2 — Backdrop blur** (`UiBlur`) for menu screens.
+      `UiRenderer::blur_backdrop(device, queue, encoder, target, &Backdrop{view,size},
+      region: Rect, viewport, scale_factor, &BlurParams{radius, downsample, tint})`.
+      Separable two-pass Gaussian over an **app-provided** scene `TextureView`
+      (the renderer never samples its own framebuffer, so blur isn't a `DrawList`
+      record — the data layer stays GPU-handle-free). Pass A blurs horizontally
+      scene→downsampled intermediate; pass B blurs vertically intermediate→target
+      over the region's NDC rect (alpha-blended, so a darkening `tint` is a scrim).
+      Pipeline built lazily on first call (`new` unchanged). Frame order:
+      render scene → `blur_backdrop(region)` → `render(panels)` on top. Pure
+      geometry/weight helpers unit-tested; GPU readback test (`tests/blur.rs`)
+      asserts a sharp edge gets smeared and wider radius widens the band; gallery
+      "Backdrop blur (UiBlur)" section shows a frosted-glass PAUSED menu.
 - [ ] **Out of scope but don't block:** depth-aware `DrawSprite`/`DrawLine`
       in 3D world space — keep UI overlay vs. world overlay passes
       separable.

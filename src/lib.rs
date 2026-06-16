@@ -65,7 +65,7 @@ pub use layer::{Layer, LayerKind, LayerStack};
 pub use projection::{world_to_screen, world_to_screen_na};
 #[cfg(feature = "phosphor-icons")]
 pub use render::PhosphorIcon;
-pub use render::{NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
+pub use render::{Backdrop, BlurParams, NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
 pub use style::{StyleKey, StyleOverlay, StyleResolver, StyleValue};
 pub use theme::Theme;
 pub use ui_context::{AlignH, AlignV, FontSpec, UiContext, UiState};

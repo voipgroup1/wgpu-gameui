@@ -13,6 +13,7 @@
 
 use wgpu_gameui::layout::{Flow as LayoutFlow, HStack, LayoutNode, MainAlign, Rect};
 use wgpu_gameui::{
+    Backdrop, BlurParams,
     Banner, Button, Checkbox, ColorPicker, ColumnWidth, Corner, DragCapture, DragHandle,
     DrawContext, DrawList, Dropdown, DropdownState, Easing, FocusState, Group, HitZone, Hsva,
     ImageButton, ImageFit, InputState, LayerStack, List,
@@ -205,6 +206,9 @@ fn render_widget_gallery() {
     // runs unconditionally, so deferred init is sound (and avoids a dead store).
     let tooltip_rect;
     let content_bottom;
+    // Reserved cell for the backdrop-blur demo; filled after layout (the blur is
+    // a renderer pass, not a DrawList record, so it runs in the encoder below).
+    let blur_rect;
 
     // =====================================================================
     // Build the base layer. The `list` borrow on `layers` is released at the
@@ -1488,6 +1492,16 @@ fn render_widget_gallery() {
             list.pop_transform();
         }
 
+        // --- Backdrop blur (UiBlur) ----------------------------------------
+        // Reserve a cell; the blur samples an app-provided "scene" texture into
+        // this region (in the encoder below) and a crisp panel is drawn on top.
+        flow.section(list, "Backdrop blur (UiBlur)");
+        {
+            let r = flow.cell(list, "Frosted-glass menu backdrop", 360.0, 150.0);
+            flow.reserve(150.0);
+            blur_rect = r;
+        }
+
         // --- Hover animation (easing) --------------------------------------
         // The animation system eases a widget's color from its idle value toward
         // its hover value over `theme.animation_duration`. A static PNG has no
@@ -1565,6 +1579,82 @@ fn render_widget_gallery() {
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
+    // --- Backdrop-blur "scene" -------------------------------------------------
+    // Stand in for the app's rendered game: a full-target texture with vivid
+    // colored stripes + text inside the reserved blur cell. `blur_backdrop` then
+    // samples this and writes a blurred copy into the cell, with a crisp panel on
+    // top — exactly the pause-menu flow (render scene → blur → draw UI).
+    let scene_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("blur scene"),
+        size: wgpu::Extent3d {
+            width: W,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let scene_view = scene_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    {
+        let mut scene_list = DrawList::new();
+        // Vivid vertical stripes across the blur cell — soft blobs once blurred.
+        let stripe_colors = [
+            [0.92, 0.26, 0.30, 1.0],
+            [0.96, 0.66, 0.18, 1.0],
+            [0.30, 0.78, 0.40, 1.0],
+            [0.22, 0.58, 0.95, 1.0],
+            [0.60, 0.36, 0.90, 1.0],
+            [0.95, 0.40, 0.70, 1.0],
+        ];
+        let n = stripe_colors.len() as f32;
+        let sw = blur_rect.width / n;
+        for (i, c) in stripe_colors.iter().enumerate() {
+            scene_list.quad(
+                blur_rect.x + i as f32 * sw,
+                blur_rect.y,
+                sw,
+                blur_rect.height,
+                *c,
+            );
+        }
+        // Big bright text to show the blur softening edges.
+        scene_list.text(
+            TextBlock::new("GAME WORLD", blur_rect.x + 24.0, blur_rect.y + 52.0)
+                .with_size(44.0)
+                .with_color(255, 255, 255),
+        );
+        let mut scene_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("scene encoder"),
+        });
+        {
+            scene_enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scene_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05,
+                            g: 0.06,
+                            b: 0.10,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        ui.render(&device, &queue, &mut scene_enc, &scene_view, (W, h), 1.0, &scene_list);
+        queue.submit(Some(scene_enc.finish()));
+    }
+
     // bytes_per_row must be 256-aligned for wgpu copy.
     let row_stride = W * 4;
     let bytes_per_row = (row_stride + 255) & !255;
@@ -1601,6 +1691,50 @@ fn render_widget_gallery() {
     }
 
     ui.render_layers(&device, &queue, &mut encoder, &view, (W, h), 1.0, &layers);
+
+    // Blur the scene into the reserved cell (a darkening scrim tint), then draw a
+    // crisp "PAUSED" panel on top — UI rendered after the blur sits sharp.
+    ui.blur_backdrop(
+        &device,
+        &queue,
+        &mut encoder,
+        &view,
+        &Backdrop {
+            view: &scene_view,
+            size: (W, h),
+        },
+        blur_rect,
+        (W, h),
+        1.0,
+        &BlurParams {
+            radius: 9.0,
+            downsample: 2,
+            tint: [0.62, 0.64, 0.72, 1.0],
+        },
+    );
+    {
+        let mut panel_list = DrawList::new();
+        let pw = 200.0;
+        let ph = 84.0;
+        let px = blur_rect.x + (blur_rect.width - pw) / 2.0;
+        let py = blur_rect.y + (blur_rect.height - ph) / 2.0;
+        let panel = Rect::new(px, py, pw, ph);
+        panel_list.rounded_rect(panel, 8.0, [0.12, 0.13, 0.17, 0.92]);
+        panel_list.rect_outline(panel, 1.0, [0.40, 0.44, 0.52, 1.0]);
+        panel_list.text(
+            TextBlock::new("PAUSED", px + 20.0, py + 16.0)
+                .with_size(22.0)
+                .with_color(240, 244, 255),
+        );
+        let btn = Rect::new(px + 20.0, py + 50.0, pw - 40.0, 22.0);
+        panel_list.rounded_rect(btn, 4.0, [0.22, 0.50, 0.85, 1.0]);
+        panel_list.text(
+            TextBlock::new("Resume", btn.x + 12.0, btn.y + 4.0)
+                .with_size(13.0)
+                .with_color(255, 255, 255),
+        );
+        ui.render(&device, &queue, &mut encoder, &view, (W, h), 1.0, &panel_list);
+    }
 
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {

@@ -8,7 +8,9 @@ use wgpu::util::DeviceExt;
 
 use crate::TextRenderer;
 use crate::layer::LayerStack;
+use crate::layout::Rect;
 use crate::render::atlas::{SpriteAtlas, SpriteId};
+use crate::render::blur::{Backdrop, Blur, BlurParams};
 use crate::render::image_cache::{ImageCache, ImageEntry, ImageError, decode_rgba8};
 use crate::text::FontSystemHandle;
 use crate::widgets::{
@@ -210,6 +212,11 @@ pub struct UiRenderer {
     nine_inst_buffer: wgpu::Buffer,
     nine_inst_capacity: u64,
     nine_inst_offset: u64,
+
+    // Target color format (used for the lazily-built backdrop-blur pipeline).
+    format: wgpu::TextureFormat,
+    // Backdrop blur — built on first `blur_backdrop` call so `new` is unchanged.
+    blur: Option<Blur>,
 
     // Text
     text_renderer: TextRenderer,
@@ -593,6 +600,8 @@ impl UiRenderer {
             nine_inst_buffer,
             nine_inst_capacity,
             nine_inst_offset: 0,
+            format,
+            blur: None,
             text_renderer,
             warned_missing: RefCell::new(HashSet::new()),
         }
@@ -833,6 +842,59 @@ impl UiRenderer {
         for layer in layers.layers() {
             self.render_one(device, queue, encoder, view, &layer.list);
         }
+    }
+
+    /// Blur an **app-provided** scene texture into `target` over `region`, for
+    /// menu/pause "frosted glass" backdrops.
+    ///
+    /// The renderer never samples its own framebuffer, so the app supplies the
+    /// already-rendered scene as a sampleable [`Backdrop`] (a `TextureView` with
+    /// `TEXTURE_BINDING` usage plus its physical size). This records a separable
+    /// two-pass Gaussian into `encoder` and writes the blurred region straight
+    /// into `target`; draw the UI panels afterwards so they sit crisp on top.
+    ///
+    /// `region` is in **logical** pixels (UI coordinates); `viewport` is the
+    /// target's **physical** size and `scale_factor` the logical→physical ratio,
+    /// matching [`render`](Self::render). A degenerate region is a no-op.
+    ///
+    /// Typical frame: render scene → `blur_backdrop(region)` → `render(panels)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blur_backdrop(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        backdrop: &Backdrop,
+        region: Rect,
+        viewport: (u32, u32),
+        scale_factor: f32,
+        params: &BlurParams,
+    ) {
+        let scale = if scale_factor > 0.0 { scale_factor } else { 1.0 };
+        let region_phys = [
+            region.x * scale,
+            region.y * scale,
+            region.width * scale,
+            region.height * scale,
+        ];
+        if region_phys[2] <= 0.0 || region_phys[3] <= 0.0 {
+            return;
+        }
+        if self.blur.is_none() {
+            self.blur = Some(Blur::new(device, self.format));
+        }
+        let blur = self.blur.as_mut().expect("blur just ensured");
+        blur.run(
+            device,
+            queue,
+            encoder,
+            target,
+            backdrop,
+            region_phys,
+            viewport,
+            params,
+        );
     }
 
     fn prepare_frame(
