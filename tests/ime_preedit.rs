@@ -178,7 +178,7 @@ fn render_focused_composing_text_input() {
 
     let field_x0 = field.x as u32;
     let field_x1 = (field.x + field.width).min(W as f32) as u32;
-    // Lower portion of the field — the underline sits near font_size * 0.9.
+    // Lower portion of the field — the underline sits just below the baseline.
     let y_lo = (field.y + field.height * 0.45) as u32;
     let y_hi = (field.y + field.height).min(H as f32) as u32;
 

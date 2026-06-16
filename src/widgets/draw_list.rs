@@ -1313,7 +1313,13 @@ impl DrawList {
         if block.spans.iter().any(|s| s.underline.is_some()) {
             let positions =
                 self.text_cursor_positions(&block.content, block.font_size, Some(block.max_width));
-            let underline_y = block.y + block.font_size * 0.9;
+            // Sit the underline just below the baseline so it clears the letter
+            // bottoms. `baseline_ratio` (~1.0 of the em) locates the baseline
+            // below the block top; the old flat `0.9` sat *above* it, cutting
+            // through the glyph bottoms. The small extra gap drops it into the
+            // descender zone, font-metric-relative so it scales with any face.
+            let vm = self.font_vmetrics(block.font.as_ref());
+            let underline_y = block.y + block.font_size * (vm.baseline_ratio + 0.12);
             let thickness = (block.font_size * 0.07).max(1.0);
             let mut span_byte = 0usize;
             for span in &block.spans {
