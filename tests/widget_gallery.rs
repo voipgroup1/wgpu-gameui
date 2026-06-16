@@ -761,7 +761,9 @@ fn render_widget_gallery() {
                     TextSpan {
                         text: "underlined".into(),
                         color: Some([1.0, 0.9, 0.3, 1.0]),
-                        underline: Some([1.0, 0.8, 0.0, 1.0]),
+                        // Underline matches the glyph colour (the common case);
+                        // it can still be set independently for a contrast rule.
+                        underline: Some([1.0, 0.9, 0.3, 1.0]),
                     },
                     TextSpan {
                         text: " end".into(),
