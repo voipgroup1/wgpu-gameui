@@ -21,7 +21,7 @@ use wgpu_gameui::{
     SelectionMode, Separator, Severity, Slider, StyleKey, StyleOverlay, StyleResolver, Table,
     TableCell, TableColumn,
     Tabs, TextAlign, TextBlock, TextDirection, TextInput, Toast, ToastStack, TextSpan, Theme,
-    TooltipContent,
+    TooltipContent, Underline,
     TooltipLayer,
     TreeAction, TreeNode, TreeState, UiContext, UiRenderer, UiState, ease, lerp_color,
 };
@@ -722,27 +722,27 @@ fn render_widget_gallery() {
                     TextSpan {
                         text: "Red".into(),
                         color: Some([1.0, 0.2, 0.2, 1.0]),
-                        underline: None,
+                        underline: Underline::None,
                     },
                     TextSpan {
                         text: " · ".into(),
                         color: Some([0.8, 0.8, 0.8, 1.0]),
-                        underline: None,
+                        underline: Underline::None,
                     },
                     TextSpan {
                         text: "Green".into(),
                         color: Some([0.2, 1.0, 0.4, 1.0]),
-                        underline: None,
+                        underline: Underline::None,
                     },
                     TextSpan {
                         text: " · ".into(),
                         color: Some([0.8, 0.8, 0.8, 1.0]),
-                        underline: None,
+                        underline: Underline::None,
                     },
                     TextSpan {
                         text: "Blue".into(),
                         color: Some([0.3, 0.6, 1.0, 1.0]),
-                        underline: None,
+                        underline: Underline::None,
                     },
                 ]),
         );
@@ -756,19 +756,19 @@ fn render_widget_gallery() {
                     TextSpan {
                         text: "normal ".into(),
                         color: None,
-                        underline: None,
+                        underline: Underline::None,
                     },
                     TextSpan {
                         text: "underlined".into(),
                         color: Some([1.0, 0.9, 0.3, 1.0]),
-                        // Underline matches the glyph colour (the common case);
-                        // it can still be set independently for a contrast rule.
-                        underline: Some([1.0, 0.9, 0.3, 1.0]),
+                        // Inherit → the underline tracks the glyph colour (the
+                        // common case); use `Underline::Color` for a contrast rule.
+                        underline: Underline::Inherit,
                     },
                     TextSpan {
                         text: " end".into(),
                         color: None,
-                        underline: None,
+                        underline: Underline::None,
                     },
                 ]),
         );

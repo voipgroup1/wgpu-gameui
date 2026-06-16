@@ -2872,6 +2872,31 @@ fn ellipsize_to_width(
     s
 }
 
+/// How a [`TextSpan`] is underlined.
+///
+/// The underline rect is emitted as a coloured soup quad at [`DrawList::text`]
+/// time so it renders beneath the MSDF glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Underline {
+    /// No underline (default).
+    #[default]
+    None,
+    /// Underline using the span's text colour — its [`color`](TextSpan::color),
+    /// or the block colour when the span sets none. The common case: an
+    /// underline that tracks whatever colour the text is.
+    Inherit,
+    /// Underline with an explicit `[r, g, b, a]` colour (`0.0..=1.0`), regardless
+    /// of the glyph colour — for a contrasting underline rule.
+    Color([f32; 4]),
+}
+
+impl From<[f32; 4]> for Underline {
+    /// An explicit `[r, g, b, a]` colour becomes [`Underline::Color`].
+    fn from(c: [f32; 4]) -> Self {
+        Underline::Color(c)
+    }
+}
+
 /// A run of text within a [`TextBlock`] with optional per-span colour and
 /// underline overrides.
 ///
@@ -2886,10 +2911,10 @@ pub struct TextSpan {
     /// Per-span fill colour as `[r, g, b, a]` in `0.0..=1.0`. `None` →
     /// inherit the block's colour.
     pub color: Option<[f32; 4]>,
-    /// Underline colour in `[r, g, b, a]` (same range). `None` → no underline.
-    /// The underline rect is emitted as a coloured soup quad at
-    /// [`DrawList::text`] time so it renders beneath the MSDF glyphs.
-    pub underline: Option<[f32; 4]>,
+    /// Underline style. [`Underline::None`] (default) draws nothing;
+    /// [`Underline::Inherit`] tracks the text colour; [`Underline::Color`]
+    /// overrides it.
+    pub underline: Underline,
 }
 
 /// Crisp outline drawn around glyphs, composited under the fill. Maps to
@@ -3198,7 +3223,7 @@ mod tests {
         byte_at_point, byte_on_adjacent_line, caret_for_byte, color_to_rgba, cosmic_align,
         direction_prefix, ellipsize_to_width, field_reach, has_cjk, has_lowercase, load_font_bytes,
         measure_with_font_system, resolve_span_color, selection_rects, shared_font_system,
-        text_caret_layout, text_cursor_positions, text_visual_layout, vcentered_line_y,
+        text_caret_layout, text_cursor_positions, text_visual_layout, Underline, vcentered_line_y,
         vertical_stack_string, visual_caret_neighbor,
     };
     use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping, Style, Weight};
@@ -3223,17 +3248,17 @@ mod tests {
             TextSpan {
                 text: "Hello".into(),
                 color: Some(red()),
-                underline: None,
+                underline: Underline::None,
             },
             TextSpan {
                 text: " ".into(),
                 color: None,
-                underline: None,
+                underline: Underline::None,
             },
             TextSpan {
                 text: "World".into(),
                 color: Some(blue()),
-                underline: None,
+                underline: Underline::None,
             },
         ];
         // First span: bytes 0–4
@@ -3257,12 +3282,12 @@ mod tests {
             TextSpan {
                 text: "abc".into(),
                 color: None,
-                underline: None,
+                underline: Underline::None,
             },
             TextSpan {
                 text: "def".into(),
                 color: None,
-                underline: None,
+                underline: Underline::None,
             },
         ];
         assert_eq!(resolve_span_color(0, &spans), None);
@@ -3276,12 +3301,12 @@ mod tests {
             TextSpan {
                 text: "café".into(),
                 color: Some(red()),
-                underline: None,
+                underline: Underline::None,
             },
             TextSpan {
                 text: "!".into(),
                 color: Some(green()),
-                underline: None,
+                underline: Underline::None,
             },
         ];
         // 'é' is at byte offset 3 (0xc3 0xa9), so byte 3 and 4 are in first span
@@ -3299,17 +3324,17 @@ mod tests {
             TextSpan {
                 text: "Hello".into(),
                 color: None,
-                underline: None,
+                underline: Underline::None,
             },
             TextSpan {
                 text: " ".into(),
                 color: None,
-                underline: None,
+                underline: Underline::None,
             },
             TextSpan {
                 text: "World".into(),
                 color: None,
-                underline: None,
+                underline: Underline::None,
             },
         ]);
         // Content is derived by DrawList::text at draw time, not in the builder.
@@ -4511,8 +4536,8 @@ mod tests {
         // but `byte_start` is corrected back so per-span colour resolution is
         // unaffected. The set of emitted fills must match between Auto and Rtl.
         let spans = vec![
-            TextSpan { text: "AB".into(), color: Some(red()), underline: None },
-            TextSpan { text: "cd".into(), color: Some(blue()), underline: None },
+            TextSpan { text: "AB".into(), color: Some(red()), underline: Underline::None },
+            TextSpan { text: "cd".into(), color: Some(blue()), underline: Underline::None },
         ];
         let auto = label("ABcd", &font).with_spans(spans.clone());
         let rtl = label("ABcd", &font)

@@ -8,7 +8,7 @@
 //! - "RED" appears in red, "WHITE" in white, "BLUE" in blue (top row).
 //! - The second row shows a yellow underline beneath an underlined word.
 
-use wgpu_gameui::{DrawList, TextBlock, TextSpan, UiRenderer};
+use wgpu_gameui::{DrawList, TextBlock, TextSpan, Underline, UiRenderer};
 
 const W: u32 = 512;
 const H: u32 = 256;
@@ -77,17 +77,17 @@ fn render_span_colours_and_underline() {
                 TextSpan {
                     text: "RED".into(),
                     color: Some([1.0, 0.0, 0.0, 1.0]),
-                    underline: None,
+                    underline: Underline::None,
                 },
                 TextSpan {
                     text: " | ".into(),
                     color: Some([1.0, 1.0, 1.0, 1.0]),
-                    underline: None,
+                    underline: Underline::None,
                 },
                 TextSpan {
                     text: "BLUE".into(),
                     color: Some([0.0, 0.3, 1.0, 1.0]),
-                    underline: None,
+                    underline: Underline::None,
                 },
             ]),
     );
@@ -102,17 +102,17 @@ fn render_span_colours_and_underline() {
                 TextSpan {
                     text: "normal ".into(),
                     color: None,
-                    underline: None,
+                    underline: Underline::None,
                 },
                 TextSpan {
                     text: "underlined".into(),
                     color: None,
-                    underline: Some([1.0, 0.9, 0.0, 1.0]), // yellow underline
+                    underline: Underline::Color([1.0, 0.9, 0.0, 1.0]), // explicit yellow override
                 },
                 TextSpan {
                     text: " text".into(),
                     color: None,
-                    underline: None,
+                    underline: Underline::None,
                 },
             ]),
     );

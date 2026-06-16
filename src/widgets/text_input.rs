@@ -6,8 +6,8 @@ use crate::InputState;
 use crate::StyleKey;
 use crate::layout::Rect;
 use crate::text::{
-    CaretPos, TextBlock, TextSpan, VisualGlyph, WrapMode, byte_at_point, byte_on_adjacent_line,
-    caret_for_byte, selection_rects, visual_caret_neighbor,
+    CaretPos, TextBlock, TextSpan, Underline, VisualGlyph, WrapMode, byte_at_point,
+    byte_on_adjacent_line, caret_for_byte, selection_rects, visual_caret_neighbor,
 };
 
 use super::{DrawContext, FocusId};
@@ -44,7 +44,6 @@ fn compose_preedit(
     cursor_pos: usize,
     preedit: &str,
     preedit_cursor: Option<[usize; 2]>,
-    underline: [f32; 4],
 ) -> (String, Vec<TextSpan>, usize) {
     let cursor = floor_char_boundary(value, cursor_pos);
     let before = &value[..cursor];
@@ -60,19 +59,20 @@ fn compose_preedit(
         spans.push(TextSpan {
             text: before.to_string(),
             color: None,
-            underline: None,
+            underline: Underline::None,
         });
     }
     spans.push(TextSpan {
         text: preedit.to_string(),
         color: None,
-        underline: Some(underline),
+        // The preedit underline tracks the field's text colour.
+        underline: Underline::Inherit,
     });
     if !after.is_empty() {
         spans.push(TextSpan {
             text: after.to_string(),
             color: None,
-            underline: None,
+            underline: Underline::None,
         });
     }
 
@@ -1083,7 +1083,6 @@ impl TextInput {
                 self.cursor_pos,
                 &input.preedit,
                 input.preedit_cursor,
-                s.color(StyleKey::Text), // underline colour matches the text
             ))
         } else {
             None
@@ -2033,15 +2032,13 @@ mod tests {
 
     // ---- IME preedit composition (compose_preedit) ----
 
-    const UL: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-
     #[test]
     fn compose_preedit_empty_value_single_underlined_span() {
-        let (display, spans, caret) = compose_preedit("", 0, "ㄓㄨ", None, UL);
+        let (display, spans, caret) = compose_preedit("", 0, "ㄓㄨ", None);
         assert_eq!(display, "ㄓㄨ");
         assert_eq!(spans.len(), 1, "no before/after segments → one span");
         assert_eq!(spans[0].text, "ㄓㄨ");
-        assert_eq!(spans[0].underline, Some(UL));
+        assert_eq!(spans[0].underline, Underline::Inherit);
         assert_eq!(spans[0].color, None, "preedit inherits the block colour");
         // Caret at end of preedit (no preedit_cursor): 'ㄓㄨ' is 6 bytes.
         assert_eq!(caret, 6);
@@ -2050,15 +2047,15 @@ mod tests {
     #[test]
     fn compose_preedit_caret_mid_value_splices_in_order() {
         // value "abXYZ", caret after "ab" (byte 2), preedit "QQ".
-        let (display, spans, caret) = compose_preedit("abXYZ", 2, "QQ", None, UL);
+        let (display, spans, caret) = compose_preedit("abXYZ", 2, "QQ", None);
         assert_eq!(display, "abQQXYZ");
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].text, "ab");
-        assert_eq!(spans[0].underline, None);
+        assert_eq!(spans[0].underline, Underline::None);
         assert_eq!(spans[1].text, "QQ");
-        assert_eq!(spans[1].underline, Some(UL));
+        assert_eq!(spans[1].underline, Underline::Inherit);
         assert_eq!(spans[2].text, "XYZ");
-        assert_eq!(spans[2].underline, None);
+        assert_eq!(spans[2].underline, Underline::None);
         // Caret at end of preedit: 2 (before) + 2 (preedit) = 4.
         assert_eq!(caret, 4);
     }
@@ -2066,36 +2063,36 @@ mod tests {
     #[test]
     fn compose_preedit_uses_preedit_cursor_start() {
         // preedit_cursor [1,1] → caret one byte into the preedit.
-        let (_display, _spans, caret) = compose_preedit("ab", 2, "QQ", Some([1, 1]), UL);
+        let (_display, _spans, caret) = compose_preedit("ab", 2, "QQ", Some([1, 1]));
         assert_eq!(caret, 2 + 1);
     }
 
     #[test]
     fn compose_preedit_at_value_start_omits_before_span() {
-        let (display, spans, caret) = compose_preedit("xyz", 0, "PRE", None, UL);
+        let (display, spans, caret) = compose_preedit("xyz", 0, "PRE", None);
         assert_eq!(display, "PRExyz");
         assert_eq!(spans.len(), 2, "empty before segment is omitted");
         assert_eq!(spans[0].text, "PRE");
-        assert_eq!(spans[0].underline, Some(UL));
+        assert_eq!(spans[0].underline, Underline::Inherit);
         assert_eq!(spans[1].text, "xyz");
         assert_eq!(caret, 3);
     }
 
     #[test]
     fn compose_preedit_at_value_end_omits_after_span() {
-        let (display, spans, _caret) = compose_preedit("xyz", 3, "PRE", None, UL);
+        let (display, spans, _caret) = compose_preedit("xyz", 3, "PRE", None);
         assert_eq!(display, "xyzPRE");
         assert_eq!(spans.len(), 2, "empty after segment is omitted");
         assert_eq!(spans[0].text, "xyz");
         assert_eq!(spans[1].text, "PRE");
-        assert_eq!(spans[1].underline, Some(UL));
+        assert_eq!(spans[1].underline, Underline::Inherit);
     }
 
     #[test]
     fn compose_preedit_multibyte_value_and_preedit_on_boundaries() {
         // value "あい" (each 3 bytes), caret after first char (byte 3),
         // preedit "ん" (3 bytes).
-        let (display, spans, caret) = compose_preedit("あい", 3, "ん", None, UL);
+        let (display, spans, caret) = compose_preedit("あい", 3, "ん", None);
         assert_eq!(display, "あんい");
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].text, "あ");
@@ -2107,7 +2104,7 @@ mod tests {
     #[test]
     fn compose_preedit_cursor_past_end_is_clamped() {
         // A cursor_pos beyond the value length is clamped to value.len().
-        let (display, _spans, caret) = compose_preedit("ab", 999, "Q", None, UL);
+        let (display, _spans, caret) = compose_preedit("ab", 999, "Q", None);
         assert_eq!(display, "abQ");
         assert_eq!(caret, 3);
     }

@@ -5,7 +5,7 @@ use crate::layout::Rect;
 use crate::render::SpriteId;
 #[cfg(feature = "phosphor-icons")]
 use crate::render::{PhosphorIcon, phosphor_glyph_id};
-use crate::text::{FontHandle, FontSystemHandle, FontVMetrics, TextBlock, TextMeasurer};
+use crate::text::{FontHandle, FontSystemHandle, FontVMetrics, TextBlock, TextMeasurer, Underline};
 
 pub(crate) const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
 
@@ -1295,7 +1295,10 @@ impl DrawList {
                     c[2] = (c[2] * tint[2]).clamp(0.0, 1.0);
                     c[3] = (c[3] * tint[3]).clamp(0.0, 1.0);
                 }
-                if let Some(c) = &mut span.underline {
+                // Only an explicit underline colour needs tinting here; an
+                // inheriting underline reads the already-tinted span/block colour
+                // at emission time.
+                if let Underline::Color(c) = &mut span.underline {
                     c[0] = (c[0] * tint[0]).clamp(0.0, 1.0);
                     c[1] = (c[1] * tint[1]).clamp(0.0, 1.0);
                     c[2] = (c[2] * tint[2]).clamp(0.0, 1.0);
@@ -1310,7 +1313,11 @@ impl DrawList {
         // the active transform uniformly — matching exactly what the text
         // pipeline does. Soup geometry draws before text glyphs, so the
         // underlines naturally appear beneath the MSDF rendering.
-        if block.spans.iter().any(|s| s.underline.is_some()) {
+        if block
+            .spans
+            .iter()
+            .any(|s| !matches!(s.underline, Underline::None))
+        {
             let positions =
                 self.text_cursor_positions(&block.content, block.font_size, Some(block.max_width));
             // Sit the underline just below the baseline so it clears the letter
@@ -1321,9 +1328,24 @@ impl DrawList {
             let vm = self.font_vmetrics(block.font.as_ref());
             let underline_y = block.y + block.font_size * (vm.baseline_ratio + 0.12);
             let thickness = (block.font_size * 0.07).max(1.0);
+            // The block colour (already tinted above), as the fallback for an
+            // inheriting underline on a span with no colour of its own.
+            let block_rgba = [
+                block.color.r() as f32 / 255.0,
+                block.color.g() as f32 / 255.0,
+                block.color.b() as f32 / 255.0,
+                block.color.a() as f32 / 255.0,
+            ];
             let mut span_byte = 0usize;
             for span in &block.spans {
-                if let Some(ul_color) = span.underline {
+                // Inherit → the span's text colour (or the block colour); Color →
+                // the explicit (tinted) override; None → no underline.
+                let ul_color = match span.underline {
+                    Underline::None => None,
+                    Underline::Inherit => Some(span.color.unwrap_or(block_rgba)),
+                    Underline::Color(c) => Some(c),
+                };
+                if let Some(ul_color) = ul_color {
                     let x_start = span_cursor_x(&positions, span_byte);
                     let end_byte = span_byte + span.text.len();
                     let x_end = span_cursor_x(&positions, end_byte);
@@ -1798,6 +1820,59 @@ mod tests {
         list.truncate_clip(base);
         assert_eq!(list.clip_len(), 0);
         assert_eq!(list.current_clip(), None);
+    }
+
+    #[test]
+    fn underline_inherit_uses_span_then_block_colour() {
+        use crate::text::{TextBlock, TextSpan, Underline};
+
+        // Three underlined spans: Inherit-with-span-colour, Inherit-without
+        // (falls back to block colour), and an explicit Colour override. Each
+        // underline lands as a thin translate-only quad in chrome_instances,
+        // carrying its resolved colour in `bg`.
+        let span_red = [1.0, 0.0, 0.0, 1.0];
+        let override_yellow = [1.0, 0.9, 0.0, 1.0];
+        let mut list = DrawList::with_font_system(crate::shared_font_system());
+        list.text(
+            TextBlock::new("", 18.0, 10.0)
+                .with_size(24.0)
+                .with_color(0, 200, 0) // block green
+                .with_spans(vec![
+                    TextSpan {
+                        text: "red ".into(),
+                        color: Some(span_red),
+                        underline: Underline::Inherit,
+                    },
+                    TextSpan {
+                        text: "green ".into(),
+                        color: None,
+                        underline: Underline::Inherit,
+                    },
+                    TextSpan {
+                        text: "yellow".into(),
+                        color: None,
+                        underline: Underline::Color(override_yellow),
+                    },
+                ]),
+        );
+
+        let block_green = [0.0, 200.0 / 255.0, 0.0, 1.0];
+        let has_colour = |want: [f32; 4]| {
+            list.chrome_instances.iter().any(|c| {
+                c.bg.iter()
+                    .zip(want.iter())
+                    .all(|(a, b)| (a - b).abs() < 1e-3)
+            })
+        };
+        assert!(has_colour(span_red), "inherit underline should use span colour");
+        assert!(
+            has_colour(block_green),
+            "inherit underline w/o span colour should fall back to block colour"
+        );
+        assert!(
+            has_colour(override_yellow),
+            "explicit Colour underline should use the override"
+        );
     }
 
     // ---- Transform/tint stack tests ----

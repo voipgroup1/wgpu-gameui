@@ -31,6 +31,7 @@ mod text;
 pub use text::{
     CaretPos, FontHandle, FontSystemHandle, FontVMetrics, SelRect, TextAlign, TextBlock,
     TextDirection, TextGlow, TextMeasurer, TextOutline, TextRenderer, TextShadow, TextSpan,
+    Underline,
     VisualCaret, VisualGlyph, WrapMode, byte_at_point, byte_on_adjacent_line, caret_for_byte,
     load_font_bytes, load_font_file, register_bundled_fonts, resolve_span_color, selection_rects,
     shared_font_system, text_caret_layout, text_cursor_positions, text_visual_layout,
