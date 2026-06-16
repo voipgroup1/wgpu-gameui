@@ -46,6 +46,7 @@ mod click_tracker;
 pub mod color;
 mod cursor;
 mod drag_tracker;
+mod frame;
 pub mod layer;
 pub mod layout;
 pub mod projection;
@@ -61,6 +62,7 @@ pub use click_tracker::{ClickTracker, DEFAULT_DOUBLE_CLICK_THRESHOLD, DEFAULT_HO
 pub use color::Hsva;
 pub use cursor::{CursorIcon, CursorState};
 pub use drag_tracker::{DEFAULT_DRAG_THRESHOLD, DragTracker};
+pub use frame::Frame;
 pub use layer::{Layer, LayerKind, LayerStack};
 pub use projection::{world_to_screen, world_to_screen_na};
 #[cfg(feature = "phosphor-icons")]

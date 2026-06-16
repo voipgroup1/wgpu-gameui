@@ -422,8 +422,18 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `slider` reuses its DragId, tree verbs register one reserved `FocusId` and
       draw the ring on the selected row.
 - [ ] **P2 — Controller / gamepad** input abstraction.
-- [ ] **P2 — Explicit `Frame`/`Ui` builder** that consumes input and produces
+- [x] **P2 — Explicit `Frame`/`Ui` builder** that consumes input and produces
       a draw list, instead of implicit `end_frame` that callers can forget.
+      `Frame::new(&mut state, &input, &theme).dt(dt).run(&mut list, |ui| { … })`
+      (and `.run_layers(&mut layers, |ui| …)`; sugar `state.frame(&input,&theme)`).
+      Closure-scoped: runs `UiState::begin_frame` before the build closure and
+      `UiState::end_frame` after — the pair can't be forgotten or mis-ordered,
+      and the closure's return value is threaded back out. `UiContext` is built
+      interactive inside, dropped (firing its push/pop balance checks) before
+      `end_frame`. **Per-surface scope by design**: `Frame` does *not* call
+      `InputState::end_frame` (that clears per-frame edges and must run once per
+      whole app frame, after all surfaces/layers/manual widgets) — that single
+      call stays the caller's. `src/frame.rs`; unit tests + doctest.
 
 ---
 
