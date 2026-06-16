@@ -207,9 +207,9 @@ impl<'a> RadioGroup<'a> {
                 // one happened this frame, else the incoming `selected`.
                 let base = result.unwrap_or(selected);
                 let (prev, next) = if self.horizontal {
-                    (input.key_left, input.key_right)
+                    (input.nav.left, input.nav.right)
                 } else {
-                    (input.key_up, input.key_down)
+                    (input.nav.up, input.nav.down)
                 };
                 let n = self.options.len();
                 if n > 0 {
@@ -366,23 +366,27 @@ mod tests {
     // ---- Keyboard navigation ----
 
     fn arrows(up: bool, down: bool) -> InputState {
-        InputState {
+        let mut s = InputState {
             key_up: up,
             key_down: down,
             mouse_x: -1.0,
             mouse_y: -1.0,
             ..Default::default()
-        }
+        };
+        crate::map_keyboard(&mut s); // arrows → nav directional
+        s
     }
 
     fn arrows_h(left: bool, right: bool) -> InputState {
-        InputState {
+        let mut s = InputState {
             key_left: left,
             key_right: right,
             mouse_x: -1.0,
             mouse_y: -1.0,
             ..Default::default()
-        }
+        };
+        crate::map_keyboard(&mut s); // arrows → nav directional
+        s
     }
 
     #[test]

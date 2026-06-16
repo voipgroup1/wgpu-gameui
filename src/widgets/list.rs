@@ -77,13 +77,14 @@ struct NavKeys {
 impl NavKeys {
     fn raw(input: &InputState) -> Self {
         Self {
-            up: input.key_up,
-            down: input.key_down,
-            left: input.key_left,
-            right: input.key_right,
+            up: input.nav.up,
+            down: input.nav.down,
+            left: input.nav.left,
+            right: input.nav.right,
+            // Home/End have no device-agnostic nav intent — they stay keyboard-only.
             home: input.key_home,
             end: input.key_end,
-            activate: input.enter_pressed || input.key_space,
+            activate: input.nav.confirm,
         }
     }
 }
@@ -582,6 +583,9 @@ mod tests {
         st: &mut ListState,
         input: &mut InputState,
     ) -> ListOutput {
+        // Tests set raw key edges; map them into `nav` intents (which the list
+        // reads) the same way a real frame's `NavMap` would.
+        crate::map_keyboard(input);
         let mut dl = DrawList::new();
         let th = theme();
         list_w.draw(

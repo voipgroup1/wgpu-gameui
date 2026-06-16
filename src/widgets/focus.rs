@@ -105,16 +105,25 @@ impl FocusState {
     }
 
     /// Begin a frame: clear the draw-order ring and capture this frame's
-    /// Tab/Escape/click edges from `input`. Call once per frame, before drawing
-    /// the focusable widgets, with the same input those widgets receive.
+    /// navigation edges from `input` — [`nav.next`]/[`nav.prev`] cycle focus
+    /// (mapped from Tab / Shift+Tab by default) and [`nav.cancel`] blurs (Escape)
+    /// — plus the click edge. Call once per frame, before drawing the focusable
+    /// widgets, with the same input those widgets receive (its `nav` intents must
+    /// already be populated by the frame's [`NavMap`](crate::NavMap)).
+    ///
+    /// [`nav.next`]: crate::NavInput::next
+    /// [`nav.prev`]: crate::NavInput::prev
+    /// [`nav.cancel`]: crate::NavInput::cancel
     pub fn begin_frame(&mut self, input: &InputState) {
         self.order.clear();
-        self.tab = if input.key_tab {
-            if input.shift_pressed { -1 } else { 1 }
+        self.tab = if input.nav.next {
+            1
+        } else if input.nav.prev {
+            -1
         } else {
             0
         };
-        self.escape = input.key_escape;
+        self.escape = input.nav.cancel;
         self.mouse_clicked = input.mouse_clicked;
         self.ime_request = None;
         self.click_claimed = false;
@@ -245,15 +254,19 @@ impl FocusState {
 mod tests {
     use super::*;
 
-    /// Build an `InputState` with the focus-relevant edges set.
+    /// Build an `InputState` with the focus-relevant edges set, mapped through the
+    /// default keyboard binding so `nav` intents (which `begin_frame` reads) are
+    /// populated — Tab → `nav.next`, Shift+Tab → `nav.prev`, Escape → `nav.cancel`.
     fn input(tab: bool, shift: bool, escape: bool, clicked: bool) -> InputState {
-        InputState {
+        let mut s = InputState {
             key_tab: tab,
             shift_pressed: shift,
             key_escape: escape,
             mouse_clicked: clicked,
             ..Default::default()
-        }
+        };
+        crate::map_keyboard(&mut s);
+        s
     }
 
     #[test]

@@ -49,6 +49,7 @@ mod drag_tracker;
 mod frame;
 pub mod layer;
 pub mod layout;
+mod nav;
 pub mod projection;
 pub mod render;
 mod style;
@@ -64,6 +65,7 @@ pub use cursor::{CursorIcon, CursorState};
 pub use drag_tracker::{DEFAULT_DRAG_THRESHOLD, DragTracker};
 pub use frame::Frame;
 pub use layer::{Layer, LayerKind, LayerStack};
+pub use nav::{GamepadNav, KeyboardNav, ManualNav, NavInput, NavMap, map_gamepad, map_keyboard};
 pub use projection::{world_to_screen, world_to_screen_na};
 #[cfg(feature = "phosphor-icons")]
 pub use render::PhosphorIcon;
@@ -177,6 +179,15 @@ pub struct InputState {
     pub shift_pressed: bool,
     /// Ctrl (or Cmd on macOS) key is currently held.
     pub ctrl_pressed: bool,
+    /// Device-agnostic navigation intents for this frame (directional, confirm,
+    /// cancel, focus next/prev). Filled by a [`NavMap`] — passed to
+    /// [`UiState::begin_frame`](crate::UiState::begin_frame) / [`Frame::new`] —
+    /// from the raw fields above and/or a [`GamepadNav`] snapshot. The focus
+    /// system and widgets read *these* rather than raw key names, so keyboard and
+    /// gamepad share one vocabulary. Per-frame edges, cleared by [`end_frame`].
+    ///
+    /// [`end_frame`]: InputState::end_frame
+    pub nav: NavInput,
 }
 
 impl InputState {
@@ -222,6 +233,9 @@ impl InputState {
         self.key_space = false;
         self.key_up = false;
         self.key_down = false;
+        // Navigation intents are per-frame edges (like the key events they're
+        // mapped from), so clear them too. The next frame's `NavMap` repopulates.
+        self.nav = NavInput::default();
         // shift_pressed and ctrl_pressed are held-state, cleared by the
         // windowing layer on key-up; they persist across frames.
     }
@@ -274,6 +288,8 @@ impl InputState {
             key_space: false,
             key_up: false,
             key_down: false,
+            // A layer under a modal/popup must not navigate either.
+            nav: NavInput::default(),
             // shift/ctrl are modifier state, not events — preserve them
             // so modals that have text inputs still see modifier keys.
             ..self.clone()

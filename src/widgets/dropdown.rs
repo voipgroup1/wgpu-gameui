@@ -129,12 +129,12 @@ impl DropdownState {
     /// Call once per frame, before [`push_open_layer`](Self::push_open_layer).
     pub fn begin_frame(&mut self, input: &InputState) {
         self.geom = self.next_geom.take();
-        self.escape = input.key_escape;
+        self.escape = input.nav.cancel;
         self.mouse_clicked = input.mouse_clicked;
         self.click_claimed = false;
-        self.key_up = input.key_up;
-        self.key_down = input.key_down;
-        self.enter = input.enter_pressed;
+        self.key_up = input.nav.up;
+        self.key_down = input.nav.down;
+        self.enter = input.nav.confirm;
     }
 
     /// True when `id` is the open dropdown.
@@ -232,11 +232,11 @@ impl DropdownState {
         self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
         let scroll = self.scroll_offset;
 
-        // ---- Keyboard navigation ----
-        // Arrow keys move the highlight. This uses the raw input (not
-        // layer-dispatched) because keyboard events aren't positional.
+        // ---- Keyboard / gamepad navigation ----
+        // Directional intents move the highlight. This uses the raw input (not
+        // layer-dispatched) because navigation isn't positional.
         if !geom.items.is_empty() {
-            if input.key_up {
+            if input.nav.up {
                 self.highlighted = self.highlighted.saturating_sub(1);
                 // Scroll to keep highlighted in view.
                 let top = self.highlighted as f32 * geom.item_h;
@@ -247,7 +247,7 @@ impl DropdownState {
                     self.scroll_offset = bottom - list_rect.height;
                 }
             }
-            if input.key_down {
+            if input.nav.down {
                 self.highlighted = (self.highlighted + 1).min(geom.items.len() - 1);
                 let top = self.highlighted as f32 * geom.item_h;
                 let bottom = top + geom.item_h;
@@ -298,7 +298,7 @@ impl DropdownState {
                 } else if hovered {
                     // Mouse hover only when keyboard isn't already highlighting
                     // a different item (to avoid fighting the user).
-                    if !input.key_up && !input.key_down {
+                    if !input.nav.up && !input.nav.down {
                         self.highlighted = i;
                     }
                     l.quad(list_rect.x, iy, list_rect.width, geom.item_h, hover);
@@ -334,8 +334,8 @@ impl DropdownState {
                 self.close();
             }
         }
-        // Enter on the highlighted item selects it.
-        if input.enter_pressed && !geom.items.is_empty() {
+        // Confirm on the highlighted item selects it.
+        if input.nav.confirm && !geom.items.is_empty() {
             let row = self.highlighted;
             if row < geom.items.len() {
                 result = Some((geom.id, row));
@@ -460,9 +460,9 @@ impl<'a> Dropdown<'a> {
         let hovered = input.is_hovered(rect.x, rect.y, rect.width, rect.height);
         let clicked = hovered && input.mouse_clicked;
 
-        // Activate on click, Space, or Enter when focused.
+        // Activate on click or confirm intent (Space/Enter/A) when focused.
         let focused = ctx.focus.is_focused(id);
-        let keyboard_activate = focused && (input.enter_pressed || input.key_space);
+        let keyboard_activate = focused && input.nav.confirm;
 
         // Clicking the button toggles this dropdown (single owner: opening one
         // implicitly leaves any other to be closed by its own end_frame).
@@ -578,13 +578,15 @@ mod tests {
     use crate::{FocusState, Theme};
 
     fn input(clicked: bool, escape: bool, mouse: (f32, f32)) -> InputState {
-        InputState {
+        let mut s = InputState {
             mouse_x: mouse.0,
             mouse_y: mouse.1,
             mouse_clicked: clicked,
             key_escape: escape,
             ..Default::default()
-        }
+        };
+        crate::map_keyboard(&mut s); // Escape → nav.cancel
+        s
     }
 
     const ITEMS: [&str; 3] = ["Red", "Green", "Blue"];
@@ -784,14 +786,16 @@ mod tests {
         assert!(!s.is_open(1), "selecting an option closes the dropdown");
     }
 
-    /// Input helper that sets arrow-up or arrow-down.
+    /// Input helper that sets arrow-up or arrow-down, mapped to `nav` intents.
     fn input_keys(up: bool, down: bool, enter: bool) -> InputState {
-        InputState {
+        let mut s = InputState {
             key_up: up,
             key_down: down,
             enter_pressed: enter,
             ..Default::default()
-        }
+        };
+        crate::map_keyboard(&mut s);
+        s
     }
 
     #[test]
@@ -871,11 +875,12 @@ mod tests {
         assert!(s.is_open(1));
 
         // Frame 2: draw button (not clicked) + arrow down.
-        let kbd = InputState {
+        let mut kbd = InputState {
             key_down: true,
             enter_pressed: false,
             ..Default::default()
         };
+        crate::map_keyboard(&mut kbd);
         focus.begin_frame(&kbd);
         s.begin_frame(&kbd);
         let mut layers = LayerStack::new();
@@ -890,10 +895,11 @@ mod tests {
         focus.end_frame(None);
 
         // Frame 3: draw button (not clicked) + Enter selects highlighted (index 1).
-        let enter = InputState {
+        let mut enter = InputState {
             enter_pressed: true,
             ..Default::default()
         };
+        crate::map_keyboard(&mut enter);
         focus.begin_frame(&enter);
         s.begin_frame(&enter);
         let popup = s.push_open_layer(&mut layers);

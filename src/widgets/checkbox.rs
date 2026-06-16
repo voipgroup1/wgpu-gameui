@@ -127,7 +127,7 @@ impl Checkbox {
             ctx.request_cursor(crate::CursorIcon::Pointer);
         }
         let clicked = hovered && input.mouse_clicked;
-        let key_activate = input.enter_pressed || input.key_space;
+        let key_activate = input.nav.confirm;
 
         // Checkbox box (square, fitted to rect height).
         let size = rect.height;
@@ -397,11 +397,13 @@ mod tests {
     // ---- Keyboard focus / activation ----
 
     fn key_input(space: bool, enter: bool) -> InputState {
-        InputState {
+        let mut s = InputState {
             key_space: space,
             enter_pressed: enter,
             ..Default::default()
-        }
+        };
+        crate::map_keyboard(&mut s); // Space/Enter → nav.confirm
+        s
     }
 
     /// Draw with an explicitly seeded focus state.

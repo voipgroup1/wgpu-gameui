@@ -227,7 +227,7 @@ impl Button {
         }
         let pressed = hovered && input.mouse_down;
         let clicked = hovered && input.mouse_clicked;
-        let key_activate = input.enter_pressed || input.key_space;
+        let key_activate = input.nav.confirm;
         let v = ButtonVisual {
             enabled: self.enabled,
             hovered,
@@ -508,13 +508,17 @@ mod tests {
 
     // ---- Keyboard focus / activation ----
 
-    /// An input with a keyboard edge but no mouse activity.
+    /// An input with a keyboard edge but no mouse activity, mapped through the
+    /// default keyboard binding so the `nav.confirm` intent (which the button
+    /// reads) is set — both Space and Enter map to confirm.
     fn key_input(space: bool, enter: bool) -> InputState {
-        InputState {
+        let mut s = InputState {
             key_space: space,
             enter_pressed: enter,
             ..Default::default()
-        }
+        };
+        crate::map_keyboard(&mut s);
+        s
     }
 
     #[test]

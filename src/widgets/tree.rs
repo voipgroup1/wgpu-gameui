@@ -212,15 +212,17 @@ impl TreeState {
     }
 
     /// Begin a frame: clear the visible-row ring and capture this frame's
-    /// rising-edge navigation keys from `input`. Call once per frame before
-    /// drawing the tree's rows (mirrors [`crate::FocusState::begin_frame`]).
+    /// rising-edge navigation intents from `input.nav`. Call once per frame before
+    /// drawing the tree's rows (mirrors [`crate::FocusState::begin_frame`]). The
+    /// input's `nav` intents must already be populated by the frame's
+    /// [`NavMap`](crate::NavMap).
     pub fn begin_frame(&mut self, input: &InputState) {
         let raw = NavKeys {
-            up: input.key_up,
-            down: input.key_down,
-            left: input.key_left,
-            right: input.key_right,
-            activate: input.enter_pressed || input.key_space,
+            up: input.nav.up,
+            down: input.nav.down,
+            left: input.nav.left,
+            right: input.nav.right,
+            activate: input.nav.confirm,
         };
         // Rising edge only, so a held arrow steps once per press.
         self.keys = NavKeys {
@@ -1001,16 +1003,19 @@ mod tests {
 
     // ---- Keyboard arrow navigation ------------------------------------------
 
-    /// An input with a single arrow / activate key edge held.
+    /// An input with a single arrow / activate key edge held, mapped through the
+    /// default keyboard binding so the `nav` intents the tree reads are populated.
     fn nav_input(up: bool, down: bool, left: bool, right: bool, activate: bool) -> InputState {
-        InputState {
+        let mut s = InputState {
             key_up: up,
             key_down: down,
             key_left: left,
             key_right: right,
             enter_pressed: activate,
             ..InputState::default()
-        }
+        };
+        crate::map_keyboard(&mut s);
+        s
     }
 
     /// Register a flat list of `(id, depth, branch)` rows as this frame's nav ring.

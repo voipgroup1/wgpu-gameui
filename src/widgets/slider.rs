@@ -102,8 +102,8 @@ impl Slider {
         let mouse_down = input.mouse_down;
         let mouse_clicked = input.mouse_clicked;
         let mouse_consumed = input.mouse_consumed;
-        let kb_dec = input.key_left || input.key_down;
-        let kb_inc = input.key_right || input.key_up;
+        let kb_dec = input.nav.left || input.nav.down;
+        let kb_inc = input.nav.right || input.nav.up;
 
         let scrubber_size = rect.height.min(20.0);
         let value_text_width = if self.show_value { 40.0 } else { 0.0 };
@@ -450,7 +450,7 @@ mod tests {
     }
 
     fn arrow(left: bool, right: bool, up: bool, down: bool) -> InputState {
-        InputState {
+        let mut s = InputState {
             mouse_x: -1.0,
             mouse_y: -1.0,
             key_left: left,
@@ -458,7 +458,9 @@ mod tests {
             key_up: up,
             key_down: down,
             ..InputState::default()
-        }
+        };
+        crate::map_keyboard(&mut s); // arrows → nav directional
+        s
     }
 
     #[test]

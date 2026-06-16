@@ -399,6 +399,18 @@ impl ApplicationHandler for App {
                     None
                 };
 
+                // Translate raw keyboard edges into device-agnostic navigation
+                // intents (`self.input.nav`) before any focus/tree/dropdown
+                // `begin_frame` reads them. `KeyboardNav` is the default binding;
+                // to also drive the UI from a controller, fold a gamepad snapshot
+                // in here too, e.g.:
+                //
+                //     let pad = /* fill GamepadNav from gilrs/SDL each frame */;
+                //     wgpu_gameui::map_gamepad(&mut self.input, &pad);
+                //
+                // (map_keyboard / map_gamepad OR into `nav`, so order is moot.)
+                wgpu_gameui::map_keyboard(&mut self.input);
+
                 // Establish the open dropdown's popup layer at frame-top (from
                 // last frame's geometry) so `input_for_base` blocks clicks to
                 // widgets under the open list — same as the modal above.

@@ -183,13 +183,28 @@ impl UiState {
         Self::default()
     }
 
-    /// Per-frame setup: arm focus navigation for this frame's Tab/Escape/click
-    /// edges, seed the auto-advance gap from the theme, and advance the animation
-    /// clock by `dt` seconds. Call before building the frame's interactive verbs
+    /// Per-frame setup: fill this frame's navigation intents via `nav`, arm focus
+    /// navigation for the resulting confirm/cancel/next/prev/directional edges,
+    /// seed the auto-advance gap from the theme, and advance the animation clock
+    /// by `dt` seconds. Call before building the frame's interactive verbs
     /// (mirrors [`InputState::end_frame`] timing). Pass `0.0` for `dt` to freeze
     /// animations (e.g. a paused frame or a static render); the eased verbs then
     /// hold their current value.
-    pub fn begin_frame(&mut self, input: &InputState, theme: &Theme, dt: f32) {
+    ///
+    /// `nav` is a [`NavMap`](crate::NavMap) — pass [`KeyboardNav`](crate::KeyboardNav)
+    /// for the default keyboard binding, a closure that also folds in a
+    /// [`GamepadNav`](crate::GamepadNav), or [`ManualNav`](crate::ManualNav) if
+    /// you've already populated `input.nav` yourself. Requiring it here means the
+    /// navigation wiring can't be silently forgotten. The map runs first, so the
+    /// focus/tree systems read the freshly-filled `input.nav`.
+    pub fn begin_frame(
+        &mut self,
+        input: &mut InputState,
+        theme: &Theme,
+        dt: f32,
+        nav: &dyn crate::NavMap,
+    ) {
+        nav.apply(input);
         self.focus.begin_frame(input);
         self.tree.begin_frame(input);
         self.item_gap = theme.spacing;
@@ -2200,14 +2215,14 @@ mod tests {
         let theme = Theme::default();
         let mut state = UiState::new();
         // Idle pointer parked far off the button so frame 1 settles at `button`.
-        let idle = InputState {
+        let mut idle = InputState {
             mouse_x: -100.0,
             mouse_y: -100.0,
             ..Default::default()
         };
 
         // Frame 1: idle, dt = 0 settles the bg at `theme.button`.
-        state.begin_frame(&idle, &theme, 0.0);
+        state.begin_frame(&mut idle, &theme, 0.0, &crate::KeyboardNav);
         let mut list = DrawList::new();
         {
             let mut ui = UiContext::interactive(&mut list, &idle, &mut state, &theme);
@@ -2218,12 +2233,12 @@ mod tests {
 
         // Frame 2: hover the same (call-order-stable) button at dt < duration →
         // the fill is strictly between `button` and `button_hover`.
-        let hover = InputState {
+        let mut hover = InputState {
             mouse_x: 10.0,
             mouse_y: 10.0,
             ..Default::default()
         };
-        state.begin_frame(&hover, &theme, 0.04);
+        state.begin_frame(&mut hover, &theme, 0.04, &crate::KeyboardNav);
         let mut list = DrawList::new();
         {
             let mut ui = UiContext::interactive(&mut list, &hover, &mut state, &theme);
@@ -2307,8 +2322,8 @@ mod tests {
         let mut state = UiState::new();
         let mut buffer = String::from("ab");
         // Frame 1: click inside to take focus.
-        let input1 = click_at(5.0, 5.0);
-        state.begin_frame(&input1, &theme, 0.0);
+        let mut input1 = click_at(5.0, 5.0);
+        state.begin_frame(&mut input1, &theme, 0.0, &crate::KeyboardNav);
         {
             let mut list = DrawList::new();
             let mut ui = UiContext::interactive(&mut list, &input1, &mut state, &theme);
@@ -2318,7 +2333,7 @@ mod tests {
         // Frame 2: type a character while focused.
         let mut input2 = InputState::default();
         input2.text_input = "c".to_string();
-        state.begin_frame(&input2, &theme, 0.0);
+        state.begin_frame(&mut input2, &theme, 0.0, &crate::KeyboardNav);
         let changed = {
             let mut list = DrawList::new();
             let mut ui = UiContext::interactive(&mut list, &input2, &mut state, &theme);
@@ -2336,8 +2351,8 @@ mod tests {
         let mut state = UiState::new();
         let mut buffer = String::from("pw");
         // Frame 1: click inside to take focus.
-        let input1 = click_at(5.0, 5.0);
-        state.begin_frame(&input1, &theme, 0.0);
+        let mut input1 = click_at(5.0, 5.0);
+        state.begin_frame(&mut input1, &theme, 0.0, &crate::KeyboardNav);
         {
             let mut list = DrawList::new();
             let mut ui = UiContext::interactive(&mut list, &input1, &mut state, &theme);
@@ -2347,7 +2362,7 @@ mod tests {
         // Frame 2: type a character while focused; the rendered glyphs are bullets.
         let mut input2 = InputState::default();
         input2.text_input = "x".to_string();
-        state.begin_frame(&input2, &theme, 0.0);
+        state.begin_frame(&mut input2, &theme, 0.0, &crate::KeyboardNav);
         let (changed, drawn) = {
             let mut list = DrawList::new();
             let changed = {
@@ -2368,9 +2383,9 @@ mod tests {
     #[test]
     fn verbs_auto_advance_cursor() {
         let theme = Theme::default();
-        let input = InputState::default();
+        let mut input = InputState::default();
         let mut state = UiState::new();
-        state.begin_frame(&input, &theme, 0.0); // seeds item_gap = theme.spacing
+        state.begin_frame(&mut input, &theme, 0.0, &crate::KeyboardNav); // seeds item_gap = theme.spacing
         let mut list = DrawList::new();
         let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
         let c0 = ui.cursor();
@@ -2387,9 +2402,9 @@ mod tests {
     #[test]
     fn text_verb_advances_by_font_size() {
         let theme = Theme::default();
-        let input = InputState::default();
+        let mut input = InputState::default();
         let mut state = UiState::new();
-        state.begin_frame(&input, &theme, 0.0);
+        state.begin_frame(&mut input, &theme, 0.0, &crate::KeyboardNav);
         let mut list = DrawList::new();
         {
             let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);

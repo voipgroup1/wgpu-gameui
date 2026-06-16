@@ -618,7 +618,7 @@ fn render_widget_gallery() {
             let mut vstate = UiState::new();
             // Static render: dt = 0 freezes the animation clock so the verbs draw
             // their resolved (settled) colors, keeping the PNG deterministic.
-            vstate.begin_frame(&input, &theme, 0.0);
+            vstate.begin_frame(&mut input, &theme, 0.0, &wgpu_gameui::ManualNav);
             let mut buf = String::from("editable");
             // Scope the `ui.translate` to this block: `UiContext::translate`
             // mutates the shared list's transform-stack top in place and is not

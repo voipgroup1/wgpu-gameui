@@ -421,11 +421,27 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       `UiContext` façade wires it all: `text_button`/`checkbox` get auto-ids,
       `slider` reuses its DragId, tree verbs register one reserved `FocusId` and
       draw the ring on the selected row.
-- [ ] **P2 — Controller / gamepad** input abstraction.
+- [x] **P2 — Controller / gamepad** input abstraction. Reframed: the lib never
+      reads devices (the game fills `InputState`), so this is a device-agnostic
+      **navigation-intent** layer, not a device driver. `InputState::nav`
+      (`NavInput { up/down/left/right, confirm, cancel, next, prev }`) is read by
+      the focus system + widgets instead of raw key names, so keyboard and gamepad
+      share one vocabulary. A `NavMap` fills it and is a **required** arg to
+      `UiState::begin_frame` / `Frame::new` (can't be forgotten): `KeyboardNav`
+      (default binding — arrows→directional, Tab/Shift+Tab→next/prev,
+      Enter/Space→confirm, Escape→cancel), `ManualNav` (no-op; you set `nav`
+      yourself), or any `Fn(&mut InputState)` closure. `map_keyboard` +
+      `map_gamepad(&mut input, &GamepadNav)` OR into `nav` so devices compose
+      (`|i| { map_keyboard(i); map_gamepad(i, &pad); }`). `GamepadNav` is a
+      game-filled button/d-pad/stick snapshot (south=confirm, east=cancel,
+      shoulders=prev/next). Slider reads directional intents (d-pad adjusts a
+      focused slider); text/number inputs keep raw keys for caret/submit so a
+      d-pad never moves a caret. List Home/End stay keyboard-only.
 - [x] **P2 — Explicit `Frame`/`Ui` builder** that consumes input and produces
       a draw list, instead of implicit `end_frame` that callers can forget.
-      `Frame::new(&mut state, &input, &theme).dt(dt).run(&mut list, |ui| { … })`
-      (and `.run_layers(&mut layers, |ui| …)`; sugar `state.frame(&input,&theme)`).
+      `Frame::new(&mut state, &mut input, &theme, &KeyboardNav).dt(dt).run(&mut list, |ui| { … })`
+      (and `.run_layers(&mut layers, |ui| …)`; sugar `state.frame(&mut input,&theme,&KeyboardNav)`).
+      The fourth arg is the required `NavMap` (see the gamepad item above).
       Closure-scoped: runs `UiState::begin_frame` before the build closure and
       `UiState::end_frame` after — the pair can't be forgotten or mis-ordered,
       and the closure's return value is threaded back out. `UiContext` is built
