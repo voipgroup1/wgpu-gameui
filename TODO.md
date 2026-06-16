@@ -532,7 +532,16 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       tests + the gallery stayed green. Gallery: "Hover animation (easing)" ramp
       samples the ease-out curve at t∈{0,.25,.5,.75,1}. Other raw widgets adopt
       the same `.animated(id)` pattern as needed.
-- [ ] **P2 — Theme stack** (push tint/color), tied to A5/D8 above.
+- [x] **P2 — Theme stack** (push tint/color), tied to A5/D8 above. Done — landed
+      with the `UiContext` scope stack: `push()`/`pop()` save & restore the
+      transform, **tint**, align, font, **style overlay**, and clip/window scopes
+      together. Scoped setters: `set_style_color`/`set_style_scalar`/`set_style`
+      (per-`StyleKey` overrides layered overlay→theme via `StyleResolver`) and
+      `color`/`color_filter` (DrawList tint set/multiply, baked into every
+      vertex/instance/text at push time). Tested
+      (`style_override_recolors_button_chrome_and_pops_with_frame`,
+      `color_replaces_tint`, `color_filter_multiplies_tint`, `push_pop_*`) and
+      shown in the gallery "Styling / overrides" section.
 - [x] **P2 — Move semantic policy out of theme.** Done. The theme now supplies
       only a palette; the *policy* mapping state→palette is caller-owned (progress)
       or a trivial themeable mapping (severity).
