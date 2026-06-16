@@ -465,6 +465,26 @@ fn render_widget_gallery() {
             );
         }
 
+        // A focused LTR text input with the whole value selected — the LTR
+        // counterpart to the RTL field below. Both show the single-line selection
+        // band + caret centred on the box (not riding high at the line-box top).
+        let r = flow.cell(list, "Input (selected)", 200.0, 28.0);
+        {
+            const SEL_ID: u64 = 204;
+            let sel_input = InputState::default();
+            let mut sel_focus = FocusState::new();
+            sel_focus.focus(SEL_ID);
+            sel_focus.begin_frame(&sel_input);
+            let mut field =
+                TextInput::new(r.x, r.y, r.width, r.height).with_value("Hello, world");
+            field.cursor_pos = field.value.len();
+            field.selection_start = Some(0);
+            field.draw(
+                SEL_ID,
+                &mut DrawContext::new(list, &mut sel_focus, &theme, &sel_input, W as f32, 600.0),
+            );
+        }
+
         // A focused, forced-RTL text input with an active selection — exercises
         // the bidi selection rectangles and edge-correct caret. Local
         // focus/input so it doesn't disturb the shared owner above.
@@ -499,6 +519,8 @@ fn render_widget_gallery() {
             TextBlock::new("こんにちは", r.x, r.y + 2.0)
                 .with_size(22.0)
                 .with_color(210, 220, 240)
+                .with_max_width(r.width)
+                .with_align(TextAlign::Center)
                 .with_vertical(),
         );
 
@@ -518,6 +540,8 @@ fn render_widget_gallery() {
             TextBlock::new("レベル99", r.x, r.y + 2.0)
                 .with_size(24.0)
                 .with_color(255, 240, 200)
+                .with_max_width(r.width)
+                .with_align(TextAlign::Center)
                 .with_vertical(),
         );
 
@@ -528,6 +552,8 @@ fn render_widget_gallery() {
         let mut tight = TextBlock::new("たてがき", r.x, r.y + 2.0)
             .with_size(24.0)
             .with_color(200, 230, 210)
+            .with_max_width(r.width)
+            .with_align(TextAlign::Center)
             .with_vertical();
         tight.line_height = 24.0;
         list.text(tight);

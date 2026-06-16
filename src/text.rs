@@ -788,6 +788,23 @@ impl TextRenderer {
                 0.0
             };
 
+            // Vertical: place the whole column horizontally within `max_width`
+            // per `align`, mirroring horizontal text — `Start`/`Left` flush left
+            // (offset 0), `Center` centers, `End`/`Right` flush right. The slack
+            // is clamped non-negative so a column wider than `max_width` stays at
+            // the origin rather than shifting off the left edge. (Vertical has no
+            // bidi, so `Start`/`End` resolve to left/right.)
+            let column_off_x = if block.vertical {
+                let slack = (block.max_width - column_w).max(0.0);
+                match block.align {
+                    TextAlign::Center => slack / 2.0,
+                    TextAlign::End | TextAlign::Right => slack,
+                    TextAlign::Start | TextAlign::Left => 0.0,
+                }
+            } else {
+                0.0
+            };
+
             // Vertical: glyph byte offsets are per-buffer-line, so precompute each
             // line's start byte in the *shaped* (newline-joined) string by scanning
             // for `\n` — mirroring `text_visual_layout`. Subtracting `line_i` below
@@ -810,7 +827,7 @@ impl TextRenderer {
             let mut shaped: Vec<ShapedGlyph> = Vec::new();
             for run in buffer.layout_runs() {
                 let line_off_x = if block.vertical {
-                    (column_w - run.line_w) / 2.0
+                    column_off_x + (column_w - run.line_w) / 2.0
                 } else {
                     0.0
                 };
@@ -2974,8 +2991,10 @@ pub struct TextBlock {
     /// glyphs centered within the column — the casual look used for Japanese game
     /// labels. This is upright stacking, **not** true CJK `vertical-rl` (no
     /// vertical glyph variants, rotated kana/punctuation, or right-to-left
-    /// columns). `direction`, `wrap`, and `ellipsize` do not apply in this mode.
-    /// See [`with_vertical`](Self::with_vertical).
+    /// columns). `direction`, `wrap`, and `ellipsize` do not apply in this mode,
+    /// but [`align`](Self::with_align) still positions the whole column
+    /// horizontally within [`max_width`](Self::with_max_width) (`Start`/`Left`,
+    /// `Center`, `End`/`Right`). See [`with_vertical`](Self::with_vertical).
     pub vertical: bool,
 }
 
@@ -3102,7 +3121,9 @@ impl TextBlock {
     ///
     /// The row pitch is the block's `line_height` (set via [`with_size`](Self::with_size));
     /// a tighter `line_height` reads better for full-width kana/kanji. `direction`,
-    /// `wrap`, and ellipsis do not apply in this mode.
+    /// `wrap`, and ellipsis do not apply in this mode, but [`with_align`](Self::with_align)
+    /// still places the column horizontally within [`with_max_width`](Self::with_max_width)
+    /// (e.g. `Center` to center a stacked label in a fixed-width slot).
     pub fn with_vertical(mut self) -> Self {
         self.vertical = true;
         self
@@ -4818,6 +4839,37 @@ mod tests {
             thin_x > wide_x,
             "narrow glyph ({thin_x}) should be centered right of the wide one ({wide_x})"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn vertical_align_center_offsets_column_within_max_width() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        // Full-width kana (equal advance) so per-row centering is zero — any x
+        // offset is purely the column being centred within `max_width`.
+        let content = "あいう";
+        let max_width = 120.0;
+        let block = TextBlock::new(content, 0.0, 0.0)
+            .with_size(24.0)
+            .with_font(font)
+            .with_max_width(max_width)
+            .with_align(TextAlign::Center)
+            .with_vertical();
+        r.build_vertices(&[block]);
+
+        let glyphs = cached_vertical_glyphs(&r, content);
+        assert_eq!(glyphs.len(), 3);
+        let min_x = glyphs.iter().fold(f32::MAX, |m, g| m.min(g.0));
+        let max_x = glyphs.iter().fold(0.0f32, |m, g| m.max(g.0));
+        // Clearly inset from the left (a left-flushed column starts at ~0) and
+        // still within the box — i.e. the column sits centred, not flush-left.
+        assert!(
+            (30.0..70.0).contains(&min_x),
+            "centred column should be inset ~half the slack from the left (min_x={min_x})"
+        );
+        assert!(max_x < max_width, "column stays within max_width (max_x={max_x})");
     }
 }
 

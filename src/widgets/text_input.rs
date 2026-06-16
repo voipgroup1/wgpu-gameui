@@ -805,6 +805,14 @@ impl TextInput {
             (self.height - padding * 2.0).max(0.0),
         );
 
+        // Single-line selection/caret band, centred on the field box. `text_top`
+        // is tuned to baseline-place the glyphs (so the visual body sits centred
+        // in the box), which is ~0.25em *below* the line-box top — anchoring the
+        // band there makes it ride high over the text. Centre a `line_height`-tall
+        // band on the box instead so it brackets the glyph body symmetrically.
+        // Multiline keeps per-line tops from the laid-out caret geometry.
+        let sl_band_top = self.y + (self.height - line_height) / 2.0;
+
         // Caret layout for the *current* value (multiline+focused only), built
         // BEFORE keyboard/click so vertical nav, line Home/End, and click hit
         // testing see this frame's geometry (one-frame edit latency — see
@@ -1053,7 +1061,7 @@ impl TextInput {
                         for r in selection_rects(&caret_vis, ds, de) {
                             list.quad(
                                 text_x + r.x,
-                                text_top,
+                                sl_band_top,
                                 r.w.max(1.0),
                                 line_height,
                                 s.color(StyleKey::Accent),
@@ -1152,9 +1160,13 @@ impl TextInput {
                         .map(|c| text_x + c.x)
                         .unwrap_or(text_x)
                 };
-                list.quad(cursor_x, block_y, 1.5, line_height, s.color(StyleKey::Text));
+                // Single-line carets share the box-centred band as the selection
+                // (see `sl_band_top`); multiline-composing keeps the first-line
+                // top (`block_y`) the preedit text is drawn at.
+                let caret_top = if multiline { block_y } else { sl_band_top };
+                list.quad(cursor_x, caret_top, 1.5, line_height, s.color(StyleKey::Text));
                 // See the multiline branch: declare IME focus + caret anchor.
-                focus.request_ime(Rect::new(cursor_x, block_y, 1.5, line_height));
+                focus.request_ime(Rect::new(cursor_x, caret_top, 1.5, line_height));
             }
         }
 
@@ -1647,6 +1659,38 @@ mod tests {
             "an active selection adds at least one fill quad ({} vs {})",
             l1.chrome_instances.len(),
             base
+        );
+    }
+
+    #[test]
+    fn single_line_selection_band_is_vertically_centred() {
+        // The single-line selection highlight must bracket the glyph body — its
+        // band is centred on the field box, not anchored at the text line-box top
+        // (which is tuned to baseline-place glyphs and so rides ~0.25em high).
+        // Regression guard for the selection appearing shifted up over the text.
+        let theme = Theme::default();
+        let mut focus = FocusState::new();
+        focus.focus(0);
+
+        let mut ti = make_input("hello"); // box at y=0, height=24
+        ti.selection_start = Some(0);
+        ti.cursor_pos = ti.value.len();
+        let mut list = DrawList::new();
+        focus.begin_frame(&fake_input());
+        draw_input(&mut ti, 0, &mut focus, &mut list, &theme, &fake_input());
+
+        // The selection fill is the only accent-`bg` chrome quad (the focused
+        // frame outline carries accent in `border`, never `bg`).
+        let sel = list
+            .chrome_instances
+            .iter()
+            .find(|c| c.bg == theme.accent)
+            .expect("a focused selection draws an accent-filled quad");
+        let box_centre = ti.y + ti.height / 2.0;
+        let band_centre = sel.rect[1] + sel.rect[3] / 2.0;
+        assert!(
+            (band_centre - box_centre).abs() < 1.0,
+            "selection band centre ({band_centre}) should sit on the box centre ({box_centre})"
         );
     }
 

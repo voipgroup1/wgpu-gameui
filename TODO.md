@@ -528,7 +528,14 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       upright. Scope is casual upright stacking (correct for full-width kana/kanji;
       Latin stacks per-letter), **not** true CJK `vertical-rl` (no vertical glyph
       variants / rotated kana-punctuation / tate-chu-yoko / right-to-left columns),
-      and labels only (no vertical `TextInput` editing).
+      and labels only (no vertical `TextInput` editing). `with_align` +
+      `with_max_width` position the whole column horizontally within the slot
+      (`Start`/`Left`, `Center`, `End`/`Right`), mirroring horizontal alignment.
+- [x] **Single-line text-input selection/caret vertical centring.** The
+      selection highlight and caret band are centred on the field box rather than
+      anchored at the text line-box top (which is tuned to baseline-place glyphs,
+      so the band rode ~0.25em high over the text). Multiline keeps its per-line
+      tops. Gallery now shows both an LTR and an RTL selected field for contrast.
 
 ---
 
