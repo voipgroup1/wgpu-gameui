@@ -14,6 +14,7 @@
 //! [`TextBlock`], emits one quad per glyph, lazily generates any unseen glyph into
 //! the atlas, uploads the atlas if it changed, and draws — all in one call.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -120,12 +121,22 @@ impl FontHandle {
 /// produce a visible shift when `max_width` is wider than the longest line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TextAlign {
-    /// Lines start at the left edge of the box (default).
+    /// Lines flush to the **reading start** of the box — the left edge for
+    /// left-to-right text, the right edge for right-to-left text (default).
+    /// Follows the block's resolved [base direction](TextBlock::direction).
     #[default]
-    Left,
+    Start,
     /// Lines are centered within `max_width`.
     Center,
-    /// Lines are flushed to the right edge of `max_width`.
+    /// Lines flush to the **reading end** of the box — the right edge for
+    /// left-to-right text, the left edge for right-to-left text. The
+    /// direction-relative mirror of [`Start`](TextAlign::Start).
+    End,
+    /// Lines flush to the left edge of `max_width`, regardless of text
+    /// direction (absolute).
+    Left,
+    /// Lines flush to the right edge of `max_width`, regardless of text
+    /// direction (absolute).
     Right,
 }
 
@@ -160,6 +171,42 @@ impl From<WrapMode> for Wrap {
             WrapMode::Glyph => Wrap::Glyph,
             WrapMode::WordOrGlyph => Wrap::WordOrGlyph,
         }
+    }
+}
+
+/// Base paragraph direction for a [`TextBlock`] / text field.
+///
+/// Bidi *reordering* of mixed-script runs is automatic in every case (cosmic-text
+/// runs the Unicode bidi algorithm during shaping); this only fixes the **base**
+/// direction — which edge lines start from, and how direction-neutral content
+/// (digits, punctuation, an empty string, a leading Latin word in an otherwise
+/// RTL UI) resolves. The default, [`Auto`](TextDirection::Auto), matches the
+/// pre-existing behaviour, so leaving it unset changes nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TextDirection {
+    /// Auto-detect from the first strong character of each line (cosmic-text's
+    /// default). Neutral-only content resolves left-to-right.
+    #[default]
+    Auto,
+    /// Force a left-to-right base direction.
+    Ltr,
+    /// Force a right-to-left base direction.
+    Rtl,
+}
+
+/// The zero-width strong directional mark that pins the paragraph base level when
+/// prepended to a shaped string, or `""` for [`Auto`](TextDirection::Auto).
+///
+/// cosmic-text 0.12 exposes no API to set the base/paragraph direction — it always
+/// auto-detects from the first strong character (`BidiInfo::new(line, None)`). The
+/// only lever is to make that first strong character ours: U+200E LEFT-TO-RIGHT
+/// MARK / U+200F RIGHT-TO-LEFT MARK. Both are zero-width and non-joining, so they
+/// set the base level without altering shaping of the real runs that follow.
+pub(crate) fn direction_prefix(dir: TextDirection) -> &'static str {
+    match dir {
+        TextDirection::Auto => "",
+        TextDirection::Ltr => "\u{200E}", // LRM
+        TextDirection::Rtl => "\u{200F}", // RLM
     }
 }
 
@@ -619,6 +666,7 @@ impl TextRenderer {
                 block.weight.0,
                 style_disc(block.style),
                 block.wrap,
+                block.direction,
             );
 
             // Fast path: a cached layout for this exact key + content. No
@@ -672,6 +720,18 @@ impl TextRenderer {
                 &block.content
             };
 
+            // Force the base paragraph direction (if requested) by prepending a
+            // zero-width strong mark; cosmic-text has no base-direction API. The
+            // mark shifts every glyph's byte offset by its UTF-8 length, undone
+            // below via `prefix_len`.
+            let prefix = direction_prefix(block.direction);
+            let prefix_len = prefix.len();
+            let shaped_text: Cow<str> = if prefix.is_empty() {
+                Cow::Borrowed(content)
+            } else {
+                Cow::Owned(format!("{prefix}{content}"))
+            };
+
             let mut buffer = Buffer::new(&mut fs, Metrics::new(block.font_size, block.line_height));
             if block.ellipsize {
                 buffer.set_wrap(&mut fs, Wrap::None);
@@ -682,7 +742,7 @@ impl TextRenderer {
             }
             buffer.set_text(
                 &mut fs,
-                content,
+                &shaped_text,
                 Attrs::new()
                     .family(family)
                     .weight(block.weight)
@@ -690,8 +750,8 @@ impl TextRenderer {
                     .color(block.color),
                 Shaping::Advanced,
             );
-            // Horizontal alignment is set per buffer line before layout; Left is
-            // cosmic-text's default so we only override for Center/Right.
+            // Horizontal alignment is set per buffer line before layout; `Start`
+            // is cosmic-text's default so we only override for the rest.
             if let Some(align) = cosmic_align(block.align) {
                 for line in buffer.lines.iter_mut() {
                     line.set_align(Some(align));
@@ -730,7 +790,9 @@ impl TextRenderer {
                         rel_x,
                         rel_y,
                         font_size,
-                        byte_start: glyph.start as u32,
+                        // Undo the direction-prefix byte shift so span-colour
+                        // lookup keys off the caller's real content offsets.
+                        byte_start: (glyph.start as usize).saturating_sub(prefix_len) as u32,
                     });
                 }
             }
@@ -980,7 +1042,18 @@ struct CachedShape {
 /// [`style_disc`] style discriminant, so bold/italic variants cache and re-shape
 /// independently of the regular face; the trailing [`WrapMode`] keys the wrap
 /// policy so the same content at the same metrics caches separately per wrap.
-type ShapeKey = (u32, u32, u32, u64, TextAlign, bool, u16, u8, WrapMode);
+type ShapeKey = (
+    u32,
+    u32,
+    u32,
+    u64,
+    TextAlign,
+    bool,
+    u16,
+    u8,
+    WrapMode,
+    TextDirection,
+);
 
 /// Stable discriminant for a cosmic-text [`Style`] so it can sit in a `Hash + Eq`
 /// cache key: `Normal = 0`, `Italic = 1`, `Oblique = 2`.
@@ -1756,8 +1829,13 @@ fn family_hash(font: Option<&FontHandle>) -> u64 {
 /// default (`Left`) so callers can skip the per-line override.
 fn cosmic_align(align: TextAlign) -> Option<CosmicAlign> {
     match align {
-        TextAlign::Left => None,
+        // cosmic-text's default layout already flushes to the reading start
+        // (left for LTR, right for RTL), so `Start` is "no override".
+        TextAlign::Start => None,
         TextAlign::Center => Some(CosmicAlign::Center),
+        // `End` is cosmic-text's direction-relative end alignment.
+        TextAlign::End => Some(CosmicAlign::End),
+        TextAlign::Left => Some(CosmicAlign::Left),
         TextAlign::Right => Some(CosmicAlign::Right),
     }
 }
@@ -2067,6 +2145,7 @@ pub fn text_caret_layout(
     max_width: f32,
     wrap: WrapMode,
     family_name: Option<&str>,
+    direction: TextDirection,
 ) -> Vec<CaretPos> {
     let mut out: Vec<CaretPos> = Vec::with_capacity(text.len().saturating_add(1));
     if text.is_empty() {
@@ -2080,11 +2159,22 @@ pub fn text_caret_layout(
         return out;
     }
 
-    // Byte offset of the start of each buffer line (text split on '\n'). cosmic's
-    // glyph.start/.end are relative to their buffer line, so we add this to get
-    // absolute byte indices into `text`.
+    // Optional base-direction mark. A single leading mark shifts every subsequent
+    // byte (including across '\n') by exactly `prefix_len`, so the byte mapping
+    // below stays uniform: `byte = prefixed_line_base + glyph.start - prefix_len`.
+    // (It only pins the *first* line's visual direction; later lines auto-detect.)
+    let prefix = direction_prefix(direction);
+    let prefix_len = prefix.len();
+    let shaped: Cow<str> = if prefix.is_empty() {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(format!("{prefix}{text}"))
+    };
+
+    // Byte offset of the start of each buffer line within the *shaped* (prefixed)
+    // string — cosmic's glyph.start/.end are relative to their buffer line.
     let mut line_starts: Vec<usize> = vec![0];
-    for (i, b) in text.bytes().enumerate() {
+    for (i, b) in shaped.bytes().enumerate() {
         if b == b'\n' {
             line_starts.push(i + 1);
         }
@@ -2096,11 +2186,15 @@ pub fn text_caret_layout(
     let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
     buffer.set_text(
         font_system,
-        text,
+        &shaped,
         Attrs::new().family(family),
         Shaping::Advanced,
     );
     buffer.shape_until_scroll(font_system, false);
+
+    // Map a shaped (prefixed) absolute byte back to the caller's text. The mark
+    // glyph itself sits in `[0, prefix_len)`; skip it.
+    let to_orig = |abs: usize| abs.saturating_sub(prefix_len);
 
     // Visual line ordinal: layout_runs() yields runs top-to-bottom; each run is
     // one visual line (a wrapped buffer line produces several consecutive runs).
@@ -2111,8 +2205,13 @@ pub fn text_caret_layout(
         let lh = run.line_height;
 
         // Leading caret at x=0 for the start of this visual line (covers blank
-        // lines from "\n\n", whose run has no glyphs).
-        let line_start_byte = line_base + run.glyphs.first().map(|g| g.start as usize).unwrap_or(0);
+        // lines from "\n\n", whose run has no glyphs). Skip the zero-width
+        // direction mark when picking the first real glyph's byte.
+        let first_real = run
+            .glyphs
+            .iter()
+            .find(|g| line_base + g.start as usize >= prefix_len);
+        let line_start_byte = to_orig(line_base + first_real.map(|g| g.start as usize).unwrap_or(0));
         out.push(CaretPos {
             byte: line_start_byte,
             x: 0.0,
@@ -2122,7 +2221,11 @@ pub fn text_caret_layout(
         });
 
         for g in run.glyphs.iter() {
-            let b = line_base + g.start as usize;
+            let abs = line_base + g.start as usize;
+            if abs < prefix_len {
+                continue; // the direction mark — not a caret stop
+            }
+            let b = to_orig(abs);
             // Record the first time we see each byte on this run.
             if out.last().map(|p| p.byte) != Some(b) {
                 out.push(CaretPos {
@@ -2138,7 +2241,7 @@ pub fn text_caret_layout(
         // Run-end caret (x = line width). For a hard newline this is the byte of
         // the '\n'; for a soft wrap it duplicates the next line's start byte.
         if let Some(last) = run.glyphs.last() {
-            let end_b = line_base + last.end as usize;
+            let end_b = to_orig(line_base + last.end as usize);
             if out.last().map(|p| p.byte) != Some(end_b) {
                 out.push(CaretPos {
                     byte: end_b,
@@ -2248,6 +2351,310 @@ pub fn byte_on_adjacent_line(layout: &[CaretPos], byte: usize, dir: i32, desired
         }
     }
     best_byte
+}
+
+/// One laid-out glyph cell in **visual** order, the primitive bidi-aware editing
+/// builds on. cosmic-text lays glyphs out left-to-right on screen after bidi
+/// reordering, so `[x, x + w]` is always the visual cell (positive `w`) regardless
+/// of direction; `byte_start`/`byte_end` are the **logical** (ascending) byte range
+/// the cell covers in the caller's text (the direction-mark prefix, if any, is
+/// already subtracted out). `rtl` is the glyph's own bidi level parity — it can
+/// differ from neighbours within one visual line (mixed bidi).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisualGlyph {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub x: f32,
+    pub w: f32,
+    pub line: usize,
+    pub line_top: f32,
+    pub line_height: f32,
+    pub rtl: bool,
+}
+
+/// A selection-highlight rectangle, relative to the text block's top-left origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SelRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Lay text out and return one [`VisualGlyph`] per shaped glyph, in visual order,
+/// carrying the bidi level and logical byte range of each cell. This is the
+/// keystone for bidi-aware caret movement ([`visual_caret_neighbor`]) and
+/// selection rectangles ([`selection_rects`]); both are pure functions over the
+/// returned slice and need no `FontSystem`.
+///
+/// `direction` forces the base paragraph direction via a leading mark (see
+/// [`TextDirection`]); the mark glyph is filtered out and byte offsets are mapped
+/// back to the caller's text.
+#[allow(clippy::too_many_arguments)]
+pub fn text_visual_layout(
+    font_system: &mut FontSystem,
+    text: &str,
+    font_size: f32,
+    line_height: f32,
+    max_width: f32,
+    wrap: WrapMode,
+    family_name: Option<&str>,
+    direction: TextDirection,
+) -> Vec<VisualGlyph> {
+    let mut out: Vec<VisualGlyph> = Vec::new();
+    if text.is_empty() {
+        return out;
+    }
+
+    let prefix = direction_prefix(direction);
+    let prefix_len = prefix.len();
+    let shaped: Cow<str> = if prefix.is_empty() {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(format!("{prefix}{text}"))
+    };
+
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in shaped.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    buffer.set_wrap(font_system, wrap.into());
+    buffer.set_size(font_system, Some(max_width), None);
+    let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
+    buffer.set_text(
+        font_system,
+        &shaped,
+        Attrs::new().family(family),
+        Shaping::Advanced,
+    );
+    buffer.shape_until_scroll(font_system, false);
+
+    let to_orig = |abs: usize| abs.saturating_sub(prefix_len);
+    let mut visual_line = 0usize;
+    for run in buffer.layout_runs() {
+        let line_base = line_starts.get(run.line_i).copied().unwrap_or(0);
+        let lt = run.line_top;
+        let lh = run.line_height;
+        for g in run.glyphs.iter() {
+            let abs = line_base + g.start as usize;
+            if abs < prefix_len {
+                continue; // the zero-width direction mark
+            }
+            let a = to_orig(abs);
+            let b = to_orig(line_base + g.end as usize);
+            out.push(VisualGlyph {
+                byte_start: a.min(b),
+                byte_end: a.max(b),
+                x: g.x,
+                w: g.w,
+                line: visual_line,
+                line_top: lt,
+                line_height: lh,
+                rtl: g.level.is_rtl(),
+            });
+        }
+        visual_line += 1;
+    }
+    out
+}
+
+/// Selection-highlight rectangles for the logical byte range `[sel_start, sel_end)`
+/// over a [`text_visual_layout`]. Per visual line, the glyphs whose logical range
+/// overlaps the selection are taken at their visual extents `[x, x+w]`, sorted, and
+/// merged into contiguous spans — so a selection that straddles an LTR↔RTL boundary
+/// yields the several disjoint rectangles it visually occupies, not one bogus span.
+pub fn selection_rects(glyphs: &[VisualGlyph], sel_start: usize, sel_end: usize) -> Vec<SelRect> {
+    let mut out: Vec<SelRect> = Vec::new();
+    if sel_start >= sel_end || glyphs.is_empty() {
+        return out;
+    }
+    let max_line = glyphs.iter().map(|g| g.line).max().unwrap_or(0);
+    const EPS: f32 = 0.5; // merge near-touching advances into one rect
+    for line in 0..=max_line {
+        let mut spans: Vec<(f32, f32, f32, f32)> = glyphs
+            .iter()
+            .filter(|g| g.line == line && g.byte_start < sel_end && g.byte_end > sel_start)
+            .map(|g| (g.x, g.x + g.w, g.line_top, g.line_height))
+            .collect();
+        if spans.is_empty() {
+            continue;
+        }
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (lt, lh) = (spans[0].2, spans[0].3);
+        let mut cur = (spans[0].0, spans[0].1);
+        for &(s, e, _, _) in &spans[1..] {
+            if s <= cur.1 + EPS {
+                cur.1 = cur.1.max(e);
+            } else {
+                out.push(SelRect { x: cur.0, y: lt, w: cur.1 - cur.0, h: lh });
+                cur = (s, e);
+            }
+        }
+        out.push(SelRect { x: cur.0, y: lt, w: cur.1 - cur.0, h: lh });
+    }
+    out
+}
+
+/// The byte offset the caret lands on when moved one step in the **visual**
+/// direction (`dir < 0` = screen-left, `dir > 0` = screen-right) from `cursor_byte`,
+/// over a [`text_visual_layout`]. Caret stops are the visual edges of each glyph
+/// cell, mapped to a byte by the glyph's own bidi level (LTR: `start` at the left
+/// edge, `end` at the right; RTL: the reverse), so Left/Right always move the caret
+/// the way it moves on screen even across direction runs. Wraps to the adjacent
+/// visual line's extreme at a line end. Returns `cursor_byte` unchanged when there
+/// is nowhere to go.
+///
+/// Caret **affinity** at a direction boundary (one screen x mapping to two byte
+/// positions) is resolved deterministically — leftmost occurrence for a left move,
+/// rightmost for a right move — rather than tracked as cursor state; pixel-perfect
+/// affinity is a documented v1 limitation.
+pub fn visual_caret_neighbor(glyphs: &[VisualGlyph], cursor_byte: usize, dir: i32) -> usize {
+    if glyphs.is_empty() || dir == 0 {
+        return cursor_byte;
+    }
+    let stops = caret_stops(glyphs);
+
+    // Current caret position: among stops for this byte, take the leftmost for a
+    // left move and the rightmost for a right move (affinity tie-break).
+    let cur = if dir < 0 {
+        stops
+            .iter()
+            .filter(|s| s.byte == cursor_byte)
+            .min_by(|a, b| a.x.total_cmp(&b.x))
+    } else {
+        stops
+            .iter()
+            .filter(|s| s.byte == cursor_byte)
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+    };
+    let Some(&CaretStop {
+        x: cur_x, line, ..
+    }) = cur
+    else {
+        return cursor_byte;
+    };
+    const EPS: f32 = 0.01;
+
+    // Nearest stop strictly in the visual direction on the same line.
+    let same_line = if dir < 0 {
+        stops
+            .iter()
+            .filter(|s| s.line == line && s.x < cur_x - EPS)
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+    } else {
+        stops
+            .iter()
+            .filter(|s| s.line == line && s.x > cur_x + EPS)
+            .min_by(|a, b| a.x.total_cmp(&b.x))
+    };
+    if let Some(s) = same_line {
+        return s.byte;
+    }
+
+    // Off the end of the line: wrap to the adjacent visual line's extreme.
+    let target = line as i32 + dir.signum();
+    if target < 0 {
+        return cursor_byte;
+    }
+    let target = target as usize;
+    let wrapped = if dir < 0 {
+        stops
+            .iter()
+            .filter(|s| s.line == target)
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+    } else {
+        stops
+            .iter()
+            .filter(|s| s.line == target)
+            .min_by(|a, b| a.x.total_cmp(&b.x))
+    };
+    wrapped.map(|s| s.byte).unwrap_or(cursor_byte)
+}
+
+/// A direction-aware caret stop: the byte that begins at visual position `x` on
+/// visual line `line`. Each glyph cell contributes two stops (its two visual
+/// edges); for an RTL cell the logical-start byte is the *right* edge and the
+/// logical-end byte the *left* edge (the reverse of an LTR cell).
+#[derive(Debug, Clone, Copy)]
+struct CaretStop {
+    byte: usize,
+    x: f32,
+    line: usize,
+    line_top: f32,
+    line_height: f32,
+}
+
+/// Build the level-aware caret stops for a visual glyph layout — the shared
+/// basis for [`visual_caret_neighbor`] (visual cursor movement) and
+/// [`visual_caret_pos`] (edge-correct caret rendering).
+fn caret_stops(glyphs: &[VisualGlyph]) -> Vec<CaretStop> {
+    let mut stops = Vec::with_capacity(glyphs.len() * 2);
+    for g in glyphs {
+        let (left_byte, right_byte) = if g.rtl {
+            (g.byte_end, g.byte_start)
+        } else {
+            (g.byte_start, g.byte_end)
+        };
+        stops.push(CaretStop {
+            byte: left_byte,
+            x: g.x,
+            line: g.line,
+            line_top: g.line_top,
+            line_height: g.line_height,
+        });
+        stops.push(CaretStop {
+            byte: right_byte,
+            x: g.x + g.w,
+            line: g.line,
+            line_top: g.line_top,
+            line_height: g.line_height,
+        });
+    }
+    stops
+}
+
+/// Edge-correct caret geometry for laid-out text.
+///
+/// `text_caret_layout`/`text_cursor_positions` place every caret at a glyph
+/// cell's **left** edge (`byte = glyph.start → x = glyph.x`), which is wrong for
+/// RTL glyphs — there the logical-start byte sits at the cell's *right* edge. A
+/// caret drawn from those tables would land on the wrong side in RTL/bidi text.
+/// This returns the visual position where `byte` *logically begins*, honouring
+/// each glyph's resolved direction, so a rendered caret matches the visual
+/// movement produced by [`visual_caret_neighbor`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisualCaret {
+    pub x: f32,
+    pub line: usize,
+    pub line_top: f32,
+    pub line_height: f32,
+}
+
+/// Resolve the edge-correct caret geometry for `byte` against a visual glyph
+/// layout. Returns `None` when the layout is empty or no glyph boundary matches
+/// `byte` (the caller should fall back to a line-start position). When a byte
+/// has two stops (a direction boundary — affinity), the leftmost is chosen
+/// deterministically, consistent with the soft-wrap affinity note on
+/// [`text_caret_layout`].
+pub fn visual_caret_pos(glyphs: &[VisualGlyph], byte: usize) -> Option<VisualCaret> {
+    if glyphs.is_empty() {
+        return None;
+    }
+    let stops = caret_stops(glyphs);
+    stops
+        .iter()
+        .filter(|s| s.byte == byte)
+        .min_by(|a, b| a.x.total_cmp(&b.x))
+        .map(|s| VisualCaret {
+            x: s.x,
+            line: s.line,
+            line_top: s.line_top,
+            line_height: s.line_height,
+        })
 }
 
 /// Truncate `content` to a single line that fits within `max_width`, appending a
@@ -2404,8 +2811,13 @@ pub struct TextBlock {
     pub glow: Option<TextGlow>,
     /// Font to shape this block in. `None` = the default system sans-serif.
     pub font: Option<FontHandle>,
-    /// Horizontal alignment within `max_width` (default `Left`).
+    /// Horizontal alignment within `max_width` (default
+    /// [`Start`](TextAlign::Start), i.e. the reading start).
     pub align: TextAlign,
+    /// Base paragraph direction (default [`Auto`](TextDirection::Auto)). Bidi
+    /// reordering of mixed scripts is automatic regardless; this only forces the
+    /// base direction for direction-neutral content.
+    pub direction: TextDirection,
     /// Single-line ellipsis mode: when `true`, the block is laid out on one line
     /// (no wrapping) and truncated with a trailing `'…'` if it would exceed
     /// `max_width`. When `false` (default) the block wraps at `max_width`.
@@ -2443,7 +2855,8 @@ impl TextBlock {
             shadow: None,
             glow: None,
             font: None,
-            align: TextAlign::Left,
+            align: TextAlign::default(),
+            direction: TextDirection::default(),
             ellipsize: false,
             weight: Weight::NORMAL,
             style: Style::Normal,
@@ -2533,6 +2946,14 @@ impl TextBlock {
         self
     }
 
+    /// Force the base paragraph direction. Bidi reordering of mixed scripts is
+    /// automatic regardless; this only pins the base direction for
+    /// direction-neutral content (digits, punctuation, leading Latin in an RTL UI).
+    pub fn with_direction(mut self, direction: TextDirection) -> Self {
+        self.direction = direction;
+        self
+    }
+
     /// Enable single-line ellipsis: lay the text out on one line and truncate it
     /// with a trailing `'…'` if it would exceed [`Self::max_width`]. Use this for
     /// labels that must stay inside a fixed-width box (set `max_width` to that
@@ -2597,11 +3018,13 @@ impl TextBlock {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaretPos, FontHandle, FontVMetrics, LINE_HEIGHT_RATIO, MsdfVertex, TextAlign, TextBlock,
-        TextMeasurer, TextRenderer, TextSpan, WrapMode, byte_at_point, byte_on_adjacent_line,
-        caret_for_byte, color_to_rgba, cosmic_align, ellipsize_to_width, field_reach, has_cjk,
-        has_lowercase, load_font_bytes, measure_with_font_system, resolve_span_color,
-        shared_font_system, text_caret_layout, text_cursor_positions, vcentered_line_y,
+        CaretPos, FontHandle, FontVMetrics, LINE_HEIGHT_RATIO, MsdfVertex, SelRect, TextAlign,
+        TextBlock, TextDirection, TextMeasurer, TextRenderer, TextSpan, VisualGlyph, WrapMode,
+        byte_at_point, byte_on_adjacent_line, caret_for_byte, color_to_rgba, cosmic_align,
+        direction_prefix, ellipsize_to_width, field_reach, has_cjk, has_lowercase, load_font_bytes,
+        measure_with_font_system, resolve_span_color, selection_rects, shared_font_system,
+        text_caret_layout, text_cursor_positions, text_visual_layout, vcentered_line_y,
+        visual_caret_neighbor,
     };
     use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping, Style, Weight};
 
@@ -2937,7 +3360,7 @@ mod tests {
     fn caret_layout(text: &str, wrap: WrapMode, max_width: f32) -> Vec<CaretPos> {
         let fsh = shared_font_system();
         let mut fs = fsh.lock().unwrap();
-        text_caret_layout(&mut fs, text, 16.0, 20.0, max_width, wrap, None)
+        text_caret_layout(&mut fs, text, 16.0, 20.0, max_width, wrap, None, TextDirection::Auto)
     }
 
     #[test]
@@ -3179,13 +3602,220 @@ mod tests {
     fn font_and_align_defaults_and_builders() {
         let plain = TextBlock::new("x", 0.0, 0.0);
         assert!(plain.font.is_none());
-        assert_eq!(plain.align, TextAlign::Left);
+        assert_eq!(plain.align, TextAlign::Start);
 
         let styled = TextBlock::new("x", 0.0, 0.0)
             .with_font(FontHandle("Noto Sans".to_string()))
             .with_align(TextAlign::Center);
         assert_eq!(styled.font.as_ref().unwrap().family(), "Noto Sans");
         assert_eq!(styled.align, TextAlign::Center);
+    }
+
+    // ---- RTL / bidi display knobs ----
+
+    #[test]
+    fn direction_prefix_emits_the_right_bidi_mark() {
+        assert_eq!(direction_prefix(TextDirection::Auto), "");
+        assert_eq!(direction_prefix(TextDirection::Ltr), "\u{200E}"); // LRM
+        assert_eq!(direction_prefix(TextDirection::Rtl), "\u{200F}"); // RLM
+    }
+
+    #[test]
+    fn cosmic_align_maps_logical_and_absolute_variants() {
+        use glyphon::cosmic_text::Align as CA;
+        // Start is cosmic-text's direction-relative default → no override.
+        assert!(cosmic_align(TextAlign::Start).is_none());
+        assert!(matches!(cosmic_align(TextAlign::Center), Some(CA::Center)));
+        assert!(matches!(cosmic_align(TextAlign::End), Some(CA::End)));
+        assert!(matches!(cosmic_align(TextAlign::Left), Some(CA::Left)));
+        assert!(matches!(cosmic_align(TextAlign::Right), Some(CA::Right)));
+    }
+
+    #[test]
+    fn direction_and_align_defaults_and_builders() {
+        let plain = TextBlock::new("x", 0.0, 0.0);
+        assert_eq!(plain.align, TextAlign::Start, "default align is reading-start");
+        assert_eq!(plain.direction, TextDirection::Auto, "default direction is auto");
+
+        let forced = TextBlock::new("x", 0.0, 0.0)
+            .with_direction(TextDirection::Rtl)
+            .with_align(TextAlign::End);
+        assert_eq!(forced.direction, TextDirection::Rtl);
+        assert_eq!(forced.align, TextAlign::End);
+    }
+
+    #[test]
+    fn forced_rtl_right_flushes_neutral_content() {
+        // A forced-RTL base direction makes a line flush to the right edge (cosmic
+        // lays an RTL paragraph out from `line_width`), so even Latin content is
+        // pushed rightward versus the LTR default. Mirrors `build_vertices`'
+        // prefix mechanism without a GPU.
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let leftmost = |guard: &mut glyphon::FontSystem, prefix: &str| -> f32 {
+            let mut buffer = Buffer::new(guard, Metrics::new(16.0, 20.0));
+            buffer.set_size(guard, Some(400.0), None);
+            buffer.set_text(
+                guard,
+                &format!("{prefix}short"),
+                Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+            );
+            buffer.shape_until_scroll(guard, false);
+            // First glyph that carries ink (skip the zero-width mark at index 0).
+            buffer
+                .layout_runs()
+                .next()
+                .unwrap()
+                .glyphs
+                .iter()
+                .map(|g| g.x)
+                .fold(f32::MAX, f32::min)
+        };
+        let ltr = leftmost(&mut guard, direction_prefix(TextDirection::Ltr));
+        let rtl = leftmost(&mut guard, direction_prefix(TextDirection::Rtl));
+        assert!(
+            rtl > ltr + 100.0,
+            "forced RTL should right-flush: rtl {rtl} vs ltr {ltr}"
+        );
+    }
+
+    // ---- Bidi editing primitives (pure, synthetic glyphs) ----
+
+    /// A synthetic bidi line: logical "ab" (LTR) followed by "גד" (RTL, 2-byte
+    /// chars). Visually: a@0 b@10 then the RTL run reversed — ד@20 ג@30 — each 10px.
+    /// Byte layout: a=0..1, b=1..2, ג=2..4, ד=4..6.
+    fn bidi_line() -> Vec<VisualGlyph> {
+        let vg = |byte_start, byte_end, x, rtl| VisualGlyph {
+            byte_start,
+            byte_end,
+            x,
+            w: 10.0,
+            line: 0,
+            line_top: 0.0,
+            line_height: 20.0,
+            rtl,
+        };
+        vec![
+            vg(0, 1, 0.0, false),  // a
+            vg(1, 2, 10.0, false), // b
+            vg(4, 6, 20.0, true),  // ד (logical-last, visually-left of the RTL run)
+            vg(2, 4, 30.0, true),  // ג
+        ]
+    }
+
+    #[test]
+    fn selection_rects_split_across_a_bidi_boundary() {
+        // Selecting logical [1,4) covers b (LTR, x 10..20) and ג (RTL, x 30..40),
+        // skipping ד (x 20..30) which is outside the range → two disjoint rects.
+        let rects = selection_rects(&bidi_line(), 1, 4);
+        assert_eq!(rects.len(), 2, "bidi-straddling selection is two visual spans");
+        let mut xs: Vec<f32> = rects.iter().map(|r| r.x).collect();
+        xs.sort_by(f32::total_cmp);
+        assert!((xs[0] - 10.0).abs() < 0.6, "first span starts at b: {xs:?}");
+        assert!((xs[1] - 30.0).abs() < 0.6, "second span starts at ג: {xs:?}");
+    }
+
+    #[test]
+    fn selection_rects_contiguous_run_is_one_rect() {
+        // Selecting just "ab" (logical 0..2) is one merged visual span [0,20].
+        let rects = selection_rects(&bidi_line(), 0, 2);
+        assert_eq!(rects.len(), 1);
+        let r = rects[0];
+        assert!(r.x.abs() < 0.6 && (r.w - 20.0).abs() < 0.6, "merged ab span: {r:?}");
+    }
+
+    #[test]
+    fn selection_rects_empty_when_degenerate() {
+        assert!(selection_rects(&bidi_line(), 3, 3).is_empty(), "empty range");
+        assert!(selection_rects(&[], 0, 5).is_empty(), "no glyphs");
+    }
+
+    #[test]
+    fn visual_caret_moves_left_to_right_on_screen() {
+        let line = bidi_line();
+        // LTR portion: stepping right increases byte (0→1→2 at x 0,10,20).
+        assert_eq!(visual_caret_neighbor(&line, 0, 1), 1, "a→b");
+        assert_eq!(visual_caret_neighbor(&line, 1, 1), 2, "b→ab/RTL seam");
+        // RTL interior: stepping right *decreases* logical byte (visual right in an
+        // RTL run is logically backward): ד-left=6 → ג-left=4.
+        assert_eq!(visual_caret_neighbor(&line, 6, 1), 4, "ד→ג moving right");
+        // Leftward is the mirror.
+        assert_eq!(visual_caret_neighbor(&line, 1, -1), 0, "b→a moving left");
+    }
+
+    #[test]
+    fn visual_caret_pure_ltr_is_logical() {
+        let vg = |byte_start, byte_end, x| VisualGlyph {
+            byte_start,
+            byte_end,
+            x,
+            w: 10.0,
+            line: 0,
+            line_top: 0.0,
+            line_height: 20.0,
+            rtl: false,
+        };
+        let line = vec![vg(0, 1, 0.0), vg(1, 2, 10.0), vg(2, 3, 20.0)]; // "abc"
+        assert_eq!(visual_caret_neighbor(&line, 0, 1), 1);
+        assert_eq!(visual_caret_neighbor(&line, 1, 1), 2);
+        assert_eq!(visual_caret_neighbor(&line, 2, -1), 1);
+        // No-op at the visual extremes (single line, nowhere to wrap).
+        assert_eq!(visual_caret_neighbor(&line, 0, -1), 0);
+        assert_eq!(visual_caret_neighbor(&line, 3, 1), 3);
+    }
+
+    #[test]
+    fn text_visual_layout_tags_bidi_levels() {
+        // Real shaping of a Latin+Hebrew string: cosmic assigns bidi levels per
+        // glyph regardless of whether a Hebrew face is installed, so the rtl flags
+        // are deterministic. 'a' is LTR, the Hebrew letters are RTL.
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let glyphs = text_visual_layout(
+            &mut guard,
+            "aאב",
+            16.0,
+            20.0,
+            400.0,
+            WrapMode::None,
+            None,
+            TextDirection::Auto,
+        );
+        assert!(!glyphs.is_empty(), "shaped some glyphs");
+        assert!(glyphs.iter().any(|g| !g.rtl), "the Latin 'a' is LTR");
+        assert!(glyphs.iter().any(|g| g.rtl), "the Hebrew letters are RTL");
+        // Byte offsets stay within the source string (prefix-adjusted, here no prefix).
+        assert!(glyphs.iter().all(|g| g.byte_end <= "aאב".len()));
+    }
+
+    #[test]
+    fn text_visual_layout_strips_forced_direction_mark() {
+        // Forcing a direction prepends a zero-width mark; it must not appear as a
+        // glyph nor shift the reported byte offsets.
+        let fs = shared_font_system();
+        let mut guard = fs.lock().unwrap();
+        let glyphs = text_visual_layout(
+            &mut guard,
+            "hi",
+            16.0,
+            20.0,
+            400.0,
+            WrapMode::None,
+            None,
+            TextDirection::Rtl,
+        );
+        assert!(
+            glyphs.iter().all(|g| g.byte_end <= 2),
+            "byte offsets map back to 'hi', not the prefixed string: {glyphs:?}"
+        );
+    }
+
+    // `SelRect` is part of the public surface; touch it so the import is used in
+    // builds that compile only a subset of tests.
+    #[allow(dead_code)]
+    fn _selrect_is_constructible() -> SelRect {
+        SelRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }
     }
 
     #[test]
@@ -3673,6 +4303,59 @@ mod tests {
             cache_total(&r),
             9,
             "each distinct (content|size|width|align|ellipsize|font|weight|style) is its own entry"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn direction_is_part_of_the_shape_cache_key() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        // Same content/metrics, three base directions → three distinct entries.
+        let auto = label("dir", &font);
+        let ltr = label("dir", &font).with_direction(TextDirection::Ltr);
+        let rtl = label("dir", &font).with_direction(TextDirection::Rtl);
+        r.build_vertices(&[auto, ltr, rtl]);
+        assert_eq!(
+            cache_total(&r),
+            3,
+            "each base direction caches and shapes independently"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn span_colours_survive_the_direction_prefix() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        // A two-span string: the direction prefix shifts cosmic's byte offsets,
+        // but `byte_start` is corrected back so per-span colour resolution is
+        // unaffected. The set of emitted fills must match between Auto and Rtl.
+        let spans = vec![
+            TextSpan { text: "AB".into(), color: Some(red()), underline: None },
+            TextSpan { text: "cd".into(), color: Some(blue()), underline: None },
+        ];
+        let auto = label("ABcd", &font).with_spans(spans.clone());
+        let rtl = label("ABcd", &font)
+            .with_spans(spans)
+            .with_direction(TextDirection::Rtl);
+        let va = r.build_vertices(&[auto]);
+        let vb = r.build_vertices(&[rtl]);
+
+        let fills = |v: &[MsdfVertex]| -> std::collections::BTreeSet<[u32; 4]> {
+            v.iter().map(|x| x.fill.map(f32::to_bits)).collect()
+        };
+        let fa = fills(&va);
+        assert!(
+            fa.contains(&red().map(f32::to_bits)) && fa.contains(&blue().map(f32::to_bits)),
+            "both span colours present in the LTR baseline"
+        );
+        assert_eq!(
+            fa,
+            fills(&vb),
+            "forcing RTL must not corrupt per-span colour mapping"
         );
     }
 

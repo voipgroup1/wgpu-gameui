@@ -20,7 +20,8 @@ use wgpu_gameui::{
     ListItem, ListState, NumberInput, ProgressBar, ProgressFill, RadioGroup, ScrollState, ScrollView,
     SelectionMode, Separator, Severity, Slider, StyleKey, StyleOverlay, StyleResolver, Table,
     TableCell, TableColumn,
-    Tabs, TextAlign, TextBlock, TextInput, Toast, ToastStack, TextSpan, Theme, TooltipContent,
+    Tabs, TextAlign, TextBlock, TextDirection, TextInput, Toast, ToastStack, TextSpan, Theme,
+    TooltipContent,
     TooltipLayer,
     TreeAction, TreeNode, TreeState, UiContext, UiRenderer, UiState, ease, lerp_color,
 };
@@ -395,6 +396,95 @@ fn render_widget_gallery() {
                 .with_max_width(r.width)
                 .with_align(TextAlign::Center),
         );
+
+        // ---- RTL / bidi ------------------------------------------------
+        // cosmic-text already runs the Unicode bidi algorithm, so Arabic/Hebrew
+        // shape and lay out right-to-left automatically (via system fallback
+        // faces — the glyphs only render where those faces are installed). The
+        // public knobs added on top are: a forced base `TextDirection` (for
+        // direction-neutral content that would otherwise auto-resolve LTR) and
+        // direction-relative `TextAlign::{Start, End}`.
+        flow.section(list, "RTL / bidi");
+
+        let r = flow.cell(list, "Arabic (auto)", 200.0, 22.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        list.text(
+            TextBlock::new("مرحبا بالعالم", r.x, r.y + 2.0)
+                .with_size(16.0)
+                .with_color(210, 220, 240)
+                .with_max_width(r.width),
+        );
+
+        let r = flow.cell(list, "Hebrew (auto)", 200.0, 22.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        list.text(
+            TextBlock::new("שלום עולם", r.x, r.y + 2.0)
+                .with_size(16.0)
+                .with_color(210, 220, 240)
+                .with_max_width(r.width),
+        );
+
+        // Direction-neutral content (digits + punctuation) auto-resolves LTR;
+        // forcing the base direction to RTL right-flushes and reorders it.
+        let r = flow.cell(list, "Neutral: Auto", 200.0, 22.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        list.text(
+            TextBlock::new("12:34 + 56", r.x, r.y + 2.0)
+                .with_size(15.0)
+                .with_color(200, 210, 230)
+                .with_max_width(r.width),
+        );
+
+        let r = flow.cell(list, "Neutral: forced RTL", 200.0, 22.0);
+        list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+        list.text(
+            TextBlock::new("12:34 + 56", r.x, r.y + 2.0)
+                .with_size(15.0)
+                .with_color(200, 210, 230)
+                .with_max_width(r.width)
+                .with_direction(TextDirection::Rtl),
+        );
+
+        // Direction-relative alignment over RTL content: Start = reading start
+        // (right edge for RTL), End = reading end (left); Left/Right stay
+        // absolute regardless of direction.
+        for (label, align) in [
+            ("RTL Start", TextAlign::Start),
+            ("RTL End", TextAlign::End),
+            ("RTL Left", TextAlign::Left),
+            ("RTL Right", TextAlign::Right),
+        ] {
+            let r = flow.cell(list, label, 120.0, 20.0);
+            list.rect_outline(r, 1.0, [0.3, 0.34, 0.42, 1.0]);
+            list.text(
+                TextBlock::new("שלום", r.x, r.y + 2.0)
+                    .with_size(14.0)
+                    .with_color(180, 190, 210)
+                    .with_max_width(r.width)
+                    .with_align(align),
+            );
+        }
+
+        // A focused, forced-RTL text input with an active selection — exercises
+        // the bidi selection rectangles and edge-correct caret. Local
+        // focus/input so it doesn't disturb the shared owner above.
+        let r = flow.cell(list, "RTL input (selected)", 200.0, 28.0);
+        {
+            const RTL_ID: u64 = 203;
+            let rtl_input = InputState::default();
+            let mut rtl_focus = FocusState::new();
+            rtl_focus.focus(RTL_ID);
+            rtl_focus.begin_frame(&rtl_input);
+            let mut field = TextInput::new(r.x, r.y, r.width, r.height)
+                .with_direction(TextDirection::Rtl)
+                .with_value("שלום עולם");
+            field.cursor_pos = field.value.len();
+            field.selection_start = Some(0);
+            field.draw(
+                RTL_ID,
+                &mut DrawContext::new(list, &mut rtl_focus, &theme, &rtl_input, W as f32, 600.0),
+            );
+        }
 
         // ---- Vertical centering (debug) --------------------------------
         // Visualises the per-label optical centerer (`DrawList::vcentered_text_y`).

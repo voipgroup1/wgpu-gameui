@@ -6,7 +6,8 @@ use crate::InputState;
 use crate::StyleKey;
 use crate::layout::Rect;
 use crate::text::{
-    CaretPos, TextBlock, TextSpan, WrapMode, byte_at_point, byte_on_adjacent_line, caret_for_byte,
+    CaretPos, TextBlock, TextSpan, VisualGlyph, WrapMode, byte_at_point, byte_on_adjacent_line,
+    caret_for_byte, selection_rects, visual_caret_neighbor,
 };
 
 use super::{DrawContext, FocusId};
@@ -204,6 +205,12 @@ pub struct TextInput {
     /// renders normally. Set via [`password`](Self::password) /
     /// [`with_mask`](Self::with_mask).
     pub mask: Option<char>,
+    /// Base paragraph direction for the field's content (default
+    /// [`Auto`](crate::TextDirection::Auto)). Bidi reordering of mixed scripts is
+    /// automatic regardless; this forces the base direction (and hence the
+    /// reading-start alignment + caret home edge) for direction-neutral content.
+    /// Set via [`with_direction`](Self::with_direction).
+    pub direction: crate::TextDirection,
     /// Clipboard getter — returns the current clipboard contents.
     clipboard_get: Option<Box<dyn FnMut() -> String>>,
     /// Clipboard setter — writes text to the clipboard.
@@ -225,6 +232,7 @@ impl Default for TextInput {
             scroll_offset: 0.0,
             desired_caret_x: None,
             mask: None,
+            direction: crate::TextDirection::Auto,
             clipboard_get: None,
             clipboard_set: None,
         }
@@ -246,6 +254,7 @@ impl TextInput {
             scroll_offset: 0.0,
             desired_caret_x: None,
             mask: None,
+            direction: crate::TextDirection::Auto,
             clipboard_get: None,
             clipboard_set: None,
         }
@@ -278,6 +287,15 @@ impl TextInput {
     /// Mask displayed characters with `ch` (e.g. `'*'`). See [`mask`](Self::mask).
     pub fn with_mask(mut self, ch: char) -> Self {
         self.mask = Some(ch);
+        self
+    }
+
+    /// Force the base paragraph direction of the field's content. See
+    /// [`direction`](Self::direction). Leaving this `Auto` still edits RTL text
+    /// correctly (the base direction is auto-detected from the content); set it
+    /// to pin the direction for neutral content or a consistently-RTL field.
+    pub fn with_direction(mut self, direction: crate::TextDirection) -> Self {
+        self.direction = direction;
         self
     }
 
@@ -393,8 +411,20 @@ impl TextInput {
         }
     }
 
-    /// Move cursor one grapheme-cluster left.
-    fn cursor_left(&mut self) {
+    /// Move the cursor one step to the **visual left**.
+    ///
+    /// When a visual glyph layout is available (`vis` non-empty — focused,
+    /// unmasked fields), the caret steps one glyph cell to the left *on screen*
+    /// regardless of run direction, so the key matches the physical arrow in
+    /// bidi text (macOS/Windows/GTK behaviour). With no layout (masked fields,
+    /// or callers driving the widget without geometry) it falls back to a
+    /// logical previous-grapheme step — identical to the historical behaviour
+    /// and correct for the LTR/masked case where visual == logical.
+    fn cursor_left(&mut self, vis: &[VisualGlyph]) {
+        if !vis.is_empty() {
+            self.cursor_pos = visual_caret_neighbor(vis, self.cursor_pos, -1);
+            return;
+        }
         if self.cursor_pos > 0 {
             let prev = self.value[..self.cursor_pos]
                 .char_indices()
@@ -405,8 +435,15 @@ impl TextInput {
         }
     }
 
-    /// Move cursor one grapheme-cluster right.
-    fn cursor_right(&mut self) {
+    /// Move the cursor one step to the **visual right**. See [`cursor_left`] for
+    /// the visual-vs-logical contract.
+    ///
+    /// [`cursor_left`]: Self::cursor_left
+    fn cursor_right(&mut self, vis: &[VisualGlyph]) {
+        if !vis.is_empty() {
+            self.cursor_pos = visual_caret_neighbor(vis, self.cursor_pos, 1);
+            return;
+        }
         if self.cursor_pos < self.value.len() {
             let next = self.value[self.cursor_pos..]
                 .char_indices()
@@ -480,7 +517,7 @@ impl TextInput {
     ///
     /// [`process_keyboard_with_layout`]: Self::process_keyboard_with_layout
     pub fn process_keyboard(&mut self, input: &InputState) {
-        self.handle_keyboard(input, &[]);
+        self.handle_keyboard(input, &[], &[]);
     }
 
     /// Like [`process_keyboard`](Self::process_keyboard) but with the field's
@@ -489,10 +526,14 @@ impl TextInput {
     /// the value as laid out *this* frame (pre-edit); edits re-layout next frame
     /// — a one-frame latency that only affects the Up/Down target line.
     pub fn process_keyboard_with_layout(&mut self, input: &InputState, layout: &[CaretPos]) {
-        self.handle_keyboard(input, layout);
+        self.handle_keyboard(input, layout, &[]);
     }
 
-    fn handle_keyboard(&mut self, input: &InputState, layout: &[CaretPos]) {
+    /// Full keyboard handler. `layout` is the line-aware [`CaretPos`] geometry
+    /// (vertical nav / line Home-End); `vis` is the visual-order glyph layout
+    /// used for bidi-correct Left/Right caret movement. `draw` supplies both;
+    /// the public entry points pass empty slices for the parts they can't build.
+    fn handle_keyboard(&mut self, input: &InputState, layout: &[CaretPos], vis: &[VisualGlyph]) {
         // Masking forces single-line semantics (Enter submits, Up/Down inert).
         let multiline = self.multiline && self.mask.is_none();
         // Check for Ctrl shortcuts via text_input.
@@ -583,17 +624,19 @@ impl TextInput {
                 if self.selection_start.is_none() {
                     self.selection_start = Some(was);
                 }
-                self.cursor_left();
+                self.cursor_left(vis);
             } else {
                 if self.selection_start.is_some()
                     && self.cursor_pos != self.selection_start.unwrap()
                 {
-                    // Moving without Shift clears selection and jumps to the closer end.
+                    // Moving without Shift collapses the selection to its
+                    // logical start. (In bidi text the logical start may not be
+                    // the visual-left edge; collapsing visually is a documented
+                    // v1 limitation alongside boundary affinity.)
                     let (s, _e) = self.selection_range().unwrap();
-                    // Move to the leftmost end of the selection.
                     self.cursor_pos = s;
                 } else {
-                    self.cursor_left();
+                    self.cursor_left(vis);
                 }
                 self.selection_start = None;
             }
@@ -607,7 +650,7 @@ impl TextInput {
                 if self.selection_start.is_none() {
                     self.selection_start = Some(was);
                 }
-                self.cursor_right();
+                self.cursor_right(vis);
             } else {
                 if self.selection_start.is_some()
                     && self.cursor_pos != self.selection_start.unwrap()
@@ -615,7 +658,7 @@ impl TextInput {
                     let (_, e) = self.selection_range().unwrap();
                     self.cursor_pos = e;
                 } else {
-                    self.cursor_right();
+                    self.cursor_right(vis);
                 }
                 self.selection_start = None;
             }
@@ -767,7 +810,37 @@ impl TextInput {
         // testing see this frame's geometry (one-frame edit latency — see
         // `process_keyboard_with_layout`).
         let nav_layout: Vec<CaretPos> = if multiline && focused {
-            list.text_caret_layout(&self.value, s.scalar(StyleKey::FontSize), Some(text_max_w), wrap)
+            list.text_caret_layout(
+                &self.value,
+                s.scalar(StyleKey::FontSize),
+                Some(text_max_w),
+                wrap,
+                self.direction,
+            )
+        } else {
+            Vec::new()
+        };
+
+        // Visual-order glyph layout for bidi-correct Left/Right caret movement,
+        // built BEFORE keyboard handling (same one-frame-latency contract as
+        // `nav_layout`). Only built for focused, single-line, *unmasked* fields:
+        // masked bullets are LTR (visual == logical, so the logical fallback in
+        // `cursor_left`/`cursor_right` is exact); multiline keeps the existing
+        // logical movement + left-edge caret rendering so it stays coherent
+        // (single-line is the bidi-precise editing surface — multiline RTL caret
+        // edge-precision is a documented limitation, like boundary affinity).
+        let move_vis: Vec<VisualGlyph> = if focused
+            && !multiline
+            && self.mask.is_none()
+            && !self.value.is_empty()
+        {
+            list.text_visual_layout(
+                &self.value,
+                s.scalar(StyleKey::FontSize),
+                Some(text_max_w),
+                wrap,
+                self.direction,
+            )
         } else {
             Vec::new()
         };
@@ -830,7 +903,7 @@ impl TextInput {
 
         // Process keyboard events only while focused.
         if focused {
-            self.process_keyboard_with_layout(input, &nav_layout);
+            self.handle_keyboard(input, &nav_layout, &move_vis);
         }
 
         // A live IME composition is shown inline (underlined) and supersedes the
@@ -860,7 +933,13 @@ impl TextInput {
         // Render-time caret layout (multiline+focused), reflecting any edits made
         // this frame — used for autoscroll, per-line selection, and the caret.
         let render_layout: Vec<CaretPos> = if multiline && focused {
-            list.text_caret_layout(&self.value, s.scalar(StyleKey::FontSize), Some(text_max_w), wrap)
+            list.text_caret_layout(
+                &self.value,
+                s.scalar(StyleKey::FontSize),
+                Some(text_max_w),
+                wrap,
+                self.direction,
+            )
         } else {
             Vec::new()
         };
@@ -910,6 +989,23 @@ impl TextInput {
             0.0
         };
 
+        // Render-time visual-order glyph layout of the *display* string for
+        // single-line fields, shared by the bidi selection fill and the
+        // edge-correct caret below. Masked bullets lay out LTR, so this collapses
+        // to the historical single-span / left-edge behaviour for passwords.
+        let caret_vis: Vec<VisualGlyph> =
+            if focused && !composing && !multiline && !self.value.is_empty() {
+                list.text_visual_layout(
+                    &display,
+                    s.scalar(StyleKey::FontSize),
+                    Some(text_max_w),
+                    wrap,
+                    self.direction,
+                )
+            } else {
+                Vec::new()
+            };
+
         // ---- Draw selection highlight ----
         if focused && !composing && !self.value.is_empty() {
             if let Some((sel_start, sel_end)) = self.selection_range() {
@@ -946,33 +1042,23 @@ impl TextInput {
                             );
                         }
                     } else {
-                        // Measure on the masked display; convert the selection's
-                        // value bytes to display bytes first.
-                        let positions = list.text_cursor_positions(
-                            &display,
-                            s.scalar(StyleKey::FontSize),
-                            Some(text_max_w),
-                        );
+                        // Single-line: resolve bidi-correct visual rectangles.
+                        // A logically-contiguous selection can map to several
+                        // disjoint visual spans across an LTR↔RTL boundary, so
+                        // we draw one quad per returned rect. Selection bytes are
+                        // mapped to display bytes first (identity when unmasked;
+                        // masked bullets are LTR so this yields a single span).
                         let ds = self.value_to_display_byte(sel_start);
                         let de = self.value_to_display_byte(sel_end);
-                        let sel_x1 = positions
-                            .iter()
-                            .find(|&&(i, _)| i >= ds)
-                            .map(|&(_, x)| x)
-                            .unwrap_or(0.0);
-                        let sel_x2 = positions
-                            .iter()
-                            .find(|&&(i, _)| i >= de)
-                            .map(|&(_, x)| x)
-                            .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
-
-                        list.quad(
-                            text_x + sel_x1,
-                            text_top,
-                            sel_x2 - sel_x1,
-                            line_height,
-                            s.color(StyleKey::Accent),
-                        );
+                        for r in selection_rects(&caret_vis, ds, de) {
+                            list.quad(
+                                text_x + r.x,
+                                text_top,
+                                r.w.max(1.0),
+                                line_height,
+                                s.color(StyleKey::Accent),
+                            );
+                        }
                     }
                 }
             }
@@ -1005,6 +1091,7 @@ impl TextInput {
                     (text_c[2] * 255.0) as u8,
                 )
                 .with_max_width(text_max_w)
+                .with_direction(self.direction)
                 .with_spans(spans.clone());
             list.text(text);
         } else {
@@ -1016,7 +1103,8 @@ impl TextInput {
                     (text_color[1] * 255.0) as u8,
                     (text_color[2] * 255.0) as u8,
                 )
-                .with_max_width(text_max_w);
+                .with_max_width(text_max_w)
+                .with_direction(self.direction);
             list.text(text);
         }
 
@@ -1053,19 +1141,16 @@ impl TextInput {
                 } else if self.value.is_empty() {
                     text_x
                 } else {
-                    // Measure on the masked display; convert the caret's value byte.
-                    let positions = list.text_cursor_positions(
-                        &display,
-                        s.scalar(StyleKey::FontSize),
-                        Some(text_max_w),
-                    );
+                    // Edge-correct caret position from the visual layout: in RTL
+                    // (or bidi) content the caret for a byte sits on the cell edge
+                    // where that byte logically begins — the *right* edge of an
+                    // RTL cell — which the left-edge `text_cursor_positions` table
+                    // gets wrong. `caret_vis` is over the display, so the value
+                    // byte is mapped first (identity unmasked; masked = LTR).
                     let caret_disp = self.value_to_display_byte(self.cursor_pos);
-                    let offset = positions
-                        .iter()
-                        .find(|&&(i, _)| i >= caret_disp)
-                        .map(|&(_, x)| x)
-                        .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
-                    text_x + offset
+                    crate::text::visual_caret_pos(&caret_vis, caret_disp)
+                        .map(|c| text_x + c.x)
+                        .unwrap_or(text_x)
                 };
                 list.quad(cursor_x, block_y, 1.5, line_height, s.color(StyleKey::Text));
                 // See the multiline branch: declare IME focus + caret anchor.
@@ -1339,17 +1424,17 @@ mod tests {
     fn cursor_left_right() {
         let mut ti = make_input("hi");
         assert_eq!(ti.cursor_pos, 2);
-        ti.cursor_left();
+        ti.cursor_left(&[]);
         assert_eq!(ti.cursor_pos, 1);
-        ti.cursor_left();
+        ti.cursor_left(&[]);
         assert_eq!(ti.cursor_pos, 0);
-        ti.cursor_left(); // no-op
+        ti.cursor_left(&[]); // no-op
         assert_eq!(ti.cursor_pos, 0);
-        ti.cursor_right();
+        ti.cursor_right(&[]);
         assert_eq!(ti.cursor_pos, 1);
-        ti.cursor_right();
+        ti.cursor_right(&[]);
         assert_eq!(ti.cursor_pos, 2);
-        ti.cursor_right(); // no-op
+        ti.cursor_right(&[]); // no-op
         assert_eq!(ti.cursor_pos, 2);
     }
 
@@ -1445,28 +1530,124 @@ mod tests {
         assert_eq!(ti.cursor_pos, 6);
 
         // Move left: should skip "あ" (3 bytes) → byte 3 (after 'X').
-        ti.cursor_left();
+        ti.cursor_left(&[]);
         assert_eq!(ti.cursor_pos, 3, "left from end should land after X");
 
         // Move left again: skip 'X' (1 byte) → byte 2 (after 'é').
-        ti.cursor_left();
+        ti.cursor_left(&[]);
         assert_eq!(ti.cursor_pos, 2, "left from X should land after é");
 
         // Move left again: skip 'é' (2 bytes) → byte 0.
-        ti.cursor_left();
+        ti.cursor_left(&[]);
         assert_eq!(ti.cursor_pos, 0, "left from é should land at start");
 
         // Move right: skip 'é' (2 bytes) → byte 2.
-        ti.cursor_right();
+        ti.cursor_right(&[]);
         assert_eq!(ti.cursor_pos, 2, "right from start should land after é");
 
         // Move right: skip 'X' (1 byte) → byte 3.
-        ti.cursor_right();
+        ti.cursor_right(&[]);
         assert_eq!(ti.cursor_pos, 3, "right from é should land after X");
 
         // Move right: skip 'あ' (3 bytes) → byte 6.
-        ti.cursor_right();
+        ti.cursor_right(&[]);
         assert_eq!(ti.cursor_pos, 6, "right from X should land at end");
+    }
+
+    // ---- RTL / bidi editing ----
+
+    #[test]
+    fn with_direction_sets_field_direction_default_auto() {
+        let rtl = TextInput::new(0.0, 0.0, 200.0, 24.0).with_direction(crate::TextDirection::Rtl);
+        assert_eq!(rtl.direction, crate::TextDirection::Rtl);
+        assert_eq!(
+            TextInput::new(0.0, 0.0, 10.0, 10.0).direction,
+            crate::TextDirection::Auto,
+            "fields default to auto direction"
+        );
+    }
+
+    #[test]
+    fn focused_arrows_move_visually_for_ltr() {
+        // Visual Left/Right must coincide with logical prev/next for LTR content
+        // — a regression guard that the new visual-movement wiring leaves the
+        // common case untouched. Movement runs inside `draw` (which builds the
+        // visual layout), so we drive it through focused frames.
+        let mut ti = make_input("hello");
+        ti.cursor_pos = 5;
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        focus.focus(0);
+
+        let mut left = fake_input();
+        left.key_left = true;
+        focus.begin_frame(&left);
+        draw_input(&mut ti, 0, &mut focus, &mut list, &theme, &left);
+        assert_eq!(ti.cursor_pos, 4, "visual-left from end steps back one char");
+
+        let mut right = fake_input();
+        right.key_right = true;
+        focus.begin_frame(&right);
+        draw_input(&mut ti, 0, &mut focus, &mut list, &theme, &right);
+        assert_eq!(ti.cursor_pos, 5, "visual-right returns to the end");
+    }
+
+    #[test]
+    fn focused_arrow_moves_caret_in_rtl_value() {
+        // An RTL value lays out right-to-left; cosmic assigns bidi levels
+        // regardless of which faces are installed, so visual movement engages.
+        // The logical end of RTL text is the visual *left* edge, so a visual
+        // Right step moves rightward into the text. We assert only that the
+        // caret moves (the exact byte depends on the shaped run), confirming the
+        // visual-movement path is wired for RTL content.
+        let mut ti = make_input("אבג"); // three Hebrew letters
+        let start = ti.cursor_pos; // logical end of the value
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        focus.focus(0);
+
+        let mut right = fake_input();
+        right.key_right = true;
+        focus.begin_frame(&right);
+        draw_input(&mut ti, 0, &mut focus, &mut list, &theme, &right);
+        assert_ne!(
+            ti.cursor_pos, start,
+            "a visual arrow moves the caret in RTL text"
+        );
+    }
+
+    #[test]
+    fn active_selection_adds_a_fill_quad() {
+        // The bidi selection-rect path must still draw a highlight for a plain
+        // contiguous selection. Compare vertex counts with and without an active
+        // selection on an otherwise identical focused field.
+        let theme = Theme::default();
+        let mut focus = FocusState::new();
+        focus.focus(0);
+
+        let mut plain = make_input("hello");
+        plain.cursor_pos = 5;
+        let mut l0 = DrawList::new();
+        focus.begin_frame(&fake_input());
+        draw_input(&mut plain, 0, &mut focus, &mut l0, &theme, &fake_input());
+        // Filled quads take the instanced-chrome fast path under a translate-only
+        // transform, so the selection rectangle lands in `chrome_instances`.
+        let base = l0.chrome_instances.len();
+
+        let mut sel = make_input("hello");
+        sel.cursor_pos = 4;
+        sel.selection_start = Some(1);
+        let mut l1 = DrawList::new();
+        focus.begin_frame(&fake_input());
+        draw_input(&mut sel, 0, &mut focus, &mut l1, &theme, &fake_input());
+        assert!(
+            l1.chrome_instances.len() > base,
+            "an active selection adds at least one fill quad ({} vs {})",
+            l1.chrome_instances.len(),
+            base
+        );
     }
 
     #[test]
@@ -1638,6 +1819,7 @@ mod tests {
             max_width,
             WrapMode::WordOrGlyph,
             None,
+            crate::text::TextDirection::Auto,
         )
     }
 

@@ -500,7 +500,23 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       selection geometry runs on the masked display via char-aligned byte mapping
       (`value_to_display_byte`/`display_to_value_byte`). Façade verb:
       `UiContext::password_input(id, buffer, placeholder, w)`.
-- [ ] **P2 — RTL / bidi exposure** (glyphon supports it; no public knob).
+- [x] **P2 — RTL / bidi exposure** (glyphon supports it; no public knob).
+      cosmic-text already runs the Unicode bidi algorithm, so the work was
+      exposing the missing knobs and making editing bidi-aware. API:
+      `TextDirection { Auto, Ltr, Rtl }` + `TextBlock::with_direction` /
+      `TextInput::with_direction` force a base direction (via a leading
+      LRM/RLM mark) for direction-neutral content. `TextAlign` gained
+      direction-relative `Start`/`End` (default is now `Start`, byte-identical
+      to the old `Left` default; `Left`/`Right` are absolute). New shaping
+      primitives: `text_visual_layout` → `Vec<VisualGlyph>` (visual-order,
+      bidi-level-tagged), the pure `selection_rects` (bidi selections split
+      into multiple visual rectangles), `visual_caret_neighbor` (visual
+      Left/Right caret movement), and `visual_caret_pos`/`VisualCaret`
+      (edge-correct caret rendering). `text_caret_layout` is now
+      direction-aware. Single-line `TextInput` is fully bidi-precise (visual
+      caret movement + edge-correct caret + multi-rect selection); multiline
+      stays LTR-correct (multiline RTL caret edge-precision is a documented
+      limitation, alongside direction-boundary caret affinity).
 
 ---
 

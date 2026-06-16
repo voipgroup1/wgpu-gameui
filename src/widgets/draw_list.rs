@@ -373,12 +373,31 @@ impl DrawList {
         font_size: f32,
         max_width: Option<f32>,
         wrap: crate::text::WrapMode,
+        direction: crate::text::TextDirection,
     ) -> Vec<crate::text::CaretPos> {
         let handle = self.text_measurer.font_system_handle();
         let mut fs = handle.lock().expect("FontSystem poisoned");
         let mw = max_width.unwrap_or(f32::MAX / 4.0);
         let lh = font_size * 1.25;
-        crate::text::text_caret_layout(&mut fs, text, font_size, lh, mw, wrap, None)
+        crate::text::text_caret_layout(&mut fs, text, font_size, lh, mw, wrap, None, direction)
+    }
+
+    /// Visual-order glyph layout for bidi-aware editing — the source for
+    /// [`crate::text::selection_rects`] and [`crate::text::visual_caret_neighbor`].
+    /// Same shaping parameters as [`Self::text_caret_layout`].
+    pub fn text_visual_layout(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+        wrap: crate::text::WrapMode,
+        direction: crate::text::TextDirection,
+    ) -> Vec<crate::text::VisualGlyph> {
+        let handle = self.text_measurer.font_system_handle();
+        let mut fs = handle.lock().expect("FontSystem poisoned");
+        let mw = max_width.unwrap_or(f32::MAX / 4.0);
+        let lh = font_size * 1.25;
+        crate::text::text_visual_layout(&mut fs, text, font_size, lh, mw, wrap, None, direction)
     }
 
     // ---- Clip stack ----
