@@ -19,21 +19,28 @@ pub enum ColumnWidth {
 /// Text alignment within a cell.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum Align {
+    /// Align to the left edge (default).
     #[default]
     Left,
+    /// Center within the cell.
     Center,
+    /// Align to the right edge.
     Right,
 }
 
 /// Column definition for a table.
 #[derive(Debug, Clone)]
 pub struct TableColumn {
+    /// Header text shown for this column.
     pub label: String,
+    /// How the column's width is computed.
     pub width: ColumnWidth,
+    /// Horizontal alignment of header and cell text.
     pub align: Align,
 }
 
 impl TableColumn {
+    /// Create a column with the given label and width, left-aligned by default.
     pub fn new(label: impl Into<String>, width: ColumnWidth) -> Self {
         Self {
             label: label.into(),
@@ -42,6 +49,7 @@ impl TableColumn {
         }
     }
 
+    /// Set the column's text alignment.
     pub fn with_align(mut self, align: Align) -> Self {
         self.align = align;
         self
@@ -51,11 +59,14 @@ impl TableColumn {
 /// A single cell in a table row.
 #[derive(Debug, Clone, Default)]
 pub struct TableCell {
+    /// The cell's display text.
     pub text: String,
+    /// Optional RGBA text color override; `None` uses the theme text color.
     pub color: Option<[f32; 4]>,
 }
 
 impl TableCell {
+    /// Create a cell with the given text and default (theme) color.
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -63,6 +74,7 @@ impl TableCell {
         }
     }
 
+    /// Set an RGBA text color override for this cell.
     pub fn with_color(mut self, color: [f32; 4]) -> Self {
         self.color = Some(color);
         self
@@ -124,6 +136,8 @@ pub struct Table<'a> {
 }
 
 impl<'a> Table<'a> {
+    /// Create a table over the given column definitions (default 24px rows,
+    /// 20px header shown, no zebra striping).
     pub fn new(columns: &'a [TableColumn]) -> Self {
         Self {
             columns,
@@ -134,21 +148,25 @@ impl<'a> Table<'a> {
         }
     }
 
+    /// Set the per-row height in pixels.
     pub fn with_row_height(mut self, height: f32) -> Self {
         self.row_height = height;
         self
     }
 
+    /// Set the header strip height in pixels.
     pub fn with_header_height(mut self, height: f32) -> Self {
         self.header_height = height;
         self
     }
 
+    /// Toggle whether the header row is drawn.
     pub fn with_header(mut self, show: bool) -> Self {
         self.show_header = show;
         self
     }
 
+    /// Toggle alternating-row background shading.
     pub fn with_zebra_stripe(mut self, enable: bool) -> Self {
         self.zebra_stripe = enable;
         self

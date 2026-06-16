@@ -10,6 +10,7 @@ use super::{DrawContext, DrawList, FocusId};
 /// [`Checkbox::with_icon_keys`] path; the default rendering is vector-drawn and
 /// needs no atlas assets.
 pub const CHECKBOX_ICON: &str = "textures/ui/checkbox.png";
+/// Texture key for the checked checkbox box (string-keyed path only).
 pub const CHECKBOX_CHECKED_ICON: &str = "textures/ui/checkbox_checked.png";
 
 /// How the checkbox box is rendered.

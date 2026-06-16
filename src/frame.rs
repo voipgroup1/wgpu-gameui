@@ -61,7 +61,7 @@ use crate::{InputState, layer::LayerStack};
 
 /// A closure-scoped interactive frame: runs [`UiState::begin_frame`] before your
 /// build closure and [`UiState::end_frame`] after it, so the pair can't be
-/// forgotten or mis-ordered. See the [module docs](self) for rationale.
+/// forgotten or mis-ordered. See the module docs for rationale.
 ///
 /// Construct with [`Frame::new`] (or [`UiState::frame`]) — supplying caller state,
 /// this frame's input, the theme, and a [`NavMap`] — optionally set the animation

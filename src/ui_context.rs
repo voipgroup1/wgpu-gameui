@@ -29,16 +29,22 @@ use std::collections::HashMap;
 /// Horizontal alignment relative to the current origin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AlignH {
+    /// Anchor to the left edge of the origin.
     Left,
+    /// Center horizontally on the origin.
     Center,
+    /// Anchor to the right edge of the origin.
     Right,
 }
 
 /// Vertical alignment relative to the current origin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AlignV {
+    /// Anchor to the top edge of the origin.
     Top,
+    /// Center vertically on the origin.
     Middle,
+    /// Anchor to the bottom edge of the origin.
     Bottom,
 }
 
@@ -835,7 +841,7 @@ impl<'a> UiContext<'a> {
 
     /// Advance the layout cursor by exactly `height` (no theme `item_gap`),
     /// honoring [`auto_advance`](Self::auto_advance). The public companion to the
-    /// private [`advance`](Self::advance): the Lua bindings call this for
+    /// private `advance`: the Lua bindings call this for
     /// Teardown's per-widget vertical stacking, so `UiAutoAdvance(false)`
     /// disables their stacking uniformly with the crate's own verbs.
     pub fn advance_cursor(&mut self, height: f32) {
@@ -876,7 +882,7 @@ impl<'a> UiContext<'a> {
     }
 
     /// Draw a chrome text button and report whether it was clicked this frame.
-    /// `w`/`h` default to [`default_field_width`](Self::default_field_width) /
+    /// `w`/`h` default to `default_field_width` /
     /// `theme.button_height`. Auto-advances by the button height.
     pub fn text_button(&mut self, label: &str, w: Option<f32>, h: Option<f32>) -> bool {
         let (input, theme) = match self.interactive_refs() {
@@ -920,7 +926,7 @@ impl<'a> UiContext<'a> {
     /// pointer interaction — Teardown's `UiMakeInteractive`. Draws **nothing**:
     /// it only senses hover/click/scroll over the cell, so the caller (or a
     /// preceding draw verb) owns the pixels. Auto-advances by `h`. `w` defaults
-    /// to [`default_field_width`](Self::default_field_width).
+    /// to `default_field_width`.
     ///
     /// For a fixed-position sensor over something this UI didn't lay out (a 3D
     /// viewport region, a world-projected label), use [`hit_zone_at`](Self::hit_zone_at).
@@ -961,7 +967,7 @@ impl<'a> UiContext<'a> {
 
     /// Draw a slider for `value` in `[min, max]` and return the (possibly
     /// updated) value. `id` is a stable per-slider [`DragId`]. `w` defaults to
-    /// [`default_field_width`](Self::default_field_width); height is
+    /// `default_field_width`; height is
     /// `theme.input_height`. Auto-advances by the height.
     pub fn slider(&mut self, id: DragId, value: f32, min: f32, max: f32, w: Option<f32>) -> f32 {
         let (input, theme) = match self.interactive_refs() {
@@ -1091,7 +1097,7 @@ impl<'a> UiContext<'a> {
     /// the edit cursor/selection in `UiState` keyed by `id`; syncs the caller's
     /// `&mut String` in (external changes win) and out (edits are written back).
     /// Returns whether the text changed this frame. `w` defaults to
-    /// [`default_field_width`](Self::default_field_width); height is
+    /// `default_field_width`; height is
     /// `theme.input_height`. Auto-advances by the height.
     pub fn text_input(
         &mut self,
@@ -1261,7 +1267,7 @@ impl<'a> UiContext<'a> {
     /// wheel (while focused), and Up/Down arrows (while focused). `decimals`
     /// sets the displayed precision (`0` = integer field). Returns whether the
     /// value changed this frame; writes the (clamped) value back into `value`.
-    /// `w` defaults to [`default_field_width`](Self::default_field_width);
+    /// `w` defaults to `default_field_width`;
     /// height is `theme.input_height`. Auto-advances by the height.
     ///
     /// Edit state (cursor/selection) persists in `UiState` keyed by `id`, in the

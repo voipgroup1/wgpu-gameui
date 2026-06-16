@@ -274,6 +274,9 @@ const MSDF_VERTEX_ATTRIBS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array!
     8 => Float32,
 ];
 
+/// GPU text renderer: owns the MSDF glyph atlas (and optional Phosphor icon
+/// atlas), the shaping font system, and the wgpu pipeline/buffers that draw
+/// shaped glyph quads. One instance is created per [`crate::UiRenderer`].
 pub struct TextRenderer {
     font_system: FontSystemHandle,
 
@@ -324,6 +327,9 @@ pub struct TextRenderer {
 }
 
 impl TextRenderer {
+    /// Construct a `TextRenderer` with a fresh shared `FontSystem` (loads system +
+    /// bundled fonts). Use [`with_font_system`](Self::with_font_system) to share an
+    /// existing one. `format` is the render target's color format.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let font_system = shared_font_system();
         Self::with_font_system(device, queue, format, font_system)
@@ -461,6 +467,8 @@ impl TextRenderer {
         Arc::clone(&self.font_system)
     }
 
+    /// Update the viewport size used to build the ortho projection. Both
+    /// dimensions are clamped to a minimum of 1.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
@@ -554,7 +562,7 @@ impl TextRenderer {
 
     /// Prepare and render a batch of MSDF icons in a single pass. Mirrors
     /// [`render`](Self::render) but builds each quad by fitting-and-centering the
-    /// icon's glyph tile into its rect (see [`fit_centered`]), and binds the icon
+    /// icon's glyph tile into its rect (see `fit_centered`), and binds the icon
     /// atlas instead of the glyph atlas. Shares the pipeline, ortho uniform, and
     /// vertex buffer (bump-allocated) with text.
     #[cfg(feature = "phosphor-icons")]
@@ -1621,17 +1629,25 @@ const VMETRICS_REF_PX: f32 = 100.0;
 /// (font-metric-agnostic) counterpart.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FontVMetrics {
+    /// First baseline's offset below the block top, as a fraction of `font_size`
+    /// (a touch over `1.0` for the default line box).
     pub baseline_ratio: f32,
+    /// Font x-height (lowercase body height) as a fraction of `font_size` (`~0.5`).
     pub x_ratio: f32,
+    /// Font cap height as a fraction of `font_size` (`~0.7`).
     pub cap_ratio: f32,
+    /// Baseline offset below the block top for a CJK line, as a fraction of
+    /// `font_size` (CJK rides a taller baseline than roman text).
     pub cjk_baseline_ratio: f32,
+    /// Ideographic ink centre above the CJK baseline, as a fraction of `font_size`
+    /// (`~0.4`).
     pub cjk_center_ratio: f32,
 }
 
 impl FontVMetrics {
     /// The optical centring band height (as a fraction of `font_size`) for a label,
     /// chosen by whether the label contains lowercase letters. Roman scripts only —
-    /// CJK uses [`Self::center_offset_ratio`] directly.
+    /// CJK uses [`Self::visual_center_ratio`] directly.
     ///
     /// Lowercase roman bodies are the only glyphs whose visual mass sits at
     /// x-height; capitals, digits and symbols all reach (roughly) cap height. So a
@@ -1673,7 +1689,7 @@ impl FontVMetrics {
 }
 
 /// Whether `text` contains any CJK / full-width ideographic character — the signal
-/// [`FontVMetrics::center_offset_ratio`] uses to switch to ideographic centring.
+/// [`FontVMetrics::visual_center_ratio`] uses to switch to ideographic centring.
 ///
 /// These scripts (Han, Kana, Hangul, CJK punctuation, full-width forms) fill and
 /// slightly overhang the em square rather than sitting in the roman x/cap band, so
@@ -1720,6 +1736,10 @@ pub fn has_lowercase(text: &str) -> bool {
 /// `vertical` keeps the two orientations of the same string from colliding.
 type MeasureKey = (u32, Option<u32>, u64, u16, u8, WrapMode, bool);
 
+/// Text measurement front-end: shapes through cosmic-text to report `(width,
+/// height)` for layout, caching results per metrics/font key and the optical
+/// vertical metrics per font. Shares a `FontSystem` with a `TextRenderer` so
+/// measured widths match rendered glyphs.
 pub struct TextMeasurer {
     font_system: FontSystemHandle,
     /// Keyed by [`MeasureKey`] so the inner `HashMap<String, _>` can be probed
@@ -2258,10 +2278,15 @@ pub fn text_cursor_positions(
 /// is the y of the top of that visual line; `line_height` its height.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaretPos {
+    /// Absolute byte offset into the whole text (buffer-line base pre-added).
     pub byte: usize,
+    /// Caret x relative to the visual line's left edge.
     pub x: f32,
+    /// Visual line ordinal, top-to-bottom (a soft wrap starts a new visual line).
     pub line: usize,
+    /// Y of the top of this visual line.
     pub line_top: f32,
+    /// Height of this visual line.
     pub line_height: f32,
 }
 
@@ -2510,22 +2535,35 @@ pub fn byte_on_adjacent_line(layout: &[CaretPos], byte: usize, dir: i32, desired
 /// differ from neighbours within one visual line (mixed bidi).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VisualGlyph {
+    /// Logical (ascending) start byte of the cell in the caller's text.
     pub byte_start: usize,
+    /// Logical (ascending) end byte of the cell in the caller's text.
     pub byte_end: usize,
+    /// Visual left edge of the cell (relative to the visual line's left edge).
     pub x: f32,
+    /// Visual cell width (always positive, after bidi reordering).
     pub w: f32,
+    /// Visual line ordinal the cell sits on, top-to-bottom.
     pub line: usize,
+    /// Y of the top of this visual line.
     pub line_top: f32,
+    /// Height of this visual line.
     pub line_height: f32,
+    /// Whether this glyph's own bidi level is right-to-left (may differ from
+    /// neighbours within a mixed-bidi line).
     pub rtl: bool,
 }
 
 /// A selection-highlight rectangle, relative to the text block's top-left origin.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SelRect {
+    /// Left edge, relative to the text block's top-left origin.
     pub x: f32,
+    /// Top edge, relative to the text block's top-left origin.
     pub y: f32,
+    /// Width of the highlight rectangle.
     pub w: f32,
+    /// Height of the highlight rectangle.
     pub h: f32,
 }
 
@@ -2776,9 +2814,14 @@ fn caret_stops(glyphs: &[VisualGlyph]) -> Vec<CaretStop> {
 /// movement produced by [`visual_caret_neighbor`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VisualCaret {
+    /// Visual x where the byte logically begins (relative to the visual line's
+    /// left edge), edge-corrected for the glyph's direction.
     pub x: f32,
+    /// Visual line ordinal the caret sits on, top-to-bottom.
     pub line: usize,
+    /// Y of the top of this visual line.
     pub line_top: f32,
+    /// Height of this visual line.
     pub line_height: f32,
 }
 
@@ -2874,8 +2917,9 @@ fn ellipsize_to_width(
 
 /// How a [`TextSpan`] is underlined.
 ///
-/// The underline rect is emitted as a coloured soup quad at [`DrawList::text`]
-/// time so it renders beneath the MSDF glyphs.
+/// The underline rect is emitted as a coloured soup quad at
+/// [`DrawList::text`](crate::DrawList::text) time so it renders beneath the MSDF
+/// glyphs.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Underline {
     /// No underline (default).
@@ -2921,6 +2965,7 @@ pub struct TextSpan {
 /// Teardown's `UiTextOutline(r, g, b, a, thickness)`.
 #[derive(Clone, Copy, Debug)]
 pub struct TextOutline {
+    /// Outline colour.
     pub color: Color,
     /// Outline thickness in screen pixels.
     pub width_px: f32,
@@ -2930,6 +2975,7 @@ pub struct TextOutline {
 /// `UiTextShadow(r, g, b, a, distance, blur)`.
 #[derive(Clone, Copy, Debug)]
 pub struct TextShadow {
+    /// Shadow colour.
     pub color: Color,
     /// Screen-space offset `[dx, dy]`.
     pub offset: [f32; 2],
@@ -2940,6 +2986,7 @@ pub struct TextShadow {
 /// Soft colored halo around glyphs (a wide, soft, fill-less outline).
 #[derive(Clone, Copy, Debug)]
 pub struct TextGlow {
+    /// Halo colour.
     pub color: Color,
     /// Halo radius in screen pixels.
     pub radius_px: f32,
@@ -2952,7 +2999,7 @@ pub struct TextGlow {
 pub const LINE_HEIGHT_RATIO: f32 = 1.25;
 
 /// Top `y` for a single-line text block of `font_size` (shaped with the default
-/// [`LINE_HEIGHT_RATIO`] line box, as [`TextBlock::with_size`] / `Theme::text`
+/// `LINE_HEIGHT_RATIO` line box, as [`TextBlock::with_size`] / `Theme::text`
 /// do) so its line box is vertically centred over the span `[top, top + height]`.
 ///
 /// Centring by `font_size` alone leaves the line box sitting low, so the visible
@@ -2968,13 +3015,22 @@ pub fn vcentered_line_y(top: f32, height: f32, font_size: f32) -> f32 {
 /// A block of text to render.
 #[derive(Clone)]
 pub struct TextBlock {
+    /// The text to render. When [`spans`](Self::spans) is non-empty, this is
+    /// derived from the concatenated span texts at draw time.
     pub content: String,
+    /// Left edge of the block (the pen origin, in screen pixels).
     pub x: f32,
+    /// Top edge of the block (in screen pixels).
     pub y: f32,
+    /// Font size in pixels.
     pub font_size: f32,
+    /// Line-box height in pixels (usually `font_size * LINE_HEIGHT_RATIO`).
     pub line_height: f32,
+    /// Layout box width in pixels; wrapping and alignment are relative to this.
     pub max_width: f32,
+    /// Global fill colour (overridden per-run by coloured [`spans`](Self::spans)).
     pub color: Color,
+    /// Optional clip rectangle; glyphs outside it are not drawn.
     pub clip: Option<Rect>,
     /// Optional crisp outline (off by default).
     pub outline: Option<TextOutline>,
@@ -3024,6 +3080,8 @@ pub struct TextBlock {
 }
 
 impl TextBlock {
+    /// A white block at `(x, y)` with default metrics (16px, 1.25× line height,
+    /// 800px max width) and no effects. Use the `with_*` builders to customize.
     pub fn new(content: impl Into<String>, x: f32, y: f32) -> Self {
         Self {
             content: content.into(),
@@ -3049,27 +3107,33 @@ impl TextBlock {
         }
     }
 
+    /// Set the font size (px); `line_height` is derived as `size *
+    /// LINE_HEIGHT_RATIO`.
     pub fn with_size(mut self, size: f32) -> Self {
         self.font_size = size;
         self.line_height = size * LINE_HEIGHT_RATIO;
         self
     }
 
+    /// Set the layout box width (px) that wrapping and alignment are relative to.
     pub fn with_max_width(mut self, width: f32) -> Self {
         self.max_width = width;
         self
     }
 
+    /// Set the opaque fill colour from 8-bit RGB components.
     pub fn with_color(mut self, r: u8, g: u8, b: u8) -> Self {
         self.color = Color::rgb(r, g, b);
         self
     }
 
+    /// Set the fill colour from 8-bit RGBA components (with alpha).
     pub fn with_rgba(mut self, r: u8, g: u8, b: u8, a: u8) -> Self {
         self.color = Color::rgba(r, g, b, a);
         self
     }
 
+    /// Clip glyphs to `clip`; anything outside the rectangle is not drawn.
     pub fn with_clip(mut self, clip: Rect) -> Self {
         self.clip = Some(clip);
         self

@@ -35,6 +35,7 @@ pub struct Tabs<'a> {
 }
 
 impl<'a> Tabs<'a> {
+    /// Create a tab strip over the given labels, one tab per entry.
     pub fn new(labels: &'a [&'a str]) -> Self {
         Self {
             labels,
@@ -43,6 +44,7 @@ impl<'a> Tabs<'a> {
         }
     }
 
+    /// Set the height of the tab strip, in pixels.
     pub fn with_height(mut self, height: f32) -> Self {
         self.tab_height = height;
         self

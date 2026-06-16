@@ -89,7 +89,7 @@ impl HitZoneOutput {
     }
 }
 
-/// A draw-free interactive region. See the [module docs](self).
+/// A draw-free interactive region. See the module docs.
 ///
 /// Construct, optionally [disable](Self::enabled), then [`test`](Self::test) a
 /// screen-space [`Rect`] against the frame's [`InputState`]. Cheap and stateless

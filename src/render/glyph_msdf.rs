@@ -70,7 +70,9 @@ pub struct GlyphMetrics {
 
 /// A generated glyph: its MSDF tile (RGB8) plus placement metrics.
 pub struct GlyphMsdf {
+    /// The generated MSDF tile (RGB8, distances in each channel).
     pub image: RgbImage,
+    /// EM-fraction placement metrics for positioning the tile's quad.
     pub metrics: GlyphMetrics,
 }
 

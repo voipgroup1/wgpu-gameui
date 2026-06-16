@@ -26,6 +26,11 @@
 //! // result.get(3) = down button rect
 //! ```
 
+// Public API is the contract for integrating apps; every exported type, field,
+// and method must carry rustdoc. `warn` (not `deny`) so a work-in-progress
+// build still compiles, but the project's warning-clean bar surfaces any gap.
+#![warn(missing_docs)]
+
 mod text;
 
 pub use text::{
@@ -80,10 +85,15 @@ pub use widgets::*;
 /// Input state passed to UI for interaction.
 #[derive(Default, Clone)]
 pub struct InputState {
+    /// Pointer X position in logical pixels.
     pub mouse_x: f32,
+    /// Pointer Y position in logical pixels.
     pub mouse_y: f32,
+    /// Primary button is currently held.
     pub mouse_down: bool,
+    /// Primary button went down this frame (press edge).
     pub mouse_clicked: bool,
+    /// Primary button went up this frame (release edge).
     pub mouse_released: bool,
     /// True on the frame of a double-click (two presses of the primary button
     /// within the double-click threshold). Computed by [`ClickTracker::update`];
@@ -126,8 +136,12 @@ pub struct InputState {
     /// Scroll wheel delta (positive = scroll up, negative = scroll down)
     pub scroll_delta: f32,
     // Text input
+    /// Committed text to insert at the caret this frame (UTF-8). Empty when
+    /// no characters were typed; cleared by [`InputState::end_frame`].
     pub text_input: String,
+    /// Backspace was pressed this frame (delete the char before the caret).
     pub backspace_pressed: bool,
+    /// Enter/Return was pressed this frame (submit or newline).
     pub enter_pressed: bool,
     /// The in-progress IME composition ("preedit") string, shown inline and
     /// underlined inside the focused text field but NOT yet part of its value.
@@ -167,7 +181,7 @@ pub struct InputState {
     /// Delete key was pressed this frame.
     pub key_delete: bool,
     /// Tab key was pressed this frame. Drives focus navigation
-    /// (Shift+Tab reverses via [`shift_pressed`]).
+    /// (Shift+Tab reverses via [`shift_pressed`](Self::shift_pressed)).
     pub key_tab: bool,
     /// Escape key was pressed this frame. Blurs the focused widget.
     pub key_escape: bool,
@@ -193,6 +207,7 @@ pub struct InputState {
 }
 
 impl InputState {
+    /// Create an `InputState` with all fields cleared (same as `default()`).
     pub fn new() -> Self {
         Self::default()
     }

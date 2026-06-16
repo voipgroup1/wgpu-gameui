@@ -23,7 +23,9 @@ use crate::text::TextBlock;
 /// sizes), so the keyed map is uniform without boxing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum StyleValue {
+    /// An RGBA color.
     Color([f32; 4]),
+    /// A scalar size/length.
     Scalar(f32),
 }
 
@@ -71,19 +73,33 @@ const fn fnv1a64(name: &str) -> u64 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StyleKey {
     // --- Colors ---
+    /// Window/screen backdrop fill.
     Background,
+    /// Panel/container surface fill.
     Panel,
+    /// Border stroke around panels/containers.
     PanelBorder,
+    /// Button fill in its resting state.
     Button,
+    /// Button fill while hovered.
     ButtonHover,
+    /// Button fill while pressed.
     ButtonPressed,
+    /// Border stroke around buttons.
     ButtonBorder,
+    /// Text-input field fill.
     InputBackground,
+    /// Border stroke around an unfocused text input.
     InputBorder,
+    /// Border stroke around a focused text input.
     InputFocusBorder,
+    /// Primary body text color.
     Text,
+    /// Dimmed/secondary text color.
     TextDim,
+    /// Emphasized/highlighted text color.
     TextHighlight,
+    /// Accent color for primary/active elements.
     Accent,
     /// Informational severity accent (see [`Severity`](crate::Severity)). Themeable
     /// palette entry; the severity→key mapping is the only fixed policy.
@@ -94,23 +110,40 @@ pub enum StyleKey {
     Warning,
     /// Failure severity accent (shared with the general error color).
     Error,
+    /// Outline color of the keyboard-focus ring.
     FocusRing,
+    /// Fill of an inactive (unselected) tab.
     TabInactive,
+    /// Fill of the active (selected) tab.
     TabActive,
+    /// Fill of a hovered tab.
     TabHover,
+    /// Border stroke around tabs.
     TabBorder,
+    /// Progress-bar track (unfilled) color.
     ProgressBackground,
+    /// Progress-bar fill color for normal/healthy values.
     ProgressFill,
+    /// Progress-bar fill color for low/critical values.
     ProgressFillLow,
+    /// Progress-bar fill color for medium values.
     ProgressFillMedium,
     // --- Scalars ---
+    /// Default inner padding, in pixels.
     Padding,
+    /// Default gap between stacked elements, in pixels.
     Spacing,
+    /// Default corner radius, in pixels.
     BorderRadius,
+    /// Default border stroke width, in pixels.
     BorderWidth,
+    /// Default body text size, in pixels.
     FontSize,
+    /// Title/heading text size, in pixels.
     FontSizeTitle,
+    /// Default button height, in pixels.
     ButtonHeight,
+    /// Default text-input height, in pixels.
     InputHeight,
     /// Hover/press transition duration in seconds (see
     /// [`AnimationState`](crate::AnimationState)). `0.0` disables animation

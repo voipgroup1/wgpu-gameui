@@ -54,7 +54,7 @@ pub const DEFAULT_DRAG_THRESHOLD: f32 = 4.0;
 /// Tracks an in-progress pointer drag across frames and classifies a held click
 /// as either a (still) click or a drag once it moves past a threshold.
 ///
-/// Caller-owned; persists across frames. See the [module docs](self) for the
+/// Caller-owned; persists across frames. See the module docs for the
 /// relationship to [`DragCapture`](crate::DragCapture).
 #[derive(Debug, Clone)]
 pub struct DragTracker {

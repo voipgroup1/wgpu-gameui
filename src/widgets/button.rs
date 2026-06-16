@@ -12,8 +12,8 @@
 //!
 //! # Example
 //! ```ignore
-//! if Button::new("Save").draw(rect, &mut list, &theme, &input) { save(); }
-//! if Button::new("Cancel").bare().draw(rect2, &mut list, &theme, &input) { … }
+//! if Button::new("Save").draw(rect, &mut ctx) { save(); }
+//! if Button::new("Cancel").bare().draw(rect2, &mut ctx) { cancel(); }
 //! ```
 
 use crate::layout::Rect;
@@ -182,7 +182,8 @@ impl Button {
         self
     }
 
-    /// Override the chrome corner radius (default: [`Theme::border_radius`]). Use
+    /// Override the chrome corner radius (default:
+    /// [`Theme::border_radius`](crate::Theme::border_radius)). Use
     /// `0.0` for square corners — e.g. spin-box `+`/`-` steppers that abut a
     /// field and should not round their inner edges.
     pub fn with_radius(mut self, radius: f32) -> Self {

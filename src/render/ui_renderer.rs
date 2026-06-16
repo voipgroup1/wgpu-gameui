@@ -23,6 +23,7 @@ const SHADER: &str = include_str!("ui.wgsl");
 /// Metadata describing a registered nine-slice resource.
 #[derive(Clone, Debug)]
 pub struct NineSliceMeta {
+    /// Atlas sprite the nine-slice samples from.
     pub sprite: SpriteId,
     /// Border insets in source pixels: [left, top, right, bottom].
     pub border: [u32; 4],
@@ -228,6 +229,8 @@ pub struct UiRenderer {
 }
 
 impl UiRenderer {
+    /// Build the renderer: compiles the UI shader, creates the pipelines,
+    /// atlases, and bind groups, and wires up the text sub-renderer.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -712,6 +715,7 @@ impl UiRenderer {
         id
     }
 
+    /// Look up a registered nine-slice id by the name it was registered under.
     pub fn nine_slice_id(&self, name: &str) -> Option<NineSliceId> {
         self.nine_slice_names.get(name).copied()
     }

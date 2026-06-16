@@ -145,7 +145,7 @@ impl ScalarAnim {
 }
 
 /// Caller-owned store of in-flight hover/press transitions. See the
-/// [module docs](self).
+/// module docs.
 ///
 /// Construct with [`new`](Self::new), [`tick`](Self::tick) once per frame with
 /// the frame delta, and thread `&mut` into widgets (via

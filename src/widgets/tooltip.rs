@@ -18,21 +18,32 @@ use super::DrawList;
 #[derive(Clone)]
 pub enum TooltipContent {
     /// Simple text tooltip with optional title.
-    Text { title: Option<String>, body: String },
+    Text {
+        /// Optional bold title shown above the body.
+        title: Option<String>,
+        /// Wrapped body text.
+        body: String,
+    },
     /// Multi-line text with optional title.
     Lines {
+        /// Optional bold title shown above the lines.
         title: Option<String>,
+        /// One entry per rendered line.
         lines: Vec<String>,
     },
     /// Rich content with title, description, and key-value pairs.
     Rich {
+        /// Bold title.
         title: String,
+        /// Wrapped description paragraph.
         description: String,
+        /// Key/value detail rows shown below the description.
         details: Vec<(String, String)>,
     },
 }
 
 impl TooltipContent {
+    /// Build a plain text tooltip with no title.
     pub fn text(body: impl Into<String>) -> Self {
         Self::Text {
             title: None,
@@ -40,6 +51,7 @@ impl TooltipContent {
         }
     }
 
+    /// Build a text tooltip with a title above the body.
     pub fn text_with_title(title: impl Into<String>, body: impl Into<String>) -> Self {
         Self::Text {
             title: Some(title.into()),
@@ -47,10 +59,12 @@ impl TooltipContent {
         }
     }
 
+    /// Build a multi-line tooltip with no title.
     pub fn lines(lines: Vec<String>) -> Self {
         Self::Lines { title: None, lines }
     }
 
+    /// Build a multi-line tooltip with a title above the lines.
     pub fn lines_with_title(title: impl Into<String>, lines: Vec<String>) -> Self {
         Self::Lines {
             title: Some(title.into()),
@@ -58,6 +72,8 @@ impl TooltipContent {
         }
     }
 
+    /// Build a rich tooltip with a title and description; add detail rows with
+    /// [`TooltipContent::with_detail`].
     pub fn rich(title: impl Into<String>, description: impl Into<String>) -> Self {
         Self::Rich {
             title: title.into(),
@@ -66,6 +82,7 @@ impl TooltipContent {
         }
     }
 
+    /// Append a key/value detail row. No-op unless this is a [`TooltipContent::Rich`].
     pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         if let Self::Rich {
             ref mut details, ..
@@ -118,6 +135,7 @@ impl Default for TooltipLayer {
 }
 
 impl TooltipLayer {
+    /// Create an empty tooltip layer with no hover delay.
     pub fn new() -> Self {
         Self {
             regions: Vec::new(),

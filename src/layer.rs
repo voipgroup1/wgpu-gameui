@@ -72,12 +72,14 @@ pub enum LayerKind {
 
 /// A single overlay layer.
 pub struct Layer {
+    /// Overlay behaviour (input blocking) for this layer.
     pub kind: LayerKind,
     /// Bounding rect used for popup hit-testing. For modals this is the modal
     /// dialog rect — clicks *outside* it route to the modal layer (which can
     /// implement click-outside-to-close), not to lower layers. For popups,
     /// clicks inside it stay in the popup; clicks outside fall through.
     pub rect: Rect,
+    /// Draw commands accumulated for this layer.
     pub list: DrawList,
 }
 
@@ -99,6 +101,7 @@ impl Default for LayerStack {
 }
 
 impl LayerStack {
+    /// Create an empty layer stack with a default (font-less) base list.
     pub fn new() -> Self {
         Self {
             base: DrawList::new(),
@@ -108,6 +111,8 @@ impl LayerStack {
         }
     }
 
+    /// Create an empty layer stack whose base list (and future layers) share
+    /// the given font system for text shaping.
     pub fn with_font_system(font_system: FontSystemHandle) -> Self {
         Self {
             base: DrawList::with_font_system(font_system.clone()),
@@ -129,6 +134,7 @@ impl LayerStack {
         &self.base
     }
 
+    /// Mutably borrow the base draw list (lowest layer).
     pub fn base_mut(&mut self) -> &mut DrawList {
         &mut self.base
     }

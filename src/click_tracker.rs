@@ -60,7 +60,7 @@ pub const DEFAULT_HOLD_THRESHOLD: f64 = 0.5;
 /// Detects double-clicks and click-and-hold gestures, writing the result into
 /// [`InputState`] each frame.
 ///
-/// Caller-owned; persists across frames. See [module docs](self) for design
+/// Caller-owned; persists across frames. See module docs for design
 /// rationale and usage.
 #[derive(Debug, Clone)]
 pub struct ClickTracker {

@@ -90,10 +90,13 @@ pub struct MsdfGlyphAtlas {
 }
 
 impl MsdfGlyphAtlas {
+    /// Create an empty atlas using the default reference size and ramp width.
     pub fn new() -> Self {
         Self::with_params(DEFAULT_REF_PX, DEFAULT_PX_RANGE)
     }
 
+    /// Create an empty atlas generating fields at `ref_px` with a `px_range`-wide
+    /// distance ramp (see [`DEFAULT_REF_PX`] / [`DEFAULT_PX_RANGE`]).
     pub fn with_params(ref_px: f32, px_range: f32) -> Self {
         Self {
             width: INITIAL_MSDF_ATLAS_SIZE,
@@ -108,10 +111,12 @@ impl MsdfGlyphAtlas {
         }
     }
 
+    /// Current atlas width in pixels.
     pub fn width(&self) -> u32 {
         self.width
     }
 
+    /// Current atlas height in pixels.
     pub fn height(&self) -> u32 {
         self.height
     }

@@ -270,6 +270,7 @@ impl Default for List {
 }
 
 impl List {
+    /// Create a list with default single-selection settings.
     pub fn new() -> Self {
         Self::default()
     }

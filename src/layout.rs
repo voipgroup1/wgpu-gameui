@@ -32,13 +32,18 @@
 /// Computed rectangle after layout.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {
+    /// Left edge in pixels.
     pub x: f32,
+    /// Top edge in pixels.
     pub y: f32,
+    /// Width in pixels.
     pub width: f32,
+    /// Height in pixels.
     pub height: f32,
 }
 
 impl Rect {
+    /// Construct a rect from its top-left corner and size.
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
         Self {
             x,
@@ -48,6 +53,7 @@ impl Rect {
         }
     }
 
+    /// A zero-sized rect at the origin.
     pub fn zero() -> Self {
         Self::default()
     }
@@ -76,23 +82,50 @@ impl Rect {
 #[derive(Debug, Clone, Copy)]
 pub enum Anchor {
     /// Top-left corner with offset (x, y) from corner.
-    TopLeft { offset: (f32, f32) },
+    TopLeft {
+        /// Pixel offset (x, y) from the corner.
+        offset: (f32, f32),
+    },
     /// Top-right corner with offset (x, y) from corner. X is typically negative.
-    TopRight { offset: (f32, f32) },
+    TopRight {
+        /// Pixel offset (x, y) from the corner.
+        offset: (f32, f32),
+    },
     /// Bottom-left corner with offset (x, y) from corner. Y is typically negative.
-    BottomLeft { offset: (f32, f32) },
+    BottomLeft {
+        /// Pixel offset (x, y) from the corner.
+        offset: (f32, f32),
+    },
     /// Bottom-right corner with offset (x, y) from corner. Both typically negative.
-    BottomRight { offset: (f32, f32) },
+    BottomRight {
+        /// Pixel offset (x, y) from the corner.
+        offset: (f32, f32),
+    },
     /// Centered in parent with offset (x, y) from center.
-    Center { offset: (f32, f32) },
+    Center {
+        /// Pixel offset (x, y) from the center.
+        offset: (f32, f32),
+    },
     /// Centered horizontally, at top with offset.
-    TopCenter { offset: (f32, f32) },
+    TopCenter {
+        /// Pixel offset (x, y) from the top-center point.
+        offset: (f32, f32),
+    },
     /// Centered horizontally, at bottom with offset.
-    BottomCenter { offset: (f32, f32) },
+    BottomCenter {
+        /// Pixel offset (x, y) from the bottom-center point.
+        offset: (f32, f32),
+    },
     /// Centered vertically, at left with offset.
-    LeftCenter { offset: (f32, f32) },
+    LeftCenter {
+        /// Pixel offset (x, y) from the left-center point.
+        offset: (f32, f32),
+    },
     /// Centered vertically, at right with offset.
-    RightCenter { offset: (f32, f32) },
+    RightCenter {
+        /// Pixel offset (x, y) from the right-center point.
+        offset: (f32, f32),
+    },
 }
 
 impl Default for Anchor {
@@ -181,7 +214,9 @@ impl SizeSpec {
 /// `SizeSpec::Fill` + `Constraint::between(120.0, 400.0)`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Constraint {
+    /// Optional lower pixel bound.
     pub min: Option<f32>,
+    /// Optional upper pixel bound.
     pub max: Option<f32>,
 }
 
@@ -251,7 +286,9 @@ impl Constraint {
 /// Size for both dimensions, with optional per-axis min/max clamps.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Size {
+    /// Width sizing spec.
     pub width: SizeSpec,
+    /// Height sizing spec.
     pub height: SizeSpec,
     /// Clamp applied to the resolved width.
     pub width_constraint: Constraint,
@@ -260,6 +297,7 @@ pub struct Size {
 }
 
 impl Size {
+    /// Fixed pixel size on both axes.
     pub fn fixed(width: f32, height: f32) -> Self {
         Self {
             width: SizeSpec::Fixed(width),
@@ -268,6 +306,7 @@ impl Size {
         }
     }
 
+    /// Percentage-of-parent size on both axes (0.0 to 1.0).
     pub fn percent(width: f32, height: f32) -> Self {
         Self {
             width: SizeSpec::Percent(width),
@@ -276,6 +315,7 @@ impl Size {
         }
     }
 
+    /// Fill the parent on both axes.
     pub fn fill() -> Self {
         Self {
             width: SizeSpec::Fill,
@@ -284,6 +324,7 @@ impl Size {
         }
     }
 
+    /// Size to content on both axes.
     pub fn fit() -> Self {
         Self {
             width: SizeSpec::Fit,
@@ -292,11 +333,13 @@ impl Size {
         }
     }
 
+    /// Set the width to a fixed pixel value.
     pub fn width_fixed(mut self, width: f32) -> Self {
         self.width = SizeSpec::Fixed(width);
         self
     }
 
+    /// Set the height to a fixed pixel value.
     pub fn height_fixed(mut self, height: f32) -> Self {
         self.height = SizeSpec::Fixed(height);
         self
@@ -459,12 +502,16 @@ impl LayoutResult {
 
 /// A single positioned element.
 pub struct Positioned<T> {
+    /// Where the element is anchored within its parent.
     pub anchor: Anchor,
+    /// Resolved size of the element.
     pub size: Size,
+    /// The wrapped layout node.
     pub child: T,
 }
 
 impl<T> Positioned<T> {
+    /// Wrap `child`, anchored and sized within its parent.
     pub fn new(anchor: Anchor, size: Size, child: T) -> Self {
         Self {
             anchor,
@@ -592,8 +639,11 @@ impl MainAlign {
 
 /// Vertical stack - children arranged top to bottom.
 pub struct VStack {
+    /// Gap in pixels between adjacent children.
     pub spacing: f32,
+    /// Inset in pixels applied on all four sides.
     pub padding: f32,
+    /// Children in top-to-bottom order.
     pub children: Vec<StackChild>,
     /// Main-axis (vertical) distribution of leftover space. Defaults to
     /// [`MainAlign::Start`]; ignored when a [`SizeSpec::Fill`] child is present.
@@ -602,8 +652,11 @@ pub struct VStack {
 
 /// Horizontal stack - children arranged left to right.
 pub struct HStack {
+    /// Gap in pixels between adjacent children.
     pub spacing: f32,
+    /// Inset in pixels applied on all four sides.
     pub padding: f32,
+    /// Children in left-to-right order.
     pub children: Vec<StackChild>,
     /// Main-axis (horizontal) distribution of leftover space. Defaults to
     /// [`MainAlign::Start`]; ignored when a [`SizeSpec::Fill`] child is present.
@@ -612,8 +665,11 @@ pub struct HStack {
 
 /// A child in a stack with its sizing.
 pub struct StackChild {
+    /// Main-axis sizing spec.
     pub size: SizeSpec,
+    /// Natural size along the stack (main) axis.
     pub content_size: f32, // Size along stack axis
+    /// Natural size perpendicular to the stack (cross) axis.
     pub cross_size: f32,   // Size perpendicular to stack axis
     /// Clamp applied to the resolved main-axis size of this child.
     pub constraint: Constraint,
@@ -647,6 +703,7 @@ impl StackChild {
 }
 
 impl VStack {
+    /// A vertical stack with `spacing` pixels between children and no padding.
     pub fn new(spacing: f32) -> Self {
         Self {
             spacing,
@@ -656,6 +713,7 @@ impl VStack {
         }
     }
 
+    /// Set the inset applied on all four sides.
     pub fn with_padding(mut self, padding: f32) -> Self {
         self.padding = padding;
         self
@@ -843,6 +901,7 @@ impl LayoutNode for VStack {
 }
 
 impl HStack {
+    /// A horizontal stack with `spacing` pixels between children and no padding.
     pub fn new(spacing: f32) -> Self {
         Self {
             spacing,
@@ -852,6 +911,7 @@ impl HStack {
         }
     }
 
+    /// Set the inset applied on all four sides.
     pub fn with_padding(mut self, padding: f32) -> Self {
         self.padding = padding;
         self
@@ -1040,11 +1100,14 @@ impl LayoutNode for HStack {
 
 /// A simple leaf node with fixed size.
 pub struct Leaf {
+    /// Fixed width in pixels.
     pub width: f32,
+    /// Fixed height in pixels.
     pub height: f32,
 }
 
 impl Leaf {
+    /// A leaf node with the given fixed size.
     pub fn new(width: f32, height: f32) -> Self {
         Self { width, height }
     }
@@ -1096,7 +1159,9 @@ pub struct Flow {
 /// One item in a [`Flow`]: its size and optional stable [`NodeId`].
 #[derive(Debug, Clone, Copy)]
 pub struct FlowItem {
+    /// Item width in pixels.
     pub width: f32,
+    /// Item height in pixels.
     pub height: f32,
     /// Stable identity for [`LayoutResult::get_by_id`]; `None` for `.item(..)`.
     pub id: Option<NodeId>,

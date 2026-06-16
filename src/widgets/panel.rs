@@ -7,13 +7,18 @@ use super::DrawList;
 
 /// Panel widget - a container with background.
 pub struct Panel {
+    /// Left edge, in pixels.
     pub x: f32,
+    /// Top edge, in pixels.
     pub y: f32,
+    /// Width, in pixels.
     pub width: f32,
+    /// Height, in pixels.
     pub height: f32,
 }
 
 impl Panel {
+    /// Create a panel at the given rect.
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
         Self {
             x,
@@ -33,6 +38,7 @@ impl Panel {
         }
     }
 
+    /// Draw the panel at its configured rect.
     pub fn draw(&self, list: &mut DrawList, style: &StyleResolver) {
         Self::draw_at(
             Rect::new(self.x, self.y, self.width, self.height),

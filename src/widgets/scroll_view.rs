@@ -40,7 +40,9 @@ use super::DrawList;
 /// `_drag_*` fields track the currently-dragged scrollbar thumb.
 #[derive(Debug, Clone, Default)]
 pub struct ScrollState {
+    /// Current scroll offset `[x, y]` (positive = scrolled right/down).
     pub offset: [f32; 2],
+    /// Natural content extent `[w, h]` reported by the most recent draw.
     pub content_size: [f32; 2],
     /// Which scrollbar is being dragged this frame (None when not dragging).
     drag_axis: Option<ScrollAxis>,
@@ -57,6 +59,7 @@ enum ScrollAxis {
 }
 
 impl ScrollState {
+    /// Create a fresh state scrolled to the origin.
     pub fn new() -> Self {
         Self::default()
     }
@@ -114,6 +117,7 @@ pub struct ScrollBegin {
 }
 
 impl ScrollView {
+    /// Create a ScrollView over `viewport` with default bar/wheel settings.
     pub fn new(viewport: Rect) -> Self {
         Self {
             viewport,
@@ -125,21 +129,25 @@ impl ScrollView {
         }
     }
 
+    /// Set the scrollbar thickness in pixels.
     pub fn with_bar_thickness(mut self, t: f32) -> Self {
         self.bar_thickness = t;
         self
     }
 
+    /// Set the pixels scrolled per wheel notch.
     pub fn with_wheel_speed(mut self, s: f32) -> Self {
         self.wheel_speed = s;
         self
     }
 
+    /// Disable horizontal scrolling (vertical only).
     pub fn vertical_only(mut self) -> Self {
         self.enable_horizontal = false;
         self
     }
 
+    /// Disable vertical scrolling (horizontal only).
     pub fn horizontal_only(mut self) -> Self {
         self.enable_vertical = false;
         self

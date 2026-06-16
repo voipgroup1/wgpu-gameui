@@ -69,7 +69,7 @@ impl DragHandleOutput {
     }
 }
 
-/// A draggable grab-zone for moving windows/panels. See the [module docs](self).
+/// A draggable grab-zone for moving windows/panels. See the module docs.
 ///
 /// Drawn against a layout-computed [`Rect`]. Drag ownership is arbitrated via a
 /// caller-owned [`DragCapture`] + a stable [`DragId`]; the per-frame delta comes

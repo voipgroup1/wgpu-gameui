@@ -36,16 +36,27 @@ pub(crate) const PHOSPHOR_FONT_ID: u64 = u64::MAX;
 #[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PhosphorIcon {
+    /// Upward-pointing caret (e.g. collapse / increment).
     CaretUp,
+    /// Downward-pointing caret (e.g. expand / decrement).
     CaretDown,
+    /// Plus sign (add / increment).
     Plus,
+    /// Minus sign (remove / decrement).
     Minus,
+    /// Checkmark (confirm / enabled state).
     Check,
+    /// Cross (close / cancel).
     X,
+    /// Open eye (reveal / visible).
     Eye,
+    /// Crossed-out eye (hide / hidden).
     EyeSlash,
+    /// Trash can (delete).
     Trash,
+    /// Simple pencil (edit).
     PencilSimple,
+    /// Gear (settings).
     Gear,
 }
 

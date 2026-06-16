@@ -78,11 +78,17 @@ use crate::{AnimSlot, AnimationState, Easing, InputState, StyleKey, StyleOverlay
 /// When drawing into a modal/popup layer, set [`active_layer`](Self::active_layer)
 /// to that layer's index so focus registration is automatically scoped.
 pub struct DrawContext<'a> {
+    /// Mutable draw list the widget emits geometry into.
     pub draw_list: &'a mut DrawList,
+    /// Mutable focus/Tab-ring state for focusable widgets.
     pub focus: &'a mut FocusState,
+    /// Read-only theme backing style resolution.
     pub theme: &'a Theme,
+    /// Read-only per-frame input snapshot.
     pub input: &'a InputState,
+    /// Screen width in pixels.
     pub screen_width: f32,
+    /// Screen height in pixels.
     pub screen_height: f32,
     /// When drawing into a specific layer (modal/popup), set this to the
     /// layer index so [`register_focus`](Self::register_focus) automatically

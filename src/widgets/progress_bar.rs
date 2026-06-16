@@ -20,7 +20,12 @@ pub enum ProgressFill {
     /// [`ProgressFillLow`](StyleKey::ProgressFillLow), `value < medium` →
     /// [`ProgressFillMedium`](StyleKey::ProgressFillMedium), otherwise
     /// [`ProgressFill`](StyleKey::ProgressFill). Thresholds are caller-tunable.
-    Stat { low: f32, medium: f32 },
+    Stat {
+        /// Below this fraction, use the "low" color band.
+        low: f32,
+        /// Below this fraction (but >= `low`), use the "medium" color band.
+        medium: f32,
+    },
 }
 
 impl Default for ProgressFill {
@@ -54,7 +59,9 @@ impl ProgressFill {
 
 /// Progress bar widget - shows a value as a filled bar.
 pub struct ProgressBar {
-    pub value: f32,      // 0.0 to 1.0
+    /// Fill fraction in `0.0..=1.0`.
+    pub value: f32, // 0.0 to 1.0
+    /// Whether to overlay the value as a percentage label.
     pub show_text: bool, // Show percentage text
     /// Caller-owned color policy. Defaults to [`ProgressFill::default`] (stat
     /// banding); set via [`with_fill`](Self::with_fill) for solid or custom bands.
@@ -62,6 +69,7 @@ pub struct ProgressBar {
 }
 
 impl ProgressBar {
+    /// Create a bar with `value` clamped to `0.0..=1.0` and default stat fill.
     pub fn new(value: f32) -> Self {
         Self {
             value: value.clamp(0.0, 1.0),
@@ -84,6 +92,7 @@ impl ProgressBar {
         }
     }
 
+    /// Toggle the overlaid percentage label.
     pub fn with_text(mut self, show: bool) -> Self {
         self.show_text = show;
         self

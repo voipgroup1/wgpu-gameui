@@ -18,8 +18,11 @@ use super::SpriteId;
 /// Metadata for a loaded image: its atlas handle and source pixel dimensions.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ImageEntry {
+    /// Atlas handle the decoded image was uploaded under.
     pub sprite: SpriteId,
+    /// Source image width in pixels.
     pub width: u32,
+    /// Source image height in pixels.
     pub height: u32,
 }
 
@@ -58,18 +61,22 @@ pub struct ImageCache {
 }
 
 impl ImageCache {
+    /// Create an empty cache.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// The cached entry for `key`, or `None` if it hasn't been loaded.
     pub fn get(&self, key: &str) -> Option<ImageEntry> {
         self.entries.get(key).copied()
     }
 
+    /// Whether an entry is cached for `key`.
     pub fn contains(&self, key: &str) -> bool {
         self.entries.contains_key(key)
     }
 
+    /// Record the atlas entry for `key` (overwrites any existing mapping).
     pub fn insert(&mut self, key: &str, entry: ImageEntry) {
         self.entries.insert(key.to_string(), entry);
     }

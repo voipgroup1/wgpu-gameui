@@ -49,6 +49,7 @@ pub struct Slider {
 }
 
 impl Slider {
+    /// Create a slider spanning the inclusive `min..=max` range.
     pub fn new(min: f32, max: f32) -> Self {
         Self {
             min,

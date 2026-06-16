@@ -171,16 +171,21 @@ fn line_x_for_byte(layout: &[CaretPos], line: usize, byte: usize) -> f32 {
 ///
 /// # Clipboard
 ///
-/// To enable Ctrl+X/C/V, set [`clipboard_get`](Self::set_clipboard_get) and
-/// [`clipboard_set`](Self::set_clipboard_set) closures, or implement the
-/// [`Clipboard`](crate::Clipboard) trait and call
-/// [`set_clipboard`](Self::set_clipboard).
+/// To enable Ctrl+X/C/V, set the [`set_clipboard_get`](Self::set_clipboard_get)
+/// and [`set_clipboard_set`](Self::set_clipboard_set) closures (e.g. wrapping
+/// `arboard`).
 pub struct TextInput {
+    /// Left edge of the field, in pixels.
     pub x: f32,
+    /// Top edge of the field, in pixels.
     pub y: f32,
+    /// Width of the field, in pixels.
     pub width: f32,
+    /// Height of the field, in pixels.
     pub height: f32,
+    /// Current text contents (real plaintext, even when masked).
     pub value: String,
+    /// Greyed-out prompt shown when `value` is empty.
     pub placeholder: String,
     /// Byte index of the text cursor (insertion point) within `value`.
     pub cursor_pos: usize,
@@ -240,6 +245,7 @@ impl Default for TextInput {
 }
 
 impl TextInput {
+    /// Create an empty single-line field at the given rect.
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
         Self {
             x,
@@ -266,12 +272,14 @@ impl TextInput {
         self
     }
 
+    /// Set the initial text, placing the caret at the end.
     pub fn with_value(mut self, value: impl Into<String>) -> Self {
         self.value = value.into();
         self.cursor_pos = self.value.len();
         self
     }
 
+    /// Set the placeholder prompt shown while the field is empty.
     pub fn with_placeholder(mut self, placeholder: impl Into<String>) -> Self {
         self.placeholder = placeholder.into();
         self
@@ -734,9 +742,10 @@ impl TextInput {
 
     /// Draw the input, handle text changes, and return true if clicked (to request focus).
     ///
-    /// Focus is arbitrated by the caller-owned [`FocusState`]: the widget
-    /// [`register`](FocusState::register)s itself in the Tab ring each frame and
-    /// [`request`](FocusState::request)s focus when clicked. Keyboard input is
+    /// Focus is arbitrated by the caller-owned [`FocusState`](crate::FocusState):
+    /// the widget [`register`](crate::FocusState::register)s itself in the Tab
+    /// ring each frame and [`request`](crate::FocusState::request)s focus when
+    /// clicked. Keyboard input is
     /// processed only while this widget is the focus owner, so multiple inputs
     /// can no longer all type at once. To wire up Ctrl+A/C/V/X, also call
     /// [`set_clipboard_get`](Self::set_clipboard_get) /

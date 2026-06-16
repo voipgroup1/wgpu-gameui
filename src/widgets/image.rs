@@ -51,7 +51,9 @@ pub enum ImageFit {
 /// `0.0` = start (left/top), `0.5` = center, `1.0` = end (right/bottom).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImageAlign {
+    /// Horizontal bias: `0.0` = left, `0.5` = center, `1.0` = right.
     pub x: f32,
+    /// Vertical bias: `0.0` = top, `0.5` = center, `1.0` = bottom.
     pub y: f32,
 }
 
@@ -62,10 +64,13 @@ impl Default for ImageAlign {
 }
 
 impl ImageAlign {
+    /// Create an alignment from explicit `x`/`y` biases.
     pub fn new(x: f32, y: f32) -> Self {
         Self { x, y }
     }
+    /// Center on both axes.
     pub const CENTER: Self = Self { x: 0.5, y: 0.5 };
+    /// Anchor to the top-left corner.
     pub const TOP_LEFT: Self = Self { x: 0.0, y: 0.0 };
 }
 

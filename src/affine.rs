@@ -20,11 +20,17 @@ use crate::layout::Rect;
 /// 2x3 affine transform.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Affine2 {
+    /// Top-left matrix element: x-scale / x→x linear coefficient.
     pub a: f32,
+    /// Top-right linear element: y→x shear coefficient.
     pub b: f32,
+    /// X translation (logical px).
     pub tx: f32,
+    /// Bottom-left linear element: x→y shear coefficient.
     pub c: f32,
+    /// Bottom-right matrix element: y-scale / y→y linear coefficient.
     pub d: f32,
+    /// Y translation (logical px).
     pub ty: f32,
 }
 

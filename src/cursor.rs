@@ -75,7 +75,7 @@ impl CursorIcon {
 /// [`begin_frame`](Self::begin_frame), or use [`take`](Self::take) to read and
 /// clear in one call.
 ///
-/// Conflicts are resolved by [`CursorIcon::priority`]: the highest-priority
+/// Conflicts are resolved by `CursorIcon::priority`: the highest-priority
 /// request of the frame wins, and among equal priorities the **last** request
 /// wins (the topmost widget draws last under back-to-front ordering). In
 /// practice only the single topmost hovered widget requests at all, because
@@ -92,7 +92,7 @@ impl CursorState {
     }
 
     /// Request `icon` for this frame. Kept only if its
-    /// [`priority`](CursorIcon::priority) is ≥ the current request's, so a
+    /// `priority` is ≥ the current request's, so a
     /// lower-priority request drawn later can't clobber a higher one.
     pub fn request(&mut self, icon: CursorIcon) {
         match self.requested {

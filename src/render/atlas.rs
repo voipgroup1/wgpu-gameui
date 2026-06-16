@@ -39,9 +39,13 @@ const SPRITE_HALO: u32 = 1;
 /// — the surrounding 1-pixel halo is implicit and never sampled directly.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct AtlasRegion {
+    /// X offset of the content rect within the atlas, in pixels.
     pub x: u32,
+    /// Y offset of the content rect within the atlas, in pixels.
     pub y: u32,
+    /// Content width in pixels.
     pub w: u32,
+    /// Content height in pixels.
     pub h: u32,
 }
 
@@ -87,6 +91,7 @@ pub struct SpriteAtlas {
 }
 
 impl SpriteAtlas {
+    /// Create an empty atlas at the initial size, flagged dirty for first upload.
     pub fn new() -> Self {
         Self {
             width: INITIAL_ATLAS_SIZE,
@@ -99,18 +104,22 @@ impl SpriteAtlas {
         }
     }
 
+    /// Current atlas width in pixels.
     pub fn width(&self) -> u32 {
         self.width
     }
 
+    /// Current atlas height in pixels.
     pub fn height(&self) -> u32 {
         self.height
     }
 
+    /// The content region for a sprite id, or `None` if the id is unknown.
     pub fn region(&self, id: SpriteId) -> Option<AtlasRegion> {
         self.sprites.get(id as usize).map(|s| s.region)
     }
 
+    /// Look up a sprite id by the name it was inserted under.
     pub fn id_for(&self, name: &str) -> Option<SpriteId> {
         self.name_to_id.get(name).copied()
     }

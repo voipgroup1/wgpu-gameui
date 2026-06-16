@@ -13,13 +13,18 @@ pub(crate) const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
+    /// World-space position `[x, y]`.
     pub position: [f32; 2],
+    /// RGBA color (tint already applied).
     pub color: [f32; 4],
+    /// Clip rect `[x, y, w, h]` (ignored unless `clip_enabled > 0.5`).
     pub clip: [f32; 4],
+    /// `1.0` enables `clip`, `0.0` draws unclipped.
     pub clip_enabled: f32,
 }
 
 impl Vertex {
+    /// Build an unclipped vertex at `(x, y)` with the given color.
     pub fn new(x: f32, y: f32, color: [f32; 4]) -> Self {
         Self {
             position: [x, y],
@@ -29,6 +34,8 @@ impl Vertex {
         }
     }
 
+    /// Attach a clip rect, enabling clipping for this vertex; `None` leaves it
+    /// unclipped.
     pub fn with_clip(mut self, clip: Option<Rect>) -> Self {
         if let Some(clip) = clip {
             self.clip = [clip.x, clip.y, clip.width, clip.height];
@@ -57,6 +64,7 @@ pub struct IconDraw {
     pub icon_key: String,
     /// Multiplied with sampled atlas color. Default white.
     pub tint: [f32; 4],
+    /// Optional clip rect; `None` draws unclipped.
     pub clip: Option<Rect>,
     /// Optional normalized source sub-rect `[u0, v0, u1, v1]` (0..1 within the
     /// sprite) for cropped draws. `None` draws the whole sprite. Resolved
@@ -148,6 +156,7 @@ pub struct NineSliceDraw {
     pub texture_key: String,
     /// Multiplied with sampled color. Default white.
     pub tint: [f32; 4],
+    /// Optional clip rect; `None` draws unclipped.
     pub clip: Option<Rect>,
 }
 
@@ -168,6 +177,7 @@ pub struct IconMsdf {
     pub glyph_id: u16,
     /// Multiplied with the sampled field's fill color. Default white.
     pub tint: [f32; 4],
+    /// Optional clip rect; `None` draws unclipped.
     pub clip: Option<Rect>,
 }
 
@@ -177,20 +187,25 @@ pub struct IconMsdf {
 /// the top of both stacks at push time so widgets that already take absolute
 /// `Rect`s remain transform-aware without code changes.
 pub struct DrawList {
+    /// Soup vertex buffer for color-stage geometry.
     pub vertices: Vec<Vertex>,
+    /// Triangle indices into `vertices`.
     pub indices: Vec<u32>,
+    /// Queued text blocks, rendered by the text pass.
     pub texts: Vec<TextBlock>,
+    /// Queued textured-atlas icon draws.
     pub icons: Vec<IconDraw>,
+    /// Queued nine-slice panel draws.
     pub nine_slices: Vec<NineSliceDraw>,
     /// MSDF vector icons (Phosphor), rendered by the text renderer's icon pass.
     #[cfg(feature = "phosphor-icons")]
     pub icons_msdf: Vec<IconMsdf>,
     /// Instanced chrome rects (button backgrounds/borders, plus rect/rounded-rect
     /// fills and outlines). Drawn by the chrome pipeline; interleaved with soup
-    /// geometry via [`DrawList::color_cmds`].
+    /// geometry via `DrawList::color_cmds`.
     pub chrome_instances: Vec<ChromeInstance>,
     /// Instanced circles (filled discs + ring outlines). Drawn by the circle
-    /// SDF pipeline; interleaved with soup/chrome via [`DrawList::color_cmds`].
+    /// SDF pipeline; interleaved with soup/chrome via `DrawList::color_cmds`.
     pub circle_instances: Vec<CircleInstance>,
     /// Ordered color-stage command stream (soup runs interleaved with chrome
     /// instance runs). Empty unless [`DrawList::chrome_rect`] was used, in which
@@ -232,6 +247,9 @@ impl Default for DrawList {
 }
 
 impl DrawList {
+    /// Create an empty draw list with its own (freshly-scanned) font system.
+    /// Prefer [`DrawList::with_font_system`] to share a font system and avoid a
+    /// per-instance font-database scan.
     pub fn new() -> Self {
         Self::default()
     }
@@ -270,6 +288,9 @@ impl DrawList {
         }
     }
 
+    /// Clear all queued geometry/commands and reset the clip, transform, and
+    /// tint stacks to their identity base, ready to reuse for the next frame.
+    /// The shared font system / measurer is retained.
     pub fn clear(&mut self) {
         self.vertices.clear();
         self.indices.clear();
@@ -321,7 +342,7 @@ impl DrawList {
     /// Which band that is depends on the text — labels with lowercase letters
     /// centre on the **x-height** body, all-caps/numeric labels on the taller
     /// **cap-height** band, and labels containing **CJK** on the ideographic ink
-    /// centre (see [`FontVMetrics::center_offset_ratio`]) — so text reads as
+    /// centre (see [`FontVMetrics::visual_center_ratio`](crate::FontVMetrics::visual_center_ratio)) — so text reads as
     /// centred across scripts and case. Pass the same `font` the block renders
     /// with. Degrades to em-box centring when the metrics are unavailable.
     pub fn vcentered_text_y(
@@ -423,7 +444,7 @@ impl DrawList {
     /// new clip *replaces* whatever was active (Teardown's `UiClipRect`/`UiWindow`
     /// with `inherit = false`). The rect is still transformed to its world-space
     /// AABB by the active transform, with the same rotation caveat as
-    /// [`push_clip`].
+    /// [`push_clip`](Self::push_clip).
     pub fn push_clip_exact(&mut self, rect: Rect) {
         let world_rect = self.current_transform().transform_rect_aabb(rect);
         self.clip_stack.push(world_rect);
@@ -435,7 +456,7 @@ impl DrawList {
     }
 
     /// Number of clips currently on the stack. Used to scope clips to a
-    /// push/pop frame (record the depth on push, [`truncate_clip`] back on pop).
+    /// push/pop frame (record the depth on push, [`truncate_clip`](Self::truncate_clip) back on pop).
     pub fn clip_len(&self) -> usize {
         self.clip_stack.len()
     }
@@ -566,7 +587,7 @@ impl DrawList {
     /// chrome instance (radius 0) instead of two soup triangles — so thousands of
     /// rects collapse to small per-instance records the renderer rasterizes,
     /// with no per-frame soup re-tessellation/re-upload. Under any rotation/scale/
-    /// shear it falls back to soup geometry ([`DrawList::quad_soup`]) so the rect
+    /// shear it falls back to soup geometry (`DrawList::quad_soup`) so the rect
     /// still transforms correctly.
     pub fn quad(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
         if width <= 0.0 || height <= 0.0 {
@@ -603,8 +624,8 @@ impl DrawList {
     /// (used by the color picker's SV square / hue / alpha bars).
     ///
     /// Always soup geometry (a gradient can't use the instanced-chrome fast
-    /// path), and like [`quad_soup`](Self::quad_soup) it honors the current
-    /// transform + tint via [`vertex`](Self::vertex). No-op on non-positive size.
+    /// path), and like `quad_soup` it honors the current
+    /// transform + tint via `vertex`. No-op on non-positive size.
     pub fn quad_gradient(&mut self, rect: Rect, colors: [[f32; 4]; 4]) {
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return;

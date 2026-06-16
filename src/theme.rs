@@ -7,51 +7,84 @@ use crate::text::{FontHandle, TextBlock};
 #[derive(Clone)]
 pub struct Theme {
     // Colors
+    /// Window/screen backdrop fill behind all UI.
     pub background: [f32; 4],
+    /// Panel/container surface fill.
     pub panel: [f32; 4],
+    /// Border stroke around panels/containers.
     pub panel_border: [f32; 4],
+    /// Button fill in its resting (idle) state.
     pub button: [f32; 4],
+    /// Button fill while hovered.
     pub button_hover: [f32; 4],
+    /// Button fill while pressed.
     pub button_pressed: [f32; 4],
+    /// Border stroke around buttons.
     pub button_border: [f32; 4],
+    /// Text-input field fill.
     pub input_background: [f32; 4],
+    /// Border stroke around an unfocused text input.
     pub input_border: [f32; 4],
+    /// Border stroke around a focused text input.
     pub input_focus_border: [f32; 4],
+    /// Primary body text color.
     pub text: [f32; 4],
+    /// Dimmed/secondary text color (labels, placeholders).
     pub text_dim: [f32; 4],
+    /// Emphasized/highlighted text color.
     pub text_highlight: [f32; 4],
+    /// Accent color for primary/active UI elements.
     pub accent: [f32; 4],
     /// Severity accents (see [`Severity`](crate::Severity)). The themeable palette
     /// behind banners/toasts; `error` doubles as the failure severity, so there's
     /// no separate severity-error field.
     pub info: [f32; 4],
+    /// Success / confirmation severity accent.
     pub success: [f32; 4],
+    /// Warning / caution severity accent.
     pub warning: [f32; 4],
+    /// Failure severity accent (doubles as the general error color).
     pub error: [f32; 4],
     /// Outline color drawn around the keyboard-focused widget. Bright by design
     /// so the focus ring reads clearly against any widget chrome.
     pub focus_ring: [f32; 4],
 
     // Tab colors
+    /// Fill of an inactive (unselected) tab.
     pub tab_inactive: [f32; 4],
+    /// Fill of the active (selected) tab.
     pub tab_active: [f32; 4],
+    /// Fill of a hovered tab.
     pub tab_hover: [f32; 4],
+    /// Border stroke around tabs.
     pub tab_border: [f32; 4],
 
     // Progress bar colors
+    /// Progress-bar track (unfilled) color.
     pub progress_background: [f32; 4],
+    /// Progress-bar fill color for normal/healthy values.
     pub progress_fill: [f32; 4],
+    /// Progress-bar fill color for low/critical values (e.g. hunger critical).
     pub progress_fill_low: [f32; 4], // For low values (e.g., hunger critical)
+    /// Progress-bar fill color for medium values.
     pub progress_fill_medium: [f32; 4], // For medium values
 
     // Sizing
+    /// Default inner padding, in pixels.
     pub padding: f32,
+    /// Default gap between stacked elements, in pixels.
     pub spacing: f32,
+    /// Default corner radius for rounded rects, in pixels.
     pub border_radius: f32,
+    /// Default border stroke width, in pixels.
     pub border_width: f32,
+    /// Default body text size, in pixels.
     pub font_size: f32,
+    /// Title/heading text size, in pixels.
     pub font_size_title: f32,
+    /// Default button height, in pixels.
     pub button_height: f32,
+    /// Default text-input height, in pixels.
     pub input_height: f32,
 
     /// Hover/press transition duration in seconds. `0.0` disables animation

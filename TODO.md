@@ -712,9 +712,14 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 - [x] **P1 — `examples/` directory with at least one runnable wgpu
       example.** `examples/hello_ui.rs` opens a window and renders a panel +
       button + icon + nine-slice + text via `UiRenderer`.
-- [ ] **P2 — Rustdoc on all public types.** Several lack it: `Vertex`,
-      `IconDraw`, `NineSliceDraw`, `LayoutResult`, `StackChild`,
-      `DrawContext::*`.
+- [x] **P2 — Rustdoc on all public types.** Done: enabled crate-level
+      `#![warn(missing_docs)]` (lib.rs) as a permanent guard and documented all
+      314 previously-undocumented public items across 26 modules (text, layout,
+      theme, style, render/*, every widget, lib/ui_context/affine/layer). Also
+      fixed every `cargo doc` intra-doc-link warning (renamed/stale paths
+      qualified, private-item links demoted to code spans, one stale button
+      example updated to the current `draw(rect, &mut ctx)` API). `cargo doc
+      --no-deps` and `cargo build --all-targets` are both warning-clean.
 - [ ] **P2 — README quickstart, widget gallery, architecture overview.**
 - [ ] **P2 — Bench suite** (`benches/`) for hot paths (text shaping, draw
       list construction, layout).

@@ -142,7 +142,7 @@ impl<'a> Banner<'a> {
     }
 
     /// Natural height needed to render this banner at `width` (padding + title +
-    /// wrapped message). Useful for auto-sizing a [`ToastStack`].
+    /// wrapped message). Useful for auto-sizing a [`ToastStack`](crate::ToastStack).
     pub fn measure_height(&self, list: &mut DrawList, style: &StyleResolver, width: f32) -> f32 {
         let pad = style.scalar(StyleKey::Padding);
         let font_size = style.scalar(StyleKey::FontSize);
