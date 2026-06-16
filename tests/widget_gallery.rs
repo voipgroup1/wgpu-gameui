@@ -1886,7 +1886,7 @@ fn render_widget_gallery() {
         let py = blur_rect.y + (blur_rect.height - ph) / 2.0;
         let panel = Rect::new(px, py, pw, ph);
         panel_list.rounded_rect(panel, 8.0, [0.12, 0.13, 0.17, 0.92]);
-        panel_list.rect_outline(panel, 1.0, [0.40, 0.44, 0.52, 1.0]);
+        panel_list.rounded_rect_outline(panel, 8.0, 1.0, [0.40, 0.44, 0.52, 1.0]);
         panel_list.text(
             TextBlock::new("PAUSED", px + 20.0, py + 16.0)
                 .with_size(22.0)
