@@ -808,10 +808,12 @@ impl TextInput {
         // Single-line selection/caret band, centred on the field box. `text_top`
         // is tuned to baseline-place the glyphs (so the visual body sits centred
         // in the box), which is ~0.25em *below* the line-box top — anchoring the
-        // band there makes it ride high over the text. Centre a `line_height`-tall
-        // band on the box instead so it brackets the glyph body symmetrically.
-        // Multiline keeps per-line tops from the laid-out caret geometry.
-        let sl_band_top = self.y + (self.height - line_height) / 2.0;
+        // band there makes it ride high over the text. Centre the band on the box
+        // instead so it brackets the glyph body symmetrically, and make it a touch
+        // taller than `line_height` (1.1×) so ascenders/descenders sit fully
+        // inside it. Multiline keeps per-line tops from the laid-out caret geometry.
+        let sl_band_h = line_height * 1.1;
+        let sl_band_top = self.y + (self.height - sl_band_h) / 2.0;
 
         // Caret layout for the *current* value (multiline+focused only), built
         // BEFORE keyboard/click so vertical nav, line Home/End, and click hit
@@ -1063,7 +1065,7 @@ impl TextInput {
                                 text_x + r.x,
                                 sl_band_top,
                                 r.w.max(1.0),
-                                line_height,
+                                sl_band_h,
                                 s.color(StyleKey::Accent),
                             );
                         }
@@ -1161,12 +1163,16 @@ impl TextInput {
                         .unwrap_or(text_x)
                 };
                 // Single-line carets share the box-centred band as the selection
-                // (see `sl_band_top`); multiline-composing keeps the first-line
-                // top (`block_y`) the preedit text is drawn at.
-                let caret_top = if multiline { block_y } else { sl_band_top };
-                list.quad(cursor_x, caret_top, 1.5, line_height, s.color(StyleKey::Text));
+                // (see `sl_band_top`/`sl_band_h`); multiline-composing keeps the
+                // first-line top (`block_y`) the preedit text is drawn at.
+                let (caret_top, caret_h) = if multiline {
+                    (block_y, line_height)
+                } else {
+                    (sl_band_top, sl_band_h)
+                };
+                list.quad(cursor_x, caret_top, 1.5, caret_h, s.color(StyleKey::Text));
                 // See the multiline branch: declare IME focus + caret anchor.
-                focus.request_ime(Rect::new(cursor_x, caret_top, 1.5, line_height));
+                focus.request_ime(Rect::new(cursor_x, caret_top, 1.5, caret_h));
             }
         }
 
