@@ -1284,9 +1284,64 @@ impl LayoutNode for Flow {
     }
 }
 
+/// Lay out `child_heights` as a fit-sized vertical [`VStack`] anchored at the
+/// origin and return the container rect plus one rect per child.
+///
+/// Each child is a fixed-height, `width`-wide row; the stack is sized to exactly
+/// contain them ([`VStack::content_size`]) with `spacing` between rows and
+/// `padding` inset on all four sides. The result's
+/// [`container`](LayoutResult::container) (entry 0) is the fitted panel rect and
+/// [`children`](LayoutResult::children) are the row rects — so an immediate-mode
+/// caller can draw a background sized to the container *and* place each row at
+/// its rect from a **single source of truth**, instead of hand-summing a panel
+/// height that has to stay in lockstep with the body it draws.
+///
+/// The container is at `(0, 0, width + 2·padding, fit_height)`; each row rect is
+/// inset by `padding` on the left and stacked top-to-bottom. Pure layout: draws
+/// nothing, allocates one `LayoutResult`.
+pub fn vstack_fit(width: f32, spacing: f32, padding: f32, child_heights: &[f32]) -> LayoutResult {
+    let mut stack = VStack::new(spacing).with_padding(padding);
+    for &h in child_heights {
+        stack = stack.child(h, width);
+    }
+    let (fit_w, fit_h) = stack.content_size();
+    let mut out = LayoutResult::default();
+    stack.layout_into(Rect::new(0.0, 0.0, fit_w, fit_h), &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vstack_fit_sizes_container_and_places_rows() {
+        // Two rows (20, 30) at width 100, spacing 4, padding 8.
+        let r = vstack_fit(100.0, 4.0, 8.0, &[20.0, 30.0]);
+        let c = r.container();
+        assert_eq!(c.x, 0.0);
+        assert_eq!(c.y, 0.0);
+        assert_eq!(c.width, 100.0 + 8.0 * 2.0, "container width = width + 2·padding");
+        assert_eq!(c.height, 8.0 * 2.0 + 20.0 + 4.0 + 30.0, "fit height = pad + rows + spacing");
+        assert_eq!(r.child_count(), 2);
+
+        let r0 = r.get(1);
+        assert_eq!((r0.x, r0.y, r0.width, r0.height), (8.0, 8.0, 100.0, 20.0));
+        let r1 = r.get(2);
+        // second row sits below the first plus the spacing.
+        assert_eq!((r1.x, r1.y, r1.width, r1.height), (8.0, 8.0 + 20.0 + 4.0, 100.0, 30.0));
+    }
+
+    #[test]
+    fn vstack_fit_empty_is_just_padding() {
+        let r = vstack_fit(120.0, 6.0, 10.0, &[]);
+        let c = r.container();
+        // With no rows there is no child cross-size, so the width collapses to
+        // the padding inset (the `width` argument only sizes actual rows).
+        assert_eq!(c.width, 20.0, "no rows → width is padding on both sides");
+        assert_eq!(c.height, 20.0, "no rows → height is padding on both sides");
+        assert_eq!(r.child_count(), 0);
+    }
 
     #[test]
     fn test_anchor_top_right() {
