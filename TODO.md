@@ -720,9 +720,10 @@ Use this as the working backlog for the package. Cross items off as PRs land.
       qualified, private-item links demoted to code spans, one stale button
       example updated to the current `draw(rect, &mut ctx)` API). `cargo doc
       --no-deps` and `cargo build --all-targets` are both warning-clean.
-- [ ] **P2 — README quickstart, widget gallery, architecture overview.**
-- [ ] **P2 — Bench suite** (`benches/`) for hot paths (text shaping, draw
-      list construction, layout).
+- [x] **P2 — README quickstart, widget gallery, architecture overview.**
+- [x] **P2 — Bench suite** (`benches/`) for hot paths (text shaping, draw
+      list construction, layout, interactive widgets, scroll view, list, table,
+      UiContext facade, animation).
 
 ---
 
@@ -746,3 +747,72 @@ Use this as the working backlog for the package. Cross items off as PRs land.
 
 Beyond 1.0: world-space UI, sound hooks, mod registry, color picker,
 collapsing header, blur backdrop, controller input.
+
+---
+
+## 2026-06-17 — UiContext verb coverage
+
+Added `UiContext` façade verbs for previously-unwrapped widgets:
+
+- **Non-interactive themed:** `separator()`, `progress_bar(value, w)`,
+  `banner(severity, message, w)`, `group_begin(title, w, h) -> Rect`,
+  `panel(w, h)` — draw through `StyleResolver` + auto-advance.
+- **Interactive:** `tabs(labels, active) -> Option<usize>`,
+  `image_button_key(key, w, h) -> bool`,
+  `image_button_sprite(sprite, w, h) -> bool`,
+  `color_picker(id, &mut hsva, w) -> ColorPickerOutput`,
+  `drag_handle(id, w, h) -> DragHandleOutput`.
+- **ScrollView:** `scroll_begin(w, h) -> Rect` / `scroll_end()` pair using
+  existing `UiState::scroll`.
+- **Dropdown:** `dropdown(id, options, selected, w)` using existing
+  `UiState::dropdowns`. Layer lifecycle wired into
+  `UiState::begin_frame`/`end_frame` + new
+  `UiState::push_dropdown_layer`/`draw_dropdown_layer`.
+
+**Convenience state:** added `toasts: ToastStack` and `tooltips: TooltipLayer`
+to `UiState`.
+
+**Not added as verbs (closure-based, keep raw widgets):** `List`, `Table`.
+
+---
+
+## 2026-07-03 — daemon-enabling APIs
+
+Changes driven by the notification-daemon integration audit, each closing a gap
+the daemon would otherwise work around:
+
+- **Raw-RGBA image loader (`load_image_rgba8`).** The decode-free sibling of
+  `load_image_bytes`: inserts already-decoded RGBA8 pixels under a key into both
+  the atlas *and* the image cache (so `has_image`/`image_size`/`unload_image` see
+  it). The daemon already holds decoded icon pixels, so this avoids a pointless
+  RGBA→PNG→decode round-trip per notification. (`UiRenderer::load_image_rgba8`;
+  `load_sprite_rgba8` remains the cache-bypassing out-of-band path.)
+- **Atlas eviction / reclaim.** `SpriteAtlas` is now tombstone-based
+  (`Vec<Option<StoredSprite>>` + a free-list): `remove(id)` frees a slot (its
+  pixels reclaimed, the index recycled by the next load) without shifting or
+  renumbering any other `SpriteId`. `compact()` repacks the live sprites into
+  fresh shelves, reclaiming shelf fragmentation while preserving every id — safe
+  because atlas regions are pixel rects re-derived into UVs every render and a
+  dirty atlas triggers a full re-upload (the invariant `try_grow` already relied
+  on). `UiRenderer::unload_image` now frees the slot (previously it leaked the
+  pixels); `UiRenderer::compact_atlas()` defrags on the caller's schedule;
+  `UiRenderer::atlas_size()` exposes the texture dims for monitoring. This is
+  what keeps a long-running daemon's one-off-icon churn from climbing the atlas
+  to its 4096² panic cap.
+- **`NumberInput` display formatter.** `NumberInput::with_formatter(fn(f64) ->
+  String)` (e.g. zero-padding `7` → `"07"` for an HH field) and
+  `with_parser(fn(&str) -> Option<f64>)` (when the display text isn't directly
+  `f64`-parseable; bypasses the default numeric sanitize so the parser owns
+  validation). Formatter-only keeps the default sanitize + parse path. The
+  positional `number_input` façade verb is unchanged (already at the
+  too-many-arguments limit) — zero-padding uses the raw widget, the architecture's
+  "full control" path.
+- **Enabled/disabled subtree scope.** `UiContext::enabled_scope(enabled, |ui| …)`
+  / `disabled_scope(|ui| …)` — egui's `add_enabled_ui` analogue. Self-balancing
+  (closure-scoped `push`/`color_filter`/`pop`): when disabled, gray-tints the
+  block and feeds every interactive verb an inert `InputState::consumed()` clone
+  via a per-frame `input_disabled` flag consulted at the per-widget input-clone
+  points (`localize`, `hit_zone`, `hit_zone_at`, `scroll_begin`/`end`). First
+  closure-based scope verb in the file, chosen for RAII balance; nesting is
+  absolute (an inner `enabled_scope(true)` re-enables, restored on exit).
+

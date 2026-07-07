@@ -7,9 +7,13 @@
 //! handle. The [`UiRenderer`](crate::UiRenderer) owns one of these and exposes
 //! the public `load_image_*` / `image_size` / `has_image` / `unload_image` API.
 //!
-//! Note: [`SpriteAtlas`](super::SpriteAtlas) has no slot reclamation, so
-//! `unload_image` only drops the cache entry — the atlas pixels stay until the
-//! atlas is rebuilt. That's acceptable for UI image sets (small, mostly static).
+//! Note: [`SpriteAtlas`](super::SpriteAtlas) reclaims a removed sprite's slot
+//! immediately (the pixel buffer is freed and the slot is recycled by the next
+//! load), and shelf *fragmentation* is reclaimed by
+//! [`UiRenderer::compact_atlas`](crate::UiRenderer::compact_atlas). So
+//! `unload_image` no longer leaks atlas pixels — a long-running app that churns
+//! one-off images should call `compact_atlas` periodically to keep the texture
+//! from climbing toward its 4096² cap.
 
 use std::collections::HashMap;
 
@@ -81,8 +85,10 @@ impl ImageCache {
         self.entries.insert(key.to_string(), entry);
     }
 
-    /// Drop the cache entry for `key`. Returns the removed entry, if any. Does
-    /// NOT free the atlas slot (the atlas has no reclamation).
+    /// Drop the cache entry for `key`. Returns the removed entry, if any. This is
+    /// a pure map remove — it does not touch the atlas; the caller (e.g.
+    /// [`UiRenderer::unload_image`](crate::UiRenderer::unload_image)) is
+    /// responsible for freeing the matching sprite slot.
     pub fn remove(&mut self, key: &str) -> Option<ImageEntry> {
         self.entries.remove(key)
     }
@@ -143,5 +149,45 @@ mod tests {
         let removed = cache.remove("a").unwrap();
         assert_eq!(removed.height, 8);
         assert!(!cache.contains("a"));
+    }
+
+    /// Mirrors `UiRenderer::load_image_rgba8`: insert raw RGBA8 into the atlas
+    /// *and* record the cache entry, then verify the decoded-image cache API
+    /// (`has` via `contains` / `get` / `remove`) sees the key. This is the
+    /// contract that distinguishes `load_image_rgba8` from `load_sprite_rgba8`
+    /// (which registers only the atlas name and bypasses the cache).
+    #[test]
+    fn load_image_rgba8_registers_in_cache() {
+        use crate::SpriteAtlas;
+        let mut atlas = SpriteAtlas::new();
+        let mut cache = ImageCache::new();
+
+        // "Load" a 2x2 raw RGBA8 image under a key.
+        let key = "notif_icon";
+        let (w, h) = (2u32, 2u32);
+        let rgba = vec![255u8; (w * h * 4) as usize];
+        let sprite = atlas.insert(Some(key), w, h, &rgba);
+        cache.insert(
+            key,
+            ImageEntry {
+                sprite,
+                width: w,
+                height: h,
+            },
+        );
+
+        // The cache sees it — the whole point of #1.
+        assert!(cache.contains(key));
+        assert_eq!(cache.get(key).unwrap().sprite, sprite);
+        assert_eq!(cache.get(key).unwrap().width, w);
+        assert_eq!(cache.get(key).unwrap().height, h);
+
+        // Repeating the load is a cache fast-path (returns the same sprite).
+        let again = cache.get(key).unwrap().sprite;
+        assert_eq!(again, sprite);
+
+        // Unloading drops the cache entry.
+        cache.remove(key);
+        assert!(!cache.contains(key));
     }
 }

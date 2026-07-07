@@ -1,7 +1,7 @@
 //! `UiRenderer` — single-call renderer consuming a `DrawList`.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -148,6 +148,67 @@ const NINE_INSTANCE_ATTRIBS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_arra
     8 => Float32x4, // clip
 ];
 
+/// Detects the "freshly-constructed `DrawList`/`LayerStack` every frame" footgun.
+///
+/// The text-measure cache (and the shaped-glyph cache) lives **on the
+/// `DrawList`**. A caller that builds a new list every frame — e.g.
+/// `LayerStack::new()` inside the render loop — throws that cache away each frame,
+/// so every label is re-shaped through glyphon on every frame. That is invisible
+/// in correctness terms but can cost *milliseconds* (it made one HUD cost ~11ms a
+/// frame instead of <1ms). The fix is always the same: build one list/stack once
+/// and reuse it (`clear()` resets geometry while keeping the warm cache).
+///
+/// We can't see the cache directly from the renderer, but we can see identity:
+/// each [`DrawList`] carries a unique, never-reused [`id`](DrawList::id). A reused
+/// list reports the **same** id every frame; a per-frame-fresh list reports a
+/// **brand-new** id every frame. So: remember the handful of ids seen recently,
+/// and if the renderer is fed an id it has *never* seen for many consecutive
+/// frames, the caller is rebuilding every frame — warn (once).
+///
+/// Patterns this deliberately does **not** flag: a single reused list (same id
+/// forever), a small set of double-buffered/persistent stacks cycled round-robin
+/// (their ids keep recurring), and the occasional rebuild on resize (a single
+/// fresh id now and then never builds a long streak).
+#[derive(Default)]
+struct StaleListDetector {
+    /// Bounded ring of recently observed `DrawList` ids (most-recent last). Large
+    /// enough to cover any realistic set of persistent/double-buffered stacks.
+    recent: VecDeque<u64>,
+    /// Consecutive frames whose id had never been seen before.
+    fresh_streak: u32,
+    /// Latch: warn at most once per renderer (the advice is the same every time).
+    warned: bool,
+}
+
+impl StaleListDetector {
+    /// How many distinct recent ids to remember. Comfortably exceeds any sane
+    /// number of persistent stacks an app cycles between.
+    const RECENT_CAP: usize = 16;
+    /// Consecutive all-fresh frames before we conclude the caller rebuilds every
+    /// frame. ~2s at 60fps — long enough that brief transients never trip it.
+    const WARN_AFTER: u32 = 120;
+
+    /// Record one rendered list id. Returns `true` exactly once — on the frame the
+    /// footgun is first detected — so the caller can emit the warning.
+    fn observe(&mut self, id: u64) -> bool {
+        if self.recent.contains(&id) {
+            // Seen before → the list is being reused. Reset the streak.
+            self.fresh_streak = 0;
+        } else {
+            self.fresh_streak = self.fresh_streak.saturating_add(1);
+            self.recent.push_back(id);
+            if self.recent.len() > Self::RECENT_CAP {
+                self.recent.pop_front();
+            }
+        }
+        if !self.warned && self.fresh_streak >= Self::WARN_AFTER {
+            self.warned = true;
+            return true;
+        }
+        false
+    }
+}
+
 /// Public renderer.
 pub struct UiRenderer {
     // Pipelines
@@ -226,6 +287,11 @@ pub struct UiRenderer {
     // when a missing sprite key is referenced every frame. RefCell because
     // tessellate_* take &self.
     warned_missing: RefCell<HashSet<String>>,
+
+    // Detects callers that rebuild their DrawList/LayerStack every frame (cold
+    // text-measure cache → per-frame reshaping). Fed the rendered list's id in
+    // `render`/`render_layers`; warns once if it's always a brand-new list.
+    stale_list: StaleListDetector,
 }
 
 impl UiRenderer {
@@ -607,6 +673,7 @@ impl UiRenderer {
             blur: None,
             text_renderer,
             warned_missing: RefCell::new(HashSet::new()),
+            stale_list: StaleListDetector::default(),
         }
     }
 
@@ -658,7 +725,8 @@ impl UiRenderer {
             return Ok(entry.sprite);
         }
         let bytes = std::fs::read(path.as_ref()).map_err(ImageError::Io)?;
-        self.decode_and_cache(&key, &bytes)
+        let (w, h, rgba) = decode_rgba8(&bytes).map_err(ImageError::Decode)?;
+        Ok(self.insert_image(&key, w, h, &rgba))
     }
 
     /// Decode and load an encoded image from in-memory bytes under an explicit
@@ -668,12 +736,33 @@ impl UiRenderer {
         if let Some(entry) = self.image_cache.get(key) {
             return Ok(entry.sprite);
         }
-        self.decode_and_cache(key, bytes)
+        let (w, h, rgba) = decode_rgba8(bytes).map_err(ImageError::Decode)?;
+        Ok(self.insert_image(key, w, h, &rgba))
     }
 
-    fn decode_and_cache(&mut self, key: &str, bytes: &[u8]) -> Result<SpriteId, ImageError> {
-        let (w, h, rgba) = decode_rgba8(bytes).map_err(ImageError::Decode)?;
-        let sprite = self.atlas.insert(Some(key), w, h, &rgba);
+    /// Load an already-decoded RGBA8 image under an explicit `key`, skipping the
+    /// decode step entirely. This is the decode-free sibling of
+    /// [`UiRenderer::load_image_bytes`]: use it when the caller already holds the
+    /// raw pixels (e.g. a notification daemon that rendered an icon into a
+    /// buffer) to avoid a pointless RGBA→PNG→decode round-trip.
+    ///
+    /// Like the other `load_image_*` methods, the image is registered in the
+    /// decoded-image cache, so [`has_image`](Self::has_image) /
+    /// [`image_size`](Self::image_size) /
+    /// [`unload_image`](Self::unload_image) all see it. (Contrast
+    /// [`load_sprite_rgba8`](Self::load_sprite_rgba8), which registers only the
+    /// atlas name and bypasses the cache.) Cached by `key`: a repeat load is free
+    /// and returns the existing handle.
+    pub fn load_image_rgba8(&mut self, key: &str, w: u32, h: u32, rgba: &[u8]) -> SpriteId {
+        if let Some(entry) = self.image_cache.get(key) {
+            return entry.sprite;
+        }
+        self.insert_image(key, w, h, rgba)
+    }
+
+    /// Insert decoded RGBA8 pixels into the atlas and record the cache entry.
+    fn insert_image(&mut self, key: &str, w: u32, h: u32, rgba: &[u8]) -> SpriteId {
+        let sprite = self.atlas.insert(Some(key), w, h, rgba);
         self.image_cache.insert(
             key,
             ImageEntry {
@@ -682,7 +771,7 @@ impl UiRenderer {
                 height: h,
             },
         );
-        Ok(sprite)
+        sprite
     }
 
     /// Pixel dimensions of a loaded image, if `key` has been loaded. Backs
@@ -696,10 +785,41 @@ impl UiRenderer {
         self.image_cache.contains(key)
     }
 
-    /// Drop the cache entry for an image `key` (next load re-decodes). Backs
-    /// Teardown's `UiUnloadImage`. Note: the atlas slot is not reclaimed.
+    /// Drop the cache entry for an image `key` (next load re-decodes), and free
+    /// the sprite's atlas slot so its pixels are reclaimed. Backs Teardown's
+    /// `UiUnloadImage`.
+    ///
+    /// The freed slot is tombstoned and recycled by a later `load_*`; the
+    /// GPU texture is re-uploaded without this sprite's pixels on the next
+    /// render. Shelf *fragmentation* left by the removal is reclaimed lazily by
+    /// [`compact_atlas`](Self::compact_atlas), which a long-running app can call
+    /// on its own schedule (e.g. when [`atlas_size`](Self::atlas_size) approaches
+    /// a threshold). Idempotent for an unknown key.
     pub fn unload_image(&mut self, key: &str) {
-        self.image_cache.remove(key);
+        if let Some(entry) = self.image_cache.remove(key) {
+            self.atlas.remove(entry.sprite);
+        }
+    }
+
+    /// Reclaim atlas shelf fragmentation left by [`unload_image`](Self::unload_image)
+    /// / [`remove`](SpriteAtlas::remove) calls, repacking every live sprite into
+    /// fresh contiguous shelves without changing any `SpriteId`. Safe to call at
+    /// any time; idempotent when nothing has been removed.
+    ///
+    /// The texture dimensions are not shrunk (only the *packing* is tightened),
+    /// so this prevents the atlas from climbing toward the 4096² cap under churn
+    /// but does not release the peak texture size. Call it periodically — e.g. a
+    /// daemon that loads and discards many one-off icons — to keep growth bounded.
+    pub fn compact_atlas(&mut self) {
+        self.atlas.compact();
+    }
+
+    /// Current atlas texture dimensions in pixels, as `(width, height)`. Monitor
+    /// this to decide when to call [`compact_atlas`](Self::compact_atlas); the
+    /// atlas grows (1024 → 2048 → 4096) only when a sprite doesn't fit, and
+    /// panics past 4096².
+    pub fn atlas_size(&self) -> (u32, u32) {
+        (self.atlas.width(), self.atlas.height())
     }
 
     /// Register a nine-slice resource referencing an existing sprite.
@@ -822,6 +942,9 @@ impl UiRenderer {
     ) {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_render").entered();
+        if self.stale_list.observe(draw_list.id()) {
+            Self::warn_stale_list("render", "DrawList");
+        }
         self.prepare_frame(device, queue, viewport, scale_factor);
         self.render_one(device, queue, encoder, view, draw_list);
     }
@@ -841,11 +964,33 @@ impl UiRenderer {
     ) {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_render_layers").entered();
+        // Key the footgun detector on the BASE list only: modal/popup/tooltip
+        // layers are legitimately transient (built per push), so their ids would
+        // be false positives.
+        if self.stale_list.observe(layers.base_id()) {
+            Self::warn_stale_list("render_layers", "LayerStack");
+        }
         self.prepare_frame(device, queue, viewport, scale_factor);
         self.render_one(device, queue, encoder, view, layers.base());
         for layer in layers.layers() {
             self.render_one(device, queue, encoder, view, &layer.list);
         }
+    }
+
+    /// Emit the once-per-renderer warning that the caller is feeding a
+    /// freshly-constructed list/stack every frame (see [`StaleListDetector`]).
+    fn warn_stale_list(method: &str, kind: &str) {
+        log::warn!(
+            "wgpu-gameui: `UiRenderer::{method}` has been called with a \
+             freshly-constructed `{kind}` for {}+ consecutive frames. The \
+             text-measure and shaped-glyph caches live ON the `DrawList`, so a \
+             list rebuilt every frame can never warm them — every label is \
+             re-shaped through glyphon every frame (this can cost milliseconds \
+             per frame). Construct ONE `{kind}` and reuse it across frames, \
+             calling `.clear()` each frame to reset geometry while keeping the \
+             warm caches.",
+            StaleListDetector::WARN_AFTER,
+        );
     }
 
     /// Blur an **app-provided** scene texture into `target` over `region`, for
@@ -1627,6 +1772,95 @@ mod tests {
     fn crop_uv_none_is_identity() {
         let full = [0.25, 0.5, 0.75, 1.0];
         approx4(apply_crop_uv(full, None), full);
+    }
+
+    // ---- StaleListDetector ----
+
+    #[test]
+    fn stale_detector_reused_list_never_warns() {
+        // The correct pattern: one list reused every frame → same id forever.
+        let mut d = StaleListDetector::default();
+        for _ in 0..(StaleListDetector::WARN_AFTER * 3) {
+            assert!(!d.observe(42), "reusing one list must never warn");
+        }
+        assert_eq!(d.fresh_streak, 0);
+    }
+
+    #[test]
+    fn stale_detector_fresh_list_each_frame_warns_once() {
+        // The footgun: a brand-new id every frame (LayerStack::new() in the loop).
+        let mut d = StaleListDetector::default();
+        let mut id = 1u64;
+        let mut warnings = 0;
+        for _ in 0..(StaleListDetector::WARN_AFTER * 2) {
+            if d.observe(id) {
+                warnings += 1;
+            }
+            id += 1; // never repeats — every frame is a fresh list
+        }
+        assert_eq!(warnings, 1, "must warn exactly once, not spam every frame");
+    }
+
+    #[test]
+    fn stale_detector_warns_exactly_at_threshold() {
+        let mut d = StaleListDetector::default();
+        // WARN_AFTER-1 fresh frames: not yet.
+        for id in 1..StaleListDetector::WARN_AFTER as u64 {
+            assert!(!d.observe(id));
+        }
+        // The WARN_AFTER-th consecutive fresh frame trips it.
+        assert!(d.observe(StaleListDetector::WARN_AFTER as u64));
+    }
+
+    #[test]
+    fn stale_detector_double_buffered_stacks_dont_warn() {
+        // Two persistent stacks alternating (a legitimate double-buffer): both ids
+        // keep recurring, so neither is ever "never seen". Must not warn.
+        let mut d = StaleListDetector::default();
+        for i in 0..(StaleListDetector::WARN_AFTER * 4) {
+            let id = if i % 2 == 0 { 7 } else { 9 };
+            assert!(!d.observe(id), "alternating persistent stacks must not warn");
+        }
+    }
+
+    #[test]
+    fn stale_detector_occasional_rebuild_does_not_warn() {
+        // A reused list that gets rebuilt now and then (e.g. on resize) produces a
+        // lone fresh id occasionally — never a long enough streak to trip.
+        let mut d = StaleListDetector::default();
+        let mut id = 1u64;
+        for frame in 0..(StaleListDetector::WARN_AFTER * 5) {
+            if frame % 20 == 0 {
+                id += 1; // rebuild: new id this frame, then reused for the next 19
+            }
+            assert!(!d.observe(id), "occasional rebuilds must not warn");
+        }
+    }
+
+    // ---- DrawList / LayerStack identity (backs the detector) ----
+
+    #[test]
+    fn distinct_draw_lists_have_distinct_ids() {
+        let a = DrawList::new();
+        let b = DrawList::new();
+        assert_ne!(a.id(), b.id(), "each DrawList must get a unique id");
+    }
+
+    #[test]
+    fn clear_preserves_id() {
+        let mut a = DrawList::new();
+        let before = a.id();
+        a.clear();
+        assert_eq!(a.id(), before, "clear() must keep the same list identity");
+    }
+
+    #[test]
+    fn layer_stack_base_id_matches_base_list() {
+        let s = LayerStack::new();
+        assert_eq!(s.base_id(), s.base().id());
+        // A second stack is a distinct base list.
+        let s2 = LayerStack::new();
+        assert_ne!(s.base_id(), s2.base_id());
     }
 
     /// Replicate the vertex shaders' `vec4(pos, 0, 1) * view_proj` (row-vector ×

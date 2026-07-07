@@ -11,17 +11,22 @@
 
 use crate::InputState;
 use crate::affine::Affine2;
+use crate::color::Hsva;
 use crate::layer::{LayerKind, LayerStack};
 use crate::layout::Rect;
-use crate::style::{StyleKey, StyleOverlay, StyleValue};
+use crate::style::{StyleKey, StyleOverlay, StyleResolver, StyleValue};
 use crate::text::{FontHandle, TextBlock};
 use crate::theme::Theme;
 use crate::widgets::DrawList;
 use crate::animation::AnimationState;
+use crate::render::SpriteId;
 use crate::widgets::{
-    Button, Checkbox, DragCapture, DragId, DrawContext, DropdownState, FocusId, FocusState,
-    HitZone, HitZoneOutput, NumberInput, RadioGroup, ScrollState, Slider, TextInput, TreeId,
-    TreeNode, TreeNodeOutput, TreeState,
+    Banner, Button, Checkbox, ColorPicker, ColorPickerOutput, DragCapture, DragHandle,
+    DragHandleOutput, DragId, DrawContext, Dropdown, DropdownId, DropdownState,
+    FocusId, FocusState, Group, HitZone, HitZoneOutput, ImageButton, NumberInput, Panel,
+    ProgressBar, RadioGroup, ScrollBegin, ScrollState, ScrollView, Separator, Severity, Slider,
+    Tabs, TextInput, ToastStack, TooltipLayer, TreeId, TreeNode, TreeNodeOutput,
+    TreeState,
 };
 use glyphon::{Style, Weight};
 use std::collections::HashMap;
@@ -180,6 +185,16 @@ pub struct UiState {
     /// a `dt` of `0.0` (or `theme.animation_duration == 0`) keeps every verb's
     /// drawn color instant/byte-identical to the un-animated path.
     pub anim: AnimationState,
+    /// Toast notification stack — push transient [`Toast`](crate::Toast)s,
+    /// [`tick`](ToastStack::tick) once per frame with `dt`, and
+    /// [`draw`](ToastStack::draw) at the end of the frame above the rest of the
+    /// UI. Caller-owned; no `UiContext` verb wraps it.
+    pub toasts: ToastStack,
+    /// Tooltip layer — register hover regions with
+    /// [`TooltipLayer::hover_zone`], call [`tick`](TooltipLayer::tick) once per
+    /// frame with `dt`, and [`draw`](TooltipLayer::draw) at the end of the
+    /// frame. Caller-owned; no `UiContext` verb wraps it.
+    pub tooltips: TooltipLayer,
 }
 
 impl UiState {
@@ -213,6 +228,7 @@ impl UiState {
         nav.apply(input);
         self.focus.begin_frame(input);
         self.tree.begin_frame(input);
+        self.dropdowns.begin_frame(input);
         self.item_gap = theme.spacing;
         self.next_auto_id = 0;
         self.tree_focus_registered = false;
@@ -227,6 +243,32 @@ impl UiState {
         let tree_focused = self.focus.is_focused(TREE_FOCUS_ID);
         self.tree.end_frame(tree_focused);
         self.focus.end_frame(None);
+        // Dismiss the open dropdown on Escape or click-outside.
+        self.dropdowns.end_frame();
+    }
+
+    /// Push the popup layer for the open dropdown (using last frame's geometry)
+    /// so input dispatch accounts for it. Call once per frame, after
+    /// [`begin_frame`](Self::begin_frame) but before building the base UI.
+    /// Returns the layer index to pass to
+    /// [`draw_dropdown_layer`](Self::draw_dropdown_layer).
+    pub fn push_dropdown_layer(&mut self, layers: &mut LayerStack) -> Option<usize> {
+        self.dropdowns.push_open_layer(layers)
+    }
+
+    /// Draw the open dropdown's floating option list into the popup layer pushed
+    /// by [`push_dropdown_layer`](Self::push_dropdown_layer). Call once per
+    /// frame, after the base UI is drawn. `popup` is the layer index returned by
+    /// `push_dropdown_layer`. Returns `Some((id, index))` when an option was
+    /// selected this frame.
+    pub fn draw_dropdown_layer(
+        &mut self,
+        layers: &mut LayerStack,
+        popup: Option<usize>,
+        style: &StyleResolver,
+        input: &InputState,
+    ) -> Option<(DropdownId, usize)> {
+        self.dropdowns.draw_open_layer(layers, popup, style, input)
     }
 
     /// Next auto-assigned focus id for an id-less interactive verb. Stable across
@@ -307,6 +349,20 @@ pub struct UiContext<'a> {
     /// every widget in `push`/`pop`. A fresh `UiContext` is built per frame, so
     /// this resets to `true` each frame unless re-disabled.
     auto_advance: bool,
+    /// When `true`, every interactive verb feeds its widgets an inert
+    /// [`InputState::consumed()`] clone so a whole subtree renders but cannot
+    /// react (no hover/click/scroll/keyboard/nav). Armed by
+    /// [`disabled_scope`](Self::disabled_scope)/[`enabled_scope`](Self::enabled_scope)
+    /// and saved/restored across nesting. `false` by default.
+    input_disabled: bool,
+    /// Saved viewport rect for a [`scroll_begin`](Self::scroll_begin) /
+    /// [`scroll_end`](Self::scroll_end) pair. `None` when no scroll is in
+    /// progress.
+    pending_scroll_viewport: Option<Rect>,
+    /// Saved [`ScrollBegin`] from the most recent
+    /// [`scroll_begin`](Self::scroll_begin), handed back to
+    /// [`scroll_end`](Self::scroll_end).
+    pending_scroll_begin: Option<ScrollBegin>,
 }
 
 impl<'a> UiContext<'a> {
@@ -329,6 +385,9 @@ impl<'a> UiContext<'a> {
             theme: None,
             tree_depth: 0,
             auto_advance: true,
+            input_disabled: false,
+            pending_scroll_viewport: None,
+            pending_scroll_begin: None,
         }
     }
 
@@ -349,6 +408,9 @@ impl<'a> UiContext<'a> {
             theme: None,
             tree_depth: 0,
             auto_advance: true,
+            input_disabled: false,
+            pending_scroll_viewport: None,
+            pending_scroll_begin: None,
         }
     }
 
@@ -560,6 +622,45 @@ impl<'a> UiContext<'a> {
     /// Multiply into the current tint (Teardown's `UiColorFilter`).
     pub fn color_filter(&mut self, r: f32, g: f32, b: f32, a: f32) {
         self.backend.list_mut().multiply_tint([r, g, b, a]);
+    }
+
+    /// Run `f` as an enabled/disabled subtree (egui's `add_enabled_ui` analogue).
+    /// Self-balancing: pairs [`push`](Self::push)/[`pop`](Self::pop) internally, so
+    /// the context's stack-balance checks stay satisfied regardless of what `f`
+    /// does.
+    ///
+    /// When `enabled` is `false`, every interactive verb inside `f` feeds its
+    /// widget an inert [`InputState::consumed()`] clone (no hover/click/scroll/
+    /// keyboard/nav) and a gray dim is multiplied onto the tint stack, so the
+    /// block renders visibly disabled. When `enabled` is `true` the block runs
+    /// normally — and explicitly *re-enables* inside an enclosing disabled scope
+    /// (the flag is absolute for the body, restored to its prior value on exit).
+    ///
+    /// ```ignore
+    /// ui.enabled_scope(summary_enabled, |ui| {
+    ///     // grayed + inert when `summary_enabled` is false
+    ///     ui.number_input(ID_HH, &mut hour, 0.0, 23.0, 1.0, 0, Some(60.0));
+    /// });
+    /// ```
+    pub fn enabled_scope(&mut self, enabled: bool, f: impl FnOnce(&mut UiContext<'a>)) {
+        self.push();
+        let prev = self.input_disabled;
+        if !enabled {
+            self.color_filter(0.55, 0.55, 0.55, 1.0);
+            self.input_disabled = true;
+        } else {
+            // Absolute: re-enable even inside an enclosing disabled scope.
+            self.input_disabled = false;
+        }
+        f(self);
+        self.input_disabled = prev;
+        self.pop();
+    }
+
+    /// Equivalent to [`enabled_scope(false, …)`](Self::enabled_scope): gray-tint
+    /// and input-disable the whole subtree. Self-balancing (closure-scoped).
+    pub fn disabled_scope(&mut self, f: impl FnOnce(&mut UiContext<'a>)) {
+        self.enabled_scope(false, f);
     }
 
     /// Override a [`StyleKey`] for the widgets drawn under the current
@@ -792,6 +893,104 @@ impl<'a> UiContext<'a> {
     }
 
     // ------------------------------------------------------------------
+    // Non-interactive themed verbs (no input/state, theme for colours)
+    // ------------------------------------------------------------------
+
+    /// Draw a horizontal separator (a thin rule) and auto-advance by the border
+    /// width. Non-interactive — works in interactive mode only (theme is needed
+    /// for the line colour and thickness).
+    pub fn separator(&mut self) {
+        let theme = self.theme;
+        let overlay = self.style_stack.last().cloned();
+        let (theme, overlay) = match (theme, overlay) {
+            (Some(t), o) => (t, o),
+            _ => return,
+        };
+        let style = StyleResolver::with_overlay_opt(theme, overlay.as_ref());
+        let width = self.default_field_width();
+        let thickness = style.scalar(StyleKey::BorderWidth).max(1.0);
+        let rect = self.place_rect(width, thickness);
+        Separator::horizontal().draw(rect, self.backend.list_mut(), &style);
+        self.advance(thickness);
+    }
+
+    /// Draw a progress bar filled to `value` (0.0–1.0) and auto-advance by
+    /// `theme.input_height`. Non-interactive.
+    pub fn progress_bar(&mut self, value: f32, w: Option<f32>) {
+        let theme = self.theme;
+        let overlay = self.style_stack.last().cloned();
+        let (theme, overlay) = match (theme, overlay) {
+            (Some(t), o) => (t, o),
+            _ => return,
+        };
+        let style = StyleResolver::with_overlay_opt(theme, overlay.as_ref());
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let height = style.scalar(StyleKey::InputHeight);
+        let rect = self.place_rect(width, height);
+        ProgressBar::new(value).draw(rect, self.backend.list_mut(), &style);
+        self.advance(height);
+    }
+
+    /// Draw an inline banner (info/success/warning/error) with a required
+    /// message. Auto-advances by the banner's measured height at the placed
+    /// width. Non-interactive.
+    pub fn banner(&mut self, severity: Severity, message: &str, w: Option<f32>) {
+        let theme = self.theme;
+        let overlay = self.style_stack.last().cloned();
+        let (theme, overlay) = match (theme, overlay) {
+            (Some(t), o) => (t, o),
+            _ => return,
+        };
+        let style = StyleResolver::with_overlay_opt(theme, overlay.as_ref());
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let b = Banner::new(severity, message);
+        let h = {
+            let list = self.backend.list_mut();
+            b.measure_height(list, &style, width)
+        };
+        let rect = self.place_rect(width, h);
+        b.draw(rect, self.backend.list_mut(), &style);
+        self.advance(h);
+    }
+
+    /// Draw a titled group container of the given height and return the inner
+    /// content [`Rect`] the caller can lay children into. Non-interactive.
+    /// Auto-advances by the group's full height.
+    pub fn group_begin(&mut self, title: &str, w: Option<f32>, h: f32) -> Rect {
+        let theme = self.theme;
+        let overlay = self.style_stack.last().cloned();
+        let (theme, overlay) = match (theme, overlay) {
+            (Some(t), o) => (t, o),
+            _ => {
+                let p = self.cursor();
+                return Rect::new(p[0], p[1], 0.0, 0.0);
+            }
+        };
+        let style = StyleResolver::with_overlay_opt(theme, overlay.as_ref());
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let rect = self.place_rect(width, h);
+        let content = Group::new(title).draw(rect, self.backend.list_mut(), &style);
+        self.advance(h);
+        content
+    }
+
+    /// Draw a panel (background + border, no header) at the layout cursor and
+    /// auto-advance by its height. Non-interactive.
+    pub fn panel(&mut self, w: Option<f32>, h: f32) {
+        let theme = self.theme;
+        let overlay = self.style_stack.last().cloned();
+        let (theme, overlay) = match (theme, overlay) {
+            (Some(t), o) => (t, o),
+            _ => return,
+        };
+        let style = StyleResolver::with_overlay_opt(theme, overlay.as_ref());
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let rect = self.place_rect(width, h);
+        Panel::draw_at(rect, self.backend.list_mut(), &style);
+        self.advance(h);
+    }
+
+    // ------------------------------------------------------------------
     // Interactive verbs (require `UiContext::interactive[_layers]`)
     // ------------------------------------------------------------------
 
@@ -814,15 +1013,32 @@ impl<'a> UiContext<'a> {
         }
     }
 
+    /// Return the input clone an interactive verb should hand its widget: the raw
+    /// input normally, or a fully-inert [`InputState::consumed()`] clone when the
+    /// context is inside a [`disabled_scope`](Self::disabled_scope) /
+    /// [`enabled_scope(false, …)`](Self::enabled_scope). The mouse position is
+    /// preserved (so hit tests still resolve geometry) but every event edge and
+    /// the `mouse_consumed` flag are neutralised, so no widget reacts.
+    fn effective_input(&self, input: &InputState) -> InputState {
+        if self.input_disabled {
+            input.consumed()
+        } else {
+            input.clone()
+        }
+    }
+
     /// Un-apply the active transform from a placed world rect (and map the mouse
     /// the same way) so a raw widget — which re-applies the active transform via
     /// the `DrawList` — lands back at `world` on screen, and its
     /// `rect.contains(mouse)` hit test matches the on-screen position. `inv` is
     /// the inverse of the active affine.
-    fn localize(inv: Affine2, world: Rect, input: &InputState) -> (Rect, InputState) {
+    ///
+    /// The per-widget input clone routes through [`effective_input`](Self::effective_input),
+    /// so a call inside a disabled scope yields an inert input.
+    fn localize(&self, inv: Affine2, world: Rect, input: &InputState) -> (Rect, InputState) {
         let local = inv.transform_rect_aabb(world);
         let [mx, my] = inv.transform_point([input.mouse_x, input.mouse_y]);
-        let mut li = input.clone();
+        let mut li = self.effective_input(input);
         li.mouse_x = mx;
         li.mouse_y = my;
         (local, li)
@@ -893,7 +1109,7 @@ impl<'a> UiContext<'a> {
         let height = h.unwrap_or(theme.button_height);
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
+        let (local, local_input) = self.localize(inv, world, input);
         // Auto-assign a focus id so the button is Tab-reachable + Space/Enter
         // activatable without changing the verb's signature.
         let fid = self
@@ -940,7 +1156,8 @@ impl<'a> UiContext<'a> {
         // and HitZone never re-applies a draw transform, so we test the world
         // rect against the raw screen-space pointer directly (no `localize`).
         let world = self.place_rect(width, h);
-        let out = HitZone::new().test(world, input);
+        let local_input = self.effective_input(input);
+        let out = HitZone::new().test(world, &local_input);
         self.advance(h);
         out
     }
@@ -953,7 +1170,10 @@ impl<'a> UiContext<'a> {
     /// [`InputState::mouse_consumed`].
     pub fn hit_zone_at(&self, rect: Rect) -> HitZoneOutput {
         match self.input {
-            Some(input) => HitZone::new().test(rect, input),
+            Some(input) => {
+                let local_input = self.effective_input(input);
+                HitZone::new().test(rect, &local_input)
+            }
             None => {
                 debug_assert!(
                     false,
@@ -978,7 +1198,7 @@ impl<'a> UiContext<'a> {
         let height = theme.input_height;
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
+        let (local, local_input) = self.localize(inv, world, input);
         let new_value = {
             // Disjoint field borrows: `self.backend` (list) and `self.state`'s
             // `drag`/`focus` fields (the slider needs the drag arbiter; the
@@ -1017,7 +1237,7 @@ impl<'a> UiContext<'a> {
         let width = self.default_field_width();
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
+        let (local, local_input) = self.localize(inv, world, input);
         let fid = self
             .state
             .as_mut()
@@ -1064,7 +1284,7 @@ impl<'a> UiContext<'a> {
         let width = self.default_field_width();
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
+        let (local, local_input) = self.localize(inv, world, input);
         let fid = self
             .state
             .as_mut()
@@ -1141,7 +1361,7 @@ impl<'a> UiContext<'a> {
         let height = theme.input_height;
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
+        let (local, local_input) = self.localize(inv, world, input);
         let changed = {
             // Disjoint field borrows: `self.backend` (list) and `self.state`.
             let list = self.backend.list_mut();
@@ -1214,7 +1434,7 @@ impl<'a> UiContext<'a> {
         let height = (rows.max(1) as f32) * line_height + theme.padding * 2.0;
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
+        let (local, local_input) = self.localize(inv, world, input);
         let changed = {
             let list = self.backend.list_mut();
             let state = match self.state.as_mut() {
@@ -1292,7 +1512,7 @@ impl<'a> UiContext<'a> {
         let height = theme.input_height;
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
+        let (local, local_input) = self.localize(inv, world, input);
         let changed = {
             let list = self.backend.list_mut();
             let state = match self.state.as_mut() {
@@ -1354,7 +1574,7 @@ impl<'a> UiContext<'a> {
         let depth = self.tree_depth;
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
-        let (local, local_input) = Self::localize(inv, world, input);
+        let (local, local_input) = self.localize(inv, world, input);
         // The whole tree is one Tab stop: wire its focus id and register it in
         // the ring exactly once per frame (the first row drawn).
         if let Some(s) = self.state.as_mut() {
@@ -1436,6 +1656,293 @@ impl<'a> UiContext<'a> {
     /// returned an expanded node.
     pub fn tree_pop(&mut self) {
         self.tree_depth = self.tree_depth.saturating_sub(1);
+    }
+
+    /// Draw a row of tab buttons. Returns `Some(index)` when a tab was clicked
+    /// this frame (the caller updates `active`). Auto-advances by the tab height.
+    pub fn tabs(&mut self, labels: &[&str], active: usize) -> Option<usize> {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return None,
+        };
+        let width = self.default_field_width();
+        let tab_height = theme.font_size + theme.padding * 2.0;
+        let world = self.place_rect(width, tab_height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = self.localize(inv, world, input);
+        let clicked = {
+            let list = self.backend.list_mut();
+            let style = StyleResolver::with_overlay_opt(
+                theme,
+                self.style_stack.last(),
+            );
+            let anim = self.state.as_mut().map(|s| &mut s.anim);
+            Tabs::new(labels)
+                .with_height(tab_height)
+                .draw(local, active, list, &style, &local_input, anim)
+                .clicked
+        };
+        self.advance(tab_height);
+        clicked
+    }
+
+    /// Draw an image button (by atlas key) and return true if clicked.
+    /// `w`/`h` are the natural image size. Auto-advances by `h`.
+    pub fn image_button_key(&mut self, key: &str, w: f32, h: f32) -> bool {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return false,
+        };
+        let world = self.place_rect(w, h);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = self.localize(inv, world, input);
+        let clicked = {
+            let list = self.backend.list_mut();
+            let style = StyleResolver::with_overlay_opt(
+                theme,
+                self.style_stack.last(),
+            );
+            ImageButton::key(key)
+                .natural_size(w, h)
+                .draw(local, list, &style, &local_input)
+        };
+        self.advance(h);
+        clicked
+    }
+
+    /// Draw an image button from a pre-resolved [`SpriteId`] and return true if
+    /// clicked. `w`/`h` are the natural image size. Auto-advances by `h`.
+    pub fn image_button_sprite(&mut self, sprite: SpriteId, w: f32, h: f32) -> bool {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return false,
+        };
+        let world = self.place_rect(w, h);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = self.localize(inv, world, input);
+        let clicked = {
+            let list = self.backend.list_mut();
+            let style = StyleResolver::with_overlay_opt(
+                theme,
+                self.style_stack.last(),
+            );
+            ImageButton::sprite(sprite)
+                .natural_size(w, h)
+                .draw(local, list, &style, &local_input)
+        };
+        self.advance(h);
+        clicked
+    }
+
+    /// Draw a color picker for `hsva`, returning the (possibly updated) color.
+    /// `id` is a stable [`DragId`] that arbitrates drag ownership across the
+    /// picker's sub-regions (SV square, hue bar, alpha bar). Auto-advances by
+    /// the picker's height.
+    pub fn color_picker(
+        &mut self,
+        id: DragId,
+        hsva: &mut Hsva,
+        w: Option<f32>,
+    ) -> ColorPickerOutput {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => {
+                return ColorPickerOutput {
+                    hsva: *hsva,
+                    rgba: [hsva.h, hsva.s, hsva.v, hsva.a],
+                    changed: false,
+                    dragging: false,
+                }
+            }
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        // Pick a square height that gives room for the SV field + hue bar + gap.
+        let height = width * 0.75 + theme.input_height + theme.spacing;
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = self.localize(inv, world, input);
+        let out = {
+            let list = self.backend.list_mut();
+            let state = match self.state.as_mut() {
+                Some(s) => s,
+                None => {
+                    debug_assert!(false, "UiContext::color_picker requires interactive state");
+                    return ColorPickerOutput {
+                        hsva: *hsva,
+                        rgba: [hsva.h, hsva.s, hsva.v, hsva.a],
+                        changed: false,
+                        dragging: false,
+                    };
+                }
+            };
+            let UiState { drag, focus, .. } = &mut **state;
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"));
+            ColorPicker::new().draw(*hsva, id, drag, local, &mut ctx)
+        };
+        if out.changed {
+            *hsva = out.hsva;
+        }
+        self.advance(height);
+        out
+    }
+
+    /// Draw a drag handle (grab/move region) and report this frame's drag result.
+    /// `id` is a stable [`DragId`]; the handle claims the drag only when the
+    /// capture is free and the press lands on its rect. Auto-advances by `h`.
+    pub fn drag_handle(
+        &mut self,
+        id: DragId,
+        w: Option<f32>,
+        h: f32,
+    ) -> DragHandleOutput {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return DragHandleOutput::idle(),
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let world = self.place_rect(width, h);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = self.localize(inv, world, input);
+        let out = {
+            let list = self.backend.list_mut();
+            let state = match self.state.as_mut() {
+                Some(s) => s,
+                None => {
+                    debug_assert!(false, "UiContext::drag_handle requires interactive state");
+                    return DragHandleOutput::idle();
+                }
+            };
+            let UiState { drag, focus, .. } = &mut **state;
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"));
+            DragHandle::new().draw(id, drag, local, &mut ctx)
+        };
+        self.advance(h);
+        out
+    }
+
+    /// Begin a scrollable viewport. The caller must set
+    /// [`UiState::scroll.content_size`](ScrollState::content_size) **before**
+    /// calling this verb. Returns the inner content [`Rect`] for laying out
+    /// children. Close with [`scroll_end`](Self::scroll_end). Auto-advances by
+    /// `h`.
+    ///
+    /// ```ignore
+    /// ui.state.scroll.content_size = [200.0, 800.0];
+    /// let inner = ui.scroll_begin(None, 200.0);
+    /// // draw children into `inner` ...
+    /// ui.scroll_end();
+    /// ```
+    pub fn scroll_begin(&mut self, w: Option<f32>, h: f32) -> Rect {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => {
+                let p = self.cursor();
+                return Rect::new(p[0], p[1], 0.0, 0.0);
+            }
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let viewport = self.place_rect(width, h);
+        let sv = ScrollView::new(viewport);
+        let style = StyleResolver::with_overlay_opt(
+            theme,
+            self.style_stack.last(),
+        );
+        // Need a mutable InputState clone since ScrollView::begin takes &mut.
+        let mut local_input = self.effective_input(input);
+        let begun = {
+            let list = self.backend.list_mut();
+            let state = match self.state.as_mut() {
+                Some(s) => s,
+                None => {
+                    debug_assert!(false, "UiContext::scroll_begin requires interactive state");
+                    return Rect::new(viewport.x, viewport.y, 0.0, 0.0);
+                }
+            };
+            sv.begin(&mut state.scroll, list, &style, &mut local_input)
+        };
+        self.pending_scroll_viewport = Some(viewport);
+        self.pending_scroll_begin = Some(begun);
+        self.advance(h);
+        begun.inner
+    }
+
+    /// Close the most recent [`scroll_begin`](Self::scroll_begin): pop the
+    /// clip/transform and draw the scrollbars. Debug-asserts when called without
+    /// a matching `scroll_begin`.
+    pub fn scroll_end(&mut self) {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return,
+        };
+        let viewport = match self.pending_scroll_viewport.take() {
+            Some(v) => v,
+            None => {
+                debug_assert!(false, "UiContext::scroll_end called without a matching scroll_begin");
+                return;
+            }
+        };
+        let begun = match self.pending_scroll_begin.take() {
+            Some(b) => b,
+            None => {
+                debug_assert!(false, "UiContext::scroll_end called without a matching scroll_begin");
+                return;
+            }
+        };
+        let sv = ScrollView::new(viewport);
+        let style = StyleResolver::with_overlay_opt(
+            theme,
+            self.style_stack.last(),
+        );
+        let mut local_input = self.effective_input(input);
+        let list = self.backend.list_mut();
+        let state = match self.state.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        sv.end(&mut state.scroll, list, &style, &mut local_input, begun);
+    }
+
+    /// Draw a dropdown button showing `options[selected]`. Clicking the button
+    /// toggles the open option list (rendered separately via
+    /// [`UiState::push_dropdown_layer`] / [`UiState::draw_dropdown_layer`]).
+    /// The caller applies the selection returned by
+    /// [`draw_dropdown_layer`](UiState::draw_dropdown_layer). Auto-advances by
+    /// `theme.input_height`.
+    pub fn dropdown(
+        &mut self,
+        id: DropdownId,
+        options: &[&str],
+        selected: usize,
+        w: Option<f32>,
+    ) {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return,
+        };
+        let width = w.unwrap_or_else(|| self.default_field_width());
+        let height = theme.input_height;
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = self.localize(inv, world, input);
+        let _output = {
+            let list = self.backend.list_mut();
+            let state = match self.state.as_mut() {
+                Some(s) => s,
+                None => {
+                    debug_assert!(false, "UiContext::dropdown requires interactive state");
+                    return;
+                }
+            };
+            let UiState {
+                dropdowns, focus, ..
+            } = &mut **state;
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"));
+            Dropdown::new(options, selected).draw(id, local, dropdowns, &mut ctx)
+        };
+        self.advance(height);
     }
 
     /// Open a modal layer covering `rect`. Subsequent draw calls go to the
@@ -1653,6 +2160,83 @@ mod tests {
         assert!(approx(t[1], 0.25));
         assert!(approx(t[2], 0.25));
         assert!(approx(t[3], 1.0));
+    }
+
+    #[test]
+    fn disabled_scope_applies_gray_tint_and_restores_after() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        let before = ui.list().current_tint();
+        ui.disabled_scope(|ui| {
+            let t = ui.list().current_tint();
+            assert!(approx(t[0], 0.55) && approx(t[1], 0.55) && approx(t[2], 0.55));
+        });
+        // The scope self-balanced: tint is back to baseline.
+        let after = ui.list().current_tint();
+        assert_eq!(before, after, "tint restored after disabled_scope");
+    }
+
+    #[test]
+    fn disabled_scope_swallows_button_click() {
+        let theme = Theme::default();
+        let input = click_at(10.0, 10.0); // inside a 100x30 button at the origin
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        // Same button/click that returns `true` outside a scope — inert inside.
+        let mut clicked = false;
+        ui.disabled_scope(|ui| {
+            clicked = ui.text_button("OK", Some(100.0), Some(30.0));
+        });
+        assert!(!clicked, "button click is swallowed inside a disabled scope");
+    }
+
+    #[test]
+    fn disabled_scope_keeps_hit_zone_idle() {
+        let theme = Theme::default();
+        let input = click_at(10.0, 10.0);
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        ui.disabled_scope(|ui| {
+            let out = ui.hit_zone(Some(100.0), 30.0);
+            assert!(!out.hovered, "hit_zone does not hover inside a disabled scope");
+            assert!(!out.clicked, "hit_zone does not click inside a disabled scope");
+        });
+    }
+
+    #[test]
+    fn enabled_scope_re_enables_inside_disabled() {
+        let theme = Theme::default();
+        let input = click_at(10.0, 10.0);
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        // An enabled_scope(true) inside a disabled scope re-enables its body...
+        let mut clicked = false;
+        ui.disabled_scope(|ui| {
+            ui.enabled_scope(true, |ui| {
+                clicked = ui.text_button("OK", Some(100.0), Some(30.0));
+            });
+            assert!(clicked, "enabled_scope(true) re-enables inside a disabled scope");
+            // ...and restores the disabled state for siblings after it.
+            let also_clicked = ui.text_button("OK2", Some(100.0), Some(30.0));
+            assert!(!also_clicked, "disabled state is restored after the inner scope");
+        });
+    }
+
+    #[test]
+    fn enabled_scope_true_runs_normally_outside_any_scope() {
+        let theme = Theme::default();
+        let input = click_at(10.0, 10.0);
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        let mut clicked = false;
+        ui.enabled_scope(true, |ui| {
+            clicked = ui.text_button("OK", Some(100.0), Some(30.0));
+        });
+        assert!(clicked, "enabled_scope(true) is a no-op pass-through");
     }
 
     #[test]
@@ -2172,7 +2756,9 @@ mod tests {
         let mut input = InputState::default();
         input.mouse_x = 115.0;
         input.mouse_y = 64.0;
-        let (local, li) = UiContext::localize(inv, world, &input);
+        let mut list = DrawList::new();
+        let ui = UiContext::new(&mut list);
+        let (local, li) = ui.localize(inv, world, &input);
         assert!(approx(local.x, 10.0) && approx(local.y, 10.0));
         assert!(approx(li.mouse_x, 15.0) && approx(li.mouse_y, 14.0));
         // The mouse is inside the world rect, so it's inside the localized rect.
@@ -2187,7 +2773,9 @@ mod tests {
         let mut input = InputState::default();
         input.mouse_x = 12.0; // inside world
         input.mouse_y = 12.0;
-        let (local, li) = UiContext::localize(inv, world, &input);
+        let mut list = DrawList::new();
+        let ui = UiContext::new(&mut list);
+        let (local, li) = ui.localize(inv, world, &input);
         assert!(approx(local.x, 5.0) && approx(local.width, 10.0));
         assert!(local.contains(li.mouse_x, li.mouse_y));
     }

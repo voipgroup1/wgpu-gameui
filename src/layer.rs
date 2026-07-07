@@ -134,6 +134,13 @@ impl LayerStack {
         &self.base
     }
 
+    /// The base draw list's unique id ([`DrawList::id`]). The renderer keys its
+    /// "fresh stack every frame" footgun detector on this: a reused stack reports
+    /// the same id each frame, a per-frame-`new()`ed one reports a different id.
+    pub fn base_id(&self) -> u64 {
+        self.base.id()
+    }
+
     /// Mutably borrow the base draw list (lowest layer).
     pub fn base_mut(&mut self) -> &mut DrawList {
         &mut self.base

@@ -9,6 +9,17 @@ use crate::text::{FontHandle, FontSystemHandle, FontVMetrics, TextBlock, TextMea
 
 pub(crate) const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
 
+/// Monotonic source of per-`DrawList` identity. Each `DrawList` gets a unique,
+/// never-reused id at construction so the renderer can detect the "freshly
+/// constructed every frame" footgun (a per-frame-new list can never warm its
+/// text-measure cache — see [`crate::render`]'s stale-list detector).
+static NEXT_DRAW_LIST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate the next unique `DrawList` id.
+fn next_draw_list_id() -> u64 {
+    NEXT_DRAW_LIST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A colored vertex for triangle-based rendering.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -221,6 +232,10 @@ pub struct DrawList {
     /// Logged-once flag for "tried to draw rotated text" — glyphon does not
     /// support rotation, so we silently render axis-aligned.
     text_rotation_warned: bool,
+    /// Unique identity (see [`next_draw_list_id`]). Stable for this list's whole
+    /// lifetime and never reused; lets the renderer tell a reused list from a
+    /// per-frame-fresh one. `clear()` keeps it (the list is the same object).
+    id: u64,
 }
 
 impl Default for DrawList {
@@ -242,6 +257,7 @@ impl Default for DrawList {
             transform_stack: vec![Affine2::IDENTITY],
             tint_stack: vec![[1.0, 1.0, 1.0, 1.0]],
             text_rotation_warned: false,
+            id: next_draw_list_id(),
         }
     }
 }
@@ -285,7 +301,17 @@ impl DrawList {
             transform_stack: vec![Affine2::IDENTITY],
             tint_stack: vec![[1.0, 1.0, 1.0, 1.0]],
             text_rotation_warned: false,
+            id: next_draw_list_id(),
         }
+    }
+
+    /// This list's unique, lifetime-stable identity (preserved across
+    /// [`clear`](Self::clear)). Two distinct `DrawList`s never share an id, and
+    /// ids are never reused — so a caller that builds a fresh `DrawList` every
+    /// frame yields a different id each frame, which the renderer uses to flag the
+    /// "cache can never warm" footgun.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Clear all queued geometry/commands and reset the clip, transform, and

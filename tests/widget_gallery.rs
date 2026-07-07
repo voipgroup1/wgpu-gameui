@@ -811,6 +811,204 @@ fn render_widget_gallery() {
             vstate.end_frame();
         }
 
+        // enabled_scope(): an enabled block beside a disabled_scope block — same
+        // widgets, the right one grayed and inert. Visual check for the dim tint.
+        {
+            let r = flow.cell(list, "enabled_scope() / disabled_scope()", 200.0, 96.0);
+            let mut estate = UiState::new();
+            estate.begin_frame(&mut input, &theme, 0.0, &wgpu_gameui::ManualNav);
+            list.push_transform();
+            {
+                let mut ui = UiContext::interactive(list, &input, &mut estate, &theme);
+                ui.translate(r.x, r.y);
+                // Enabled block: a button + checkbox at full colour.
+                ui.text_button("Enabled", Some(200.0), None);
+                let _ = ui.checkbox("on", true);
+                // Disabled block: same widgets, grayed + inert.
+                ui.disabled_scope(|ui| {
+                    ui.text_button("Disabled", Some(200.0), None);
+                    let _ = ui.checkbox("off", true);
+                });
+            }
+            list.pop_transform();
+            estate.end_frame();
+        }
+
+        // ---- Non-interactive themed verbs --------------------------------
+        {
+            let r = flow.cell(list, "separator()", 200.0, 12.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                ui.translate(r.x, r.y);
+                ui.separator();
+            }
+            list.pop_transform();
+        }
+
+        {
+            let r = flow.cell(list, "progress_bar()", 200.0, 30.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                ui.translate(r.x, r.y);
+                ui.progress_bar(0.65, Some(200.0));
+            }
+            list.pop_transform();
+        }
+
+        {
+            let r = flow.cell(list, "banner()", 200.0, 50.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                ui.translate(r.x, r.y);
+                ui.banner(Severity::Warning, "Banner message", Some(200.0));
+            }
+            list.pop_transform();
+        }
+
+        {
+            let r = flow.cell(list, "group_begin()", 200.0, 80.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                ui.translate(r.x, r.y);
+                let inner = ui.group_begin("Group Title", Some(200.0), 80.0);
+                // Place a small text label inside the group
+                ui.push();
+                ui.translate(inner.x - r.x, inner.y - r.y);
+                ui.text("Content");
+                ui.pop();
+            }
+            list.pop_transform();
+        }
+
+        {
+            let r = flow.cell(list, "panel()", 200.0, 50.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                ui.translate(r.x, r.y);
+                ui.panel(Some(200.0), 50.0);
+                ui.push();
+                ui.text("Inside panel");
+                ui.pop();
+            }
+            list.pop_transform();
+        }
+
+        // ---- More interactive verbs --------------------------------------
+        {
+            let r = flow.cell(list, "tabs()", 240.0, 32.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                vstate.begin_frame(&mut input, &theme, 0.0, &wgpu_gameui::ManualNav);
+                {
+                    let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                    ui.translate(r.x, r.y);
+                    let _ = ui.tabs(&["Tab A", "Tab B", "Tab C"], 0);
+                }
+                vstate.end_frame();
+            }
+            list.pop_transform();
+        }
+
+        {
+            let r = flow.cell(list, "image_button_key()", 40.0, 40.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                ui.translate(r.x, r.y);
+                // Use the phosphor icon key present in the gallery renderer
+                let _ = ui.image_button_key("eye", 32.0, 32.0);
+            }
+            list.pop_transform();
+        }
+
+        {
+            let r = flow.cell(list, "color_picker()", 200.0, 180.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                vstate.begin_frame(&mut input, &theme, 0.0, &wgpu_gameui::ManualNav);
+                {
+                    let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                    ui.translate(r.x, r.y);
+                    let mut hsva = Hsva { h: 200.0, s: 0.8, v: 0.9, a: 1.0 };
+                    let _ = ui.color_picker(100, &mut hsva, Some(200.0));
+                }
+                vstate.end_frame();
+            }
+            list.pop_transform();
+        }
+
+        {
+            let r = flow.cell(list, "drag_handle()", 200.0, 24.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                vstate.begin_frame(&mut input, &theme, 0.0, &wgpu_gameui::ManualNav);
+                {
+                    let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                    ui.translate(r.x, r.y);
+                    let _ = ui.drag_handle(200, Some(200.0), 24.0);
+                }
+                vstate.end_frame();
+            }
+            list.pop_transform();
+        }
+
+        {
+            let r = flow.cell(list, "scroll_begin()/end()", 200.0, 100.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                vstate.begin_frame(&mut input, &theme, 0.0, &wgpu_gameui::ManualNav);
+                // The content is taller than the viewport, so scrollbars appear.
+                vstate.scroll.content_size = [200.0, 200.0];
+                {
+                    let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                    ui.translate(r.x, r.y);
+                    let inner = ui.scroll_begin(Some(200.0), 100.0);
+                    ui.push();
+                    ui.translate(inner.x - r.x, inner.y - r.y);
+                    ui.text("Row 1");
+                    ui.text("Row 2");
+                    ui.text("Row 3");
+                    ui.text("Row 4");
+                    ui.text("Row 5");
+                    ui.pop();
+                    ui.scroll_end();
+                }
+                vstate.end_frame();
+            }
+            list.pop_transform();
+        }
+
+        {
+            let r = flow.cell(list, "dropdown()", 160.0, 30.0);
+            list.push_transform();
+            {
+                let mut vstate = UiState::new();
+                vstate.begin_frame(&mut input, &theme, 0.0, &wgpu_gameui::ManualNav);
+                {
+                    let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
+                    ui.translate(r.x, r.y);
+                    ui.dropdown(300, &["Alpha", "Beta", "Gamma"], 0, Some(160.0));
+                }
+                vstate.end_frame();
+            }
+            list.pop_transform();
+        }
+
         // ---- Widgets ----------------------------------------------------
         flow.section(list, "Widgets");
 
@@ -1013,6 +1211,47 @@ fn render_widget_gallery() {
                         600.0,
                     ),
                 );
+        }
+
+        // Number input with a custom formatter: zero-padded HH:MM fields, the
+        // shape a daily-summary time picker needs. Both fields are unfocused so
+        // the formatter owns the displayed text ("07" / "30", not "7" / "30").
+        let r = flow.cell(list, "Number input (zero-pad HH:MM)", 150.0, 28.0);
+        {
+            let num_input = InputState::default();
+            let mut num_focus = FocusState::new();
+            num_focus.begin_frame(&num_input);
+            let hh = |v: f64| format!("{:02}", v.round() as i64);
+            let colon_w = 8.0;
+            let field_w = (r.width - colon_w) / 2.0;
+            let hh_rect = Rect::new(r.x, r.y, field_w, r.height);
+            let mm_rect = Rect::new(r.x + field_w + colon_w, r.y, field_w, r.height);
+            let mut hh_field = TextInput::new(hh_rect.x, hh_rect.y, hh_rect.width, hh_rect.height);
+            let mut mm_field = TextInput::new(mm_rect.x, mm_rect.y, mm_rect.width, mm_rect.height);
+            let mut draw = |id, value, field, rect| {
+                NumberInput::new()
+                    .with_range(0.0, 59.0)
+                    .with_step(1.0)
+                    .with_formatter(hh)
+                    .draw(
+                        value,
+                        id,
+                        field,
+                        rect,
+                        &mut DrawContext::new(
+                            list,
+                            &mut num_focus,
+                            &theme,
+                            &num_input,
+                            W as f32,
+                            600.0,
+                        ),
+                    )
+            };
+            draw(203, 7.0, &mut hh_field, hh_rect);
+            draw(204, 30.0, &mut mm_field, mm_rect);
+            // The ":" separator between the two fields.
+            list.text(TextBlock::new(":", r.x + field_w, r.y + 4.0).with_size(theme.font_size));
         }
 
         // Tree view (outliner): a seeded hierarchy — an expanded branch with

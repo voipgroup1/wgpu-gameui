@@ -76,6 +76,10 @@ struct StoredSprite {
     region: AtlasRegion,
     /// Sprite RGBA8 pixels (region.w * region.h * 4) — content only, no halo.
     pixels: Vec<u8>,
+    /// The name this sprite was inserted under, if any. Kept so [`SpriteAtlas::remove`]
+    /// can clear the [`name_to_id`](SpriteAtlas::name_to_id) entry in O(1) without a
+    /// reverse index.
+    name: Option<String>,
 }
 
 /// Dynamic atlas. CPU-side state is the source of truth; the GPU texture is
@@ -85,7 +89,16 @@ pub struct SpriteAtlas {
     height: u32,
     shelves: Vec<Shelf>,
     next_shelf_y: u32,
-    sprites: Vec<StoredSprite>,
+    /// Indexed by `SpriteId`. `None` slots are **tombstones** — sprites that were
+    /// [`remove`](Self::remove)d. The slot index is the sprite's permanent id, so
+    /// removing a sprite never shifts or renumbers the others (live `SpriteId`s
+    /// held elsewhere stay valid). Tombstone slots are recycled by [`insert`](Self::insert)
+    /// via [`free_list`](Self::free_list "structfield"), and their shelf footprint
+    /// is reclaimed by [`compact`](Self::compact).
+    sprites: Vec<Option<StoredSprite>>,
+    /// Tombstoned slot indices available for reuse by [`insert`](Self::insert),
+    /// keeping the `sprites` `Vec` from growing without bound under churn.
+    free_list: Vec<SpriteId>,
     name_to_id: HashMap<String, SpriteId>,
     dirty: bool,
 }
@@ -99,6 +112,7 @@ impl SpriteAtlas {
             shelves: Vec::new(),
             next_shelf_y: 0,
             sprites: Vec::new(),
+            free_list: Vec::new(),
             name_to_id: HashMap::new(),
             dirty: true,
         }
@@ -114,18 +128,26 @@ impl SpriteAtlas {
         self.height
     }
 
-    /// The content region for a sprite id, or `None` if the id is unknown.
+    /// The content region for a sprite id, or `None` if the id is unknown (out
+    /// of range) or the slot has been [`remove`](Self::remove)d (tombstoned).
     pub fn region(&self, id: SpriteId) -> Option<AtlasRegion> {
-        self.sprites.get(id as usize).map(|s| s.region)
+        self.sprites
+            .get(id as usize)
+            .and_then(|slot| slot.as_ref().map(|s| s.region))
     }
 
-    /// Look up a sprite id by the name it was inserted under.
+    /// Look up a sprite id by the name it was inserted under. Returns `None` for
+    /// a name whose sprite was [`remove`](Self::remove)d.
     pub fn id_for(&self, name: &str) -> Option<SpriteId> {
         self.name_to_id.get(name).copied()
     }
 
     /// Insert a sprite. Returns its new id. Panics if the sprite cannot fit even
     /// after growing to MAX_ATLAS_SIZE — UI atlases shouldn't hit that.
+    ///
+    /// A previously [`remove`](Self::remove)d slot is recycled if one is
+    /// available, so the `SpriteId` space does not grow without bound under
+    /// load-then-unload churn.
     pub fn insert(&mut self, name: Option<&str>, w: u32, h: u32, pixels: &[u8]) -> SpriteId {
         assert_eq!(
             pixels.len(),
@@ -146,16 +168,107 @@ impl SpriteAtlas {
             }
         };
 
-        let id = self.sprites.len() as SpriteId;
-        self.sprites.push(StoredSprite {
+        let stored = StoredSprite {
             region,
             pixels: pixels.to_vec(),
-        });
+            name: name.map(|n| n.to_string()),
+        };
+        // Reuse a tombstoned slot if one is free; otherwise append. Either way the
+        // slot index is the sprite's stable id.
+        let id = if let Some(recycled) = self.free_list.pop() {
+            self.sprites[recycled as usize] = Some(stored);
+            recycled
+        } else {
+            let id = self.sprites.len() as SpriteId;
+            self.sprites.push(Some(stored));
+            id
+        };
         if let Some(name) = name {
             self.name_to_id.insert(name.to_string(), id);
         }
         self.dirty = true;
         id
+    }
+
+    /// Drop a sprite by id, tombstoning its slot so the index can be recycled by
+    /// a later [`insert`](Self::insert) and its shelf footprint reclaimed by
+    /// [`compact`](Self::compact). Frees the CPU-side pixel buffer immediately;
+    /// the GPU texture is re-uploaded (without this sprite's pixels) on the next
+    /// render because this sets the dirty flag.
+    ///
+    /// Returns `true` if the sprite was present and removed, `false` if the id is
+    /// out of range or already a tombstone. The sprite's name (if any) is cleared
+    /// from the name map, so [`id_for`](Self::id_for) no longer resolves it.
+    ///
+    /// **SpriteId stability:** this never shifts or renumbers other sprites. Any
+    /// live `SpriteId` issued before this call remains valid; only the removed id
+    /// becomes a tombstone (its [`region`](Self::region) now returns `None`).
+    pub fn remove(&mut self, id: SpriteId) -> bool {
+        let Some(slot) = self.sprites.get_mut(id as usize) else {
+            return false;
+        };
+        let Some(stored) = slot.take() else {
+            return false; // already a tombstone
+        };
+        if let Some(name) = &stored.name {
+            // Only clear the map entry if it still points at us (a name reuse via
+            // insert would have overwritten it to a different id).
+            if self.name_to_id.get(name).copied() == Some(id) {
+                self.name_to_id.remove(name);
+            }
+        }
+        self.free_list.push(id);
+        self.dirty = true;
+        true
+    }
+
+    /// Reclaim shelf fragmentation left by [`remove`](Self::remove) by repacking
+    /// every live sprite into fresh contiguous shelves, preserving each sprite's
+    /// `SpriteId` (index). Tombstoned slots are skipped and keep their index (a
+    /// later [`insert`](Self::insert) recycles them).
+    ///
+    /// Safe to call at any time: atlas regions are pixel rects re-derived into
+    /// UVs every render frame, and a dirty atlas triggers a full GPU re-upload,
+    /// so reassigning regions here is picked up automatically — exactly the
+    /// invariant [`try_grow`](Self::try_grow "method") already relies on. Idempotent
+    /// when there are no tombstones.
+    pub fn compact(&mut self) {
+        // Nothing to reclaim if nothing was ever removed.
+        if self.free_list.is_empty() {
+            return;
+        }
+        // Snapshot the live sprites (index + dims) up front: repacking mutates
+        // `self` (the shelves), which would alias a live iterator over
+        // `self.sprites`. Owned data here, no outstanding borrow in the loop.
+        let live: Vec<(SpriteId, u32, u32)> = self
+            .sprites
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                slot.as_ref().map(|s| (i as SpriteId, s.region.w, s.region.h))
+            })
+            .collect();
+
+        self.shelves.clear();
+        self.next_shelf_y = 0;
+        for (id, w, h) in live {
+            let region = loop {
+                if let Some(r) = self.try_place(w, h) {
+                    break r;
+                }
+                if !self.try_grow() {
+                    // Shouldn't happen — the live set fit before compaction — but
+                    // guard rather than silently drop a sprite.
+                    panic!(
+                        "sprite {}x{} doesn't fit during atlas compaction at max size {}",
+                        w, h, MAX_ATLAS_SIZE
+                    );
+                }
+            };
+            // The slot is still live (compaction doesn't tombstone anything).
+            self.sprites[id as usize].as_mut().unwrap().region = region;
+        }
+        self.dirty = true;
     }
 
     fn try_place(&mut self, w: u32, h: u32) -> Option<AtlasRegion> {
@@ -240,7 +353,10 @@ impl SpriteAtlas {
             buf[off..off + 4].copy_from_slice(src);
         };
 
-        for sprite in &self.sprites {
+        for slot in &self.sprites {
+            let Some(sprite) = slot else {
+                continue; // tombstone — contributes no pixels
+            };
             let r = sprite.region;
             let row_bytes = (r.w * 4) as usize;
 
@@ -459,5 +575,135 @@ mod tests {
         for col in 0..r.w {
             assert_eq!(read(r.x + col, r.y - 1), red);
         }
+    }
+
+    #[test]
+    fn remove_tombstones_slot_and_clears_name() {
+        let mut atlas = SpriteAtlas::new();
+        let pixels = vec![0u8; 8 * 8 * 4];
+        let a = atlas.insert(Some("a"), 8, 8, &pixels);
+        let b = atlas.insert(Some("b"), 8, 8, &pixels);
+
+        // Removing `a` tombstones its slot and clears its name.
+        assert!(atlas.remove(a));
+        assert_eq!(atlas.region(a), None, "tombstoned slot region is None");
+        assert_eq!(
+            atlas.id_for("a"),
+            None,
+            "name map entry for removed sprite is cleared"
+        );
+        // The other sprite is untouched — its id still resolves.
+        let rb = atlas.region(b);
+        assert!(rb.is_some(), "unrelated sprite id stays valid");
+        assert_eq!(atlas.id_for("b"), Some(b));
+
+        // Removing an out-of-range id or an already-tombstoned slot is a no-op.
+        assert!(!atlas.remove(a), "re-removing a tombstone is a no-op");
+        assert!(!atlas.remove(9999), "out-of-range id is a no-op");
+    }
+
+    #[test]
+    fn slot_reuse_after_remove() {
+        let mut atlas = SpriteAtlas::new();
+        let pixels = vec![1u8; 8 * 8 * 4];
+        let a = atlas.insert(Some("a"), 8, 8, &pixels);
+
+        assert!(atlas.remove(a));
+
+        // The next insert recycles `a`'s tombstoned slot rather than appending a
+        // new index — so the SpriteId space does not grow under churn.
+        let b = atlas.insert(Some("b"), 8, 8, &pixels);
+        assert_eq!(b, a, "tombstoned slot index is recycled");
+        assert!(atlas.region(b).is_some());
+        assert_eq!(atlas.id_for("b"), Some(b));
+        assert_eq!(atlas.id_for("a"), None, "old name not resurrected");
+    }
+
+    #[test]
+    fn compact_preserves_ids_and_reclaims_shelf_footprint() {
+        // 256x256 sprites have a 258x258 cell; at the initial 1024 atlas only
+        // floor(1024/258) = 3 shelves fit, so a 4th forces a grow to 2048.
+        let mut atlas = SpriteAtlas::new();
+        let big = 256u32;
+        let pixels = vec![0u8; (big * big * 4) as usize];
+        let ids: Vec<_> = (0..4).map(|_| atlas.insert(None, big, big, &pixels)).collect();
+        let footprint_before = atlas.next_shelf_y;
+
+        // Remove two of the four, leaving shelf fragmentation (the shelf cursor
+        // doesn't rewind on remove).
+        assert!(atlas.remove(ids[0]));
+        assert!(atlas.remove(ids[2]));
+        let live: Vec<_> = [ids[1], ids[3]].into_iter().collect();
+
+        atlas.compact();
+
+        // All live ids still resolve (index stability — the whole point), with
+        // valid, disjoint regions.
+        let regions: Vec<_> = live.iter().map(|id| atlas.region(*id).unwrap()).collect();
+        for r in &regions {
+            assert_eq!(r.w, big);
+            assert_eq!(r.h, big);
+        }
+        for i in 0..regions.len() {
+            for j in (i + 1)..regions.len() {
+                let a = regions[i];
+                let b = regions[j];
+                let separate = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y
+                    || b.y + b.h <= a.y;
+                assert!(separate, "compacted regions overlap: {a:?} vs {b:?}");
+            }
+        }
+        // The two remaining sprites now pack onto a single shelf, so the shelf
+        // footprint (next_shelf_y) shrank dramatically — this is the reclamation.
+        assert!(
+            atlas.next_shelf_y < footprint_before,
+            "compaction should reclaim shelf footprint: {} -> {}",
+            footprint_before,
+            atlas.next_shelf_y
+        );
+        assert_eq!(
+            atlas.next_shelf_y, 258,
+            "two 258-tall cells pack onto one shelf after compaction"
+        );
+    }
+
+    #[test]
+    fn compact_is_noop_without_tombstones() {
+        let mut atlas = SpriteAtlas::new();
+        let pixels = vec![0u8; 8 * 8 * 4];
+        let id = atlas.insert(Some("x"), 8, 8, &pixels);
+        let region_before = atlas.region(id).unwrap();
+        // No tombstones → compaction does nothing (and must not corrupt state).
+        atlas.compact();
+        assert_eq!(
+            atlas.region(id).unwrap(),
+            region_before,
+            "compaction with no tombstones leaves regions untouched"
+        );
+    }
+
+    #[test]
+    fn build_pixel_buffer_skips_tombstones() {
+        // A removed sprite must not bleed its stale pixels into the rebuilt
+        // atlas texture: its old content area should be zeroed after re-upload.
+        let mut atlas = SpriteAtlas::new();
+        let red = [255u8, 0, 0, 255];
+        let red_pixels: Vec<u8> = red.repeat(8 * 8);
+        let id = atlas.insert(Some("red"), 8, 8, &red_pixels);
+        let region = atlas.region(id).unwrap();
+
+        assert!(atlas.remove(id));
+        let buf = atlas.build_pixel_buffer();
+        let stride = (atlas.width() * 4) as usize;
+        let read = |x: u32, y: u32| -> [u8; 4] {
+            let off = (y as usize) * stride + (x as usize) * 4;
+            [buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]
+        };
+        // The content area where red lived is now transparent (zeroed).
+        assert_eq!(read(region.x, region.y), [0, 0, 0, 0]);
+        assert_eq!(
+            read(region.x + region.w - 1, region.y + region.h - 1),
+            [0, 0, 0, 0]
+        );
     }
 }

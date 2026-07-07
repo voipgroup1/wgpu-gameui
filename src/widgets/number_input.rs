@@ -108,6 +108,12 @@ pub struct NumberInput {
     step_buttons: bool,
     wheel_step: bool,
     arrow_step: bool,
+    /// Optional display formatter overriding the default (`format_value`), e.g.
+    /// zero-padding `7` → `"07"` for an hour field.
+    formatter: Option<fn(f64) -> String>,
+    /// Optional parse-back from edited text. When set, the default numeric
+    /// `sanitize`/`parse` path is bypassed and this owns validation.
+    parser: Option<fn(&str) -> Option<f64>>,
 }
 
 impl Default for NumberInput {
@@ -127,6 +133,8 @@ impl NumberInput {
             step_buttons: true,
             wheel_step: true,
             arrow_step: true,
+            formatter: None,
+            parser: None,
         }
     }
 
@@ -172,8 +180,55 @@ impl NumberInput {
         self
     }
 
+    /// Custom display formatter, overriding the default (`format_value`).
+    ///
+    /// Use this for fixed-width fields the default formatter can't express —
+    /// e.g. zero-padding an hour field: `format!("{:02}", value.round() as i64)`
+    /// renders `7` as `"07"`. The formatter is applied whenever the value owns
+    /// the text (not editing, just stepped, or on `Enter`).
+    ///
+    /// Pair with [`with_parser`](Self::with_parser) if the displayed text is not
+    /// trivially `f64`-parseable; with only a formatter set, the default
+    /// sanitize + `parse::<f64>()` path still applies (which is correct for
+    /// zero-padded numeric output like `"07"`).
+    pub fn with_formatter(mut self, formatter: fn(f64) -> String) -> Self {
+        self.formatter = Some(formatter);
+        self
+    }
+
+    /// Custom parse-back from edited text. When set, the default numeric
+    /// [`sanitize`](sanitize_numeric) + `parse::<f64>()` path is **bypassed** —
+    /// this parser owns validation, returning `None` to leave the value
+    /// untouched mid-edit (mirroring the default's handling of partial states
+    /// like `""` or `"-"`).
+    ///
+    /// Only needed when the display text is not directly `f64`-parseable (e.g. a
+    /// formatter that injects units or separators). For zero-padded numeric
+    /// fields (`"07"`), the default parse handles it — formatter alone suffices.
+    pub fn with_parser(mut self, parser: fn(&str) -> Option<f64>) -> Self {
+        self.parser = Some(parser);
+        self
+    }
+
     fn clamp(&self, v: f64) -> f64 {
         v.clamp(self.min, self.max)
+    }
+
+    /// Format `value` for display: custom formatter if set, else the default.
+    fn display_value(&self, value: f64) -> String {
+        match self.formatter {
+            Some(f) => f(value),
+            None => format_value(value, self.decimals),
+        }
+    }
+
+    /// Parse edited text back to a value: custom parser if set, else default
+    /// `f64` parse. `None` for a partial/non-parseable edit.
+    fn parse_value(&self, text: &str) -> Option<f64> {
+        match self.parser {
+            Some(p) => p(text),
+            None => text.parse::<f64>().ok(),
+        }
     }
 
     /// Draw the spin box. `ti` carries the persistent text-edit state; its
@@ -294,7 +349,7 @@ impl NumberInput {
 
         // 2. When not editing (or just stepped), the value owns the text.
         if !was_focused || stepped {
-            let formatted = format_value(value, self.decimals);
+            let formatted = self.display_value(value);
             if ti.value != formatted {
                 ti.value = formatted;
                 ti.cursor_pos = ti.value.len();
@@ -311,21 +366,25 @@ impl NumberInput {
         ti.draw(id, ctx);
 
         // 4. While focused, sanitise + parse the edited text into the value.
+        //    A custom parser owns validation entirely (sanitize is bypassed);
+        //    otherwise the default sanitize + parse path applies.
         if ctx.focus.is_focused(id) {
-            let (clean, cur) = sanitize_numeric(&ti.value, ti.cursor_pos, allow_decimal);
-            if clean != ti.value {
-                ti.value = clean;
-                ti.cursor_pos = cur.min(ti.value.len());
-                if ti.selection_start.is_some_and(|s| s > ti.value.len()) {
-                    ti.selection_start = None;
+            if self.parser.is_none() {
+                let (clean, cur) = sanitize_numeric(&ti.value, ti.cursor_pos, allow_decimal);
+                if clean != ti.value {
+                    ti.value = clean;
+                    ti.cursor_pos = cur.min(ti.value.len());
+                    if ti.selection_start.is_some_and(|s| s > ti.value.len()) {
+                        ti.selection_start = None;
+                    }
                 }
             }
-            if let Ok(parsed) = ti.value.parse::<f64>() {
+            if let Some(parsed) = self.parse_value(&ti.value) {
                 value = self.clamp(parsed);
             }
             // Enter canonicalises the displayed text from the (clamped) value.
             if enter_pressed {
-                ti.value = format_value(value, self.decimals);
+                ti.value = self.display_value(value);
                 ti.cursor_pos = ti.value.len();
                 ti.selection_start = None;
             }
@@ -562,5 +621,107 @@ mod tests {
             out.changed,
             "an out-of-range input clamps and reports changed"
         );
+    }
+
+    // ---- formatter / parser ----
+
+    /// Zero-pad an hour field to two digits. The default sanitize + parse path
+    /// still applies (formatter-only), so typed `"9"` parses to 9 and displays
+    /// `"09"` once the value owns the text.
+    fn hour_formatter(v: f64) -> String {
+        format!("{:02}", v.round() as i64)
+    }
+
+    #[test]
+    fn formatter_zero_pads_display_when_not_editing() {
+        let ni = NumberInput::new()
+            .with_range(0.0, 23.0)
+            .with_formatter(hour_formatter);
+        let mut ti = TextInput::new(0.0, 0.0, 96.0, 24.0);
+        let mut focus = FocusState::new(); // not focused
+        let input = InputState::default();
+        let out = draw_number(&ni, 7.0, 0, &mut ti, rect(), &mut focus, &input);
+        assert_eq!(out.value, 7.0);
+        assert_eq!(ti.value, "07", "formatter zero-pads single-digit hour");
+    }
+
+    #[test]
+    fn formatter_keeps_default_parse_for_zero_padded_numeric() {
+        // Formatter-only: the default parse path handles "07" → 7.0 fine.
+        let ni = NumberInput::new()
+            .with_range(0.0, 23.0)
+            .with_formatter(hour_formatter);
+        let mut ti = TextInput::new(0.0, 0.0, 96.0, 24.0);
+        let mut focus = FocusState::new();
+        focus.focus(0);
+        ti.value = "09".to_string(); // user typed zero-padded value
+        ti.cursor_pos = ti.value.len();
+        let input = InputState::default();
+        let out = draw_number(&ni, 0.0, 0, &mut ti, rect(), &mut focus, &input);
+        assert_eq!(out.value, 9.0, "default parse handles zero-padded input");
+    }
+
+    #[test]
+    fn formatter_round_trips_via_enter_canonicalization() {
+        let ni = NumberInput::new()
+            .with_range(0.0, 23.0)
+            .with_formatter(hour_formatter);
+        let mut ti = TextInput::new(0.0, 0.0, 96.0, 24.0);
+        let mut focus = FocusState::new();
+        focus.focus(0);
+        ti.value = "9".to_string();
+        ti.cursor_pos = ti.value.len();
+        let mut input = InputState::default();
+        input.enter_pressed = true;
+        let out = draw_number(&ni, 0.0, 0, &mut ti, rect(), &mut focus, &input);
+        assert_eq!(out.value, 9.0);
+        assert_eq!(ti.value, "09", "Enter re-canonicalises through the formatter");
+    }
+
+    /// A toy custom format ("3h" / "12h") paired with a matching parser, to
+    /// exercise the parser-owns-validation path that bypasses sanitize.
+    fn hours_with_unit(v: f64) -> String {
+        format!("{}h", v.round() as i64)
+    }
+
+    fn parse_hours_with_unit(s: &str) -> Option<f64> {
+        let s = s.strip_suffix('h').unwrap_or(s);
+        s.trim().parse::<f64>().ok()
+    }
+
+    #[test]
+    fn custom_parser_bypasses_sanitize_and_owns_validation() {
+        // Without the parser, sanitize would strip the 'h' and mangle the text.
+        // With the parser, "3h" parses cleanly to 3.0.
+        let ni = NumberInput::new()
+            .with_range(0.0, 23.0)
+            .with_formatter(hours_with_unit)
+            .with_parser(parse_hours_with_unit);
+        let mut ti = TextInput::new(0.0, 0.0, 96.0, 24.0);
+        let mut focus = FocusState::new();
+        focus.focus(0);
+        ti.value = "3h".to_string();
+        ti.cursor_pos = ti.value.len();
+        let input = InputState::default();
+        let out = draw_number(&ni, 0.0, 0, &mut ti, rect(), &mut focus, &input);
+        assert_eq!(out.value, 3.0, "custom parser extracts the numeric value");
+        assert_eq!(ti.value, "3h", "text is not mangled by sanitize");
+    }
+
+    #[test]
+    fn custom_parser_none_leaves_value_untouched() {
+        // A parser returning None (e.g. partial edit) leaves the value as-is,
+        // mirroring the default path's handling of "" or "-".
+        let ni = NumberInput::new()
+            .with_range(0.0, 23.0)
+            .with_parser(parse_hours_with_unit);
+        let mut ti = TextInput::new(0.0, 0.0, 96.0, 24.0);
+        let mut focus = FocusState::new();
+        focus.focus(0);
+        ti.value = "-".to_string(); // doesn't parse
+        ti.cursor_pos = ti.value.len();
+        let input = InputState::default();
+        let out = draw_number(&ni, 5.0, 0, &mut ti, rect(), &mut focus, &input);
+        assert_eq!(out.value, 5.0, "parser None holds the value mid-edit");
     }
 }

@@ -29,8 +29,10 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 
 use wgpu_gameui::layout::{Anchor, LayoutResult, Positioned, Rect, Size, VStack};
 use wgpu_gameui::{
-    Button, DrawContext, DrawList, FocusState, FontSystemHandle, InputState, TextBlock, Theme,
-    UiRenderer,
+    AnimSlot, AnimationState, Button, Checkbox, ColumnWidth, DragCapture, DrawContext, DrawList,
+    Easing, FocusState, FontSystemHandle, Frame, InputState, KeyboardNav, List, ListItem,
+    ListState, NumberInput, ScrollState, ScrollView, Slider, StyleResolver, Table, TableCell,
+    TableColumn, TextBlock, TextInput, TextMeasurer, Theme, UiRenderer, UiState,
 };
 
 const W: u32 = 1920;
@@ -453,6 +455,437 @@ fn bench_layout(c: &mut Criterion) {
     group.finish();
 }
 
+/// CPU-only text measurement: cache-hit vs cache-miss at growing string counts.
+///
+/// Both paths use identical short strings so the comparison is apples-to-apples.
+/// Cache-hit re-measures the same strings every iteration (hash lookup, no
+/// shaping). Cache-miss measures a fresh unique string each time (FontSystem lock
+/// + cosmic-text shape + insert), with the TextMeasurer cache cleared between
+/// iterations so every call is a genuine miss.
+///
+/// Note: cosmic-text has its own internal glyph cache that survives
+/// `TextMeasurer::clear_cache()`, so "miss" times represent a warm-glyph-cache
+/// miss (the glyphs are already rasterized), not a cold start.
+fn bench_text_shape(c: &mut Criterion) {
+    let mut measurer = TextMeasurer::new();
+    let counts: &[usize] = &[100, 1_000, 10_000];
+    const FONT_SIZE: f32 = 14.0;
+
+    let mut group = c.benchmark_group("text_shape");
+    for &count in counts {
+        // Use identical string patterns for both paths.
+        let hit_strings: Vec<String> =
+            (0..count).map(|i| format!("item{i:05}")).collect();
+
+        // Pre-populate the cache so the hit path hits.
+        for s in &hit_strings {
+            measurer.measure(s, FONT_SIZE, None);
+        }
+
+        // --- cache hit: all strings already in cache --------------------
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::new("cache_hit", count), &count, |b, _| {
+            b.iter(|| {
+                for s in &hit_strings {
+                    std::hint::black_box(measurer.measure(s, FONT_SIZE, None));
+                }
+            });
+        });
+
+        // --- cache miss: cache cleared, entirely disjoint string set -----
+        measurer.clear_cache();
+        group.bench_with_input(BenchmarkId::new("cache_miss", count), &count, |b, &count| {
+            b.iter(|| {
+                measurer.clear_cache();
+                for i in 0..count {
+                    // Offset by count so these never collide with hit_strings.
+                    std::hint::black_box(measurer.measure(
+                        &format!("miss{i:05}x{count:05}"),
+                        FONT_SIZE,
+                        None,
+                    ));
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
+/// CPU-only build of the four main interactive widget types through `DrawContext`.
+///
+/// Measures the per-widget cost of the `draw()` call — style lookups, geometry
+/// tessellation, focus registration, and interaction edge detection — in
+/// isolation (no GPU render, no UI context overhead).
+fn bench_interactive_widgets(c: &mut Criterion) {
+    let harness = Harness::new();
+    let theme = Theme::default();
+    let input = InputState::default();
+    let mut list = harness.draw_list();
+    let counts: &[usize] = &[100, 1_000, 10_000];
+
+    let mut group = c.benchmark_group("interactive_widgets");
+
+    // --- Slider ----------------------------------------------------------
+    for &count in counts {
+        let slider = Slider::new(0.0, 1.0).with_step(0.01);
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::new("slider", count), &count, |b, &count| {
+            b.iter(|| {
+                list.clear();
+                let mut focus = FocusState::new();
+                let mut capture = DragCapture::new();
+                let mut ctx = DrawContext::new(
+                    &mut list, &mut focus, &theme, &input, W as f32, H as f32,
+                );
+                for i in 0..count {
+                    let r = grid_rect(i, cols_for(count));
+                    std::hint::black_box(slider.draw(
+                        0.5,
+                        i as u64, // DragId
+                        &mut capture,
+                        r,
+                        &mut ctx,
+                    ));
+                }
+            });
+        });
+    }
+
+    // --- Checkbox --------------------------------------------------------
+    for &count in counts {
+        let cb = Checkbox::new();
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::new("checkbox", count), &count, |b, &count| {
+            b.iter(|| {
+                list.clear();
+                let mut focus = FocusState::new();
+                let mut ctx = DrawContext::new(
+                    &mut list, &mut focus, &theme, &input, W as f32, H as f32,
+                );
+                for i in 0..count {
+                    let r = grid_rect(i, cols_for(count));
+                    std::hint::black_box(cb.draw(i % 2 == 0, "X", r, &mut ctx));
+                }
+            });
+        });
+    }
+
+    // --- TextInput -------------------------------------------------------
+    for &count in counts {
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::new("text_input", count), &count, |b, &count| {
+            b.iter(|| {
+                list.clear();
+                let mut focus = FocusState::new();
+                let mut ctx = DrawContext::new(
+                    &mut list, &mut focus, &theme, &input, W as f32, H as f32,
+                );
+                // Fresh TextInputs each iter — they carry internal cursor state
+                // but we want the pure draw cost, not state-accumulation effects.
+                let mut tis: Vec<TextInput> = (0..count)
+                    .map(|i| {
+                        let r = grid_rect(i, cols_for(count));
+                        TextInput::new(r.x, r.y, r.width, r.height)
+                    })
+                    .collect();
+                for (i, ti) in tis.iter_mut().enumerate() {
+                    std::hint::black_box(ti.draw(i as u64, &mut ctx));
+                }
+            });
+        });
+    }
+
+    // --- NumberInput -----------------------------------------------------
+    for &count in counts {
+        let ni = NumberInput::new().with_range(0.0, 100.0).with_step(1.0);
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::new("number_input", count), &count, |b, &count| {
+            b.iter(|| {
+                list.clear();
+                let mut focus = FocusState::new();
+                let mut ctx = DrawContext::new(
+                    &mut list, &mut focus, &theme, &input, W as f32, H as f32,
+                );
+                let mut tis: Vec<TextInput> = (0..count)
+                    .map(|i| {
+                        let r = grid_rect(i, cols_for(count));
+                        TextInput::new(r.x, r.y, r.width, r.height)
+                    })
+                    .collect();
+                for (i, ti) in tis.iter_mut().enumerate() {
+                    let r = grid_rect(i, cols_for(count));
+                    std::hint::black_box(ni.draw(50.0, i as u64, ti, r, &mut ctx));
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// CPU cost of processing key events through `TextInput` — the hot path of text
+/// editing (typing, backspace, delete, arrow keys, Ctrl+A).
+///
+/// Each iteration creates N fresh `TextInput`s, feeds each one simulated
+/// key-downs, then draws them. This isolates the edit-path cost separate from
+/// pure draw.
+fn bench_text_input_edit(c: &mut Criterion) {
+    let harness = Harness::new();
+    let theme = Theme::default();
+    let mut list = harness.draw_list();
+    let counts: &[usize] = &[100, 1_000, 5_000];
+
+    let mut group = c.benchmark_group("text_input_edit");
+    for &count in counts {
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            b.iter(|| {
+                list.clear();
+                let mut focus = FocusState::new();
+                // One key-down edge per field: Backspace (trims last char).
+                let mut input = InputState::default();
+                input.backspace_pressed = true;
+                let mut ctx = DrawContext::new(
+                    &mut list, &mut focus, &theme, &input, W as f32, H as f32,
+                );
+                // Fresh TextInputs each iteration with a starting value so
+                // backspace hit is consistent.
+                let mut tis: Vec<TextInput> = (0..count)
+                    .map(|i| {
+                        let r = grid_rect(i, cols_for(count));
+                        TextInput::new(r.x, r.y, r.width, r.height)
+                            .with_value(format!("item {i}"))
+                    })
+                    .collect();
+                for (i, ti) in tis.iter_mut().enumerate() {
+                    std::hint::black_box(ti.draw(i as u64, &mut ctx));
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
+/// CPU-only cost of drawing N `ScrollView` regions, each wrapping a simple
+/// content closure (a handful of quads). Measures the scroll-clip + transform +
+/// scrollbar overhead independent of the content.
+fn bench_scroll_view(c: &mut Criterion) {
+    let harness = Harness::new();
+    let theme = Theme::default();
+    let mut list = harness.draw_list();
+    let counts: &[usize] = &[100, 1_000, 10_000];
+    let style = StyleResolver::new(&theme);
+
+    let mut group = c.benchmark_group("scroll_view");
+    for &count in counts {
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            b.iter(|| {
+                list.clear();
+                let mut input = InputState::default();
+                for i in 0..count {
+                    let mut state = ScrollState::new();
+                    state.content_size = [200.0, 500.0]; // scrollable content
+                    let r = Rect::new(
+                        (i * 64) as f32 % (W as f32 - 200.0),
+                        (i / 10) as f32 * 160.0,
+                        200.0,
+                        150.0,
+                    );
+                    let sv = ScrollView::new(r);
+                    sv.draw(&mut state, &mut list, &style, &mut input, |list, inner| {
+                        // Simulate a small content payload: 5 colored quads.
+                        list.quad(inner.x, inner.y, inner.width, 30.0, [0.2, 0.3, 0.8, 1.0]);
+                        list.quad(inner.x, inner.y + 60.0, inner.width, 30.0, [0.3, 0.6, 0.3, 1.0]);
+                        list.quad(inner.x, inner.y + 120.0, inner.width, 30.0, [0.8, 0.3, 0.2, 1.0]);
+                        list.quad(inner.x, inner.y + 250.0, inner.width, 30.0, [0.5, 0.3, 0.7, 1.0]);
+                        list.quad(inner.x, inner.y + 400.0, inner.width, 30.0, [0.2, 0.7, 0.7, 1.0]);
+                    });
+                }
+                std::hint::black_box(&list);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// CPU-only cost of drawing one virtualized `List` with `count` logical items
+/// (the widget draws only the visible subset). Measures the culling + selection +
+/// scroll interaction cost, not the item closure (which is a no-op label).
+fn bench_list_virtual(c: &mut Criterion) {
+    let harness = Harness::new();
+    let theme = Theme::default();
+    let mut list = harness.draw_list();
+    let style = StyleResolver::new(&theme);
+    let counts: &[usize] = &[1_000, 10_000, 100_000];
+
+    let mut group = c.benchmark_group("list_virtual");
+    for &count in counts {
+        let lw = List::new();
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            b.iter(|| {
+                list.clear();
+                let mut state = ListState::default();
+                let mut input = InputState::default();
+                lw.draw(
+                    Rect::new(0.0, 0.0, 300.0, 600.0),
+                    count,
+                    &mut state,
+                    &mut list,
+                    &style,
+                    &mut input,
+                    |list, rect, item: ListItem| {
+                        // Minimal closure: one text label per visible row.
+                        list.text(TextBlock::new(
+                            &format!("Item {}", item.index),
+                            rect.x,
+                            rect.y,
+                        ));
+                    },
+                );
+                std::hint::black_box(&list);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// CPU-only cost of drawing a `Table` with a fixed column layout and `count`
+/// rows, each with a few cells. Measures header + row chrome + scroll overhead.
+fn bench_table(c: &mut Criterion) {
+    let harness = Harness::new();
+    let theme = Theme::default();
+    let mut list = harness.draw_list();
+    let style = StyleResolver::new(&theme);
+    let row_counts: &[usize] = &[100, 1_000, 10_000];
+
+    let columns = [
+        TableColumn::new("Name", ColumnWidth::Flex(0.4)),
+        TableColumn::new("Age", ColumnWidth::Fixed(60.0)),
+        TableColumn::new("Score", ColumnWidth::Flex(0.3)),
+        TableColumn::new("Rank", ColumnWidth::Flex(0.3)),
+    ];
+
+    let mut group = c.benchmark_group("table");
+    for &rows in row_counts {
+        // Build the cell grid once.
+        let data: Vec<Vec<TableCell>> = (0..rows)
+            .map(|i| {
+                vec![
+                    TableCell::new(format!("Item {i}")),
+                    TableCell::new(format!("{}", 20 + (i % 50) as u32)),
+                    TableCell::new(format!("{:.1}", (i as f64 * 7.3) % 100.0)),
+                    TableCell::new(format!("#{}", i + 1)),
+                ]
+            })
+            .collect();
+        let table = Table::new(&columns);
+        group.throughput(Throughput::Elements(rows as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(rows), &rows, |b, _| {
+            b.iter(|| {
+                list.clear();
+                let mut scroll = ScrollState::new();
+                let mut input = InputState::default();
+                table.draw(
+                    Rect::new(0.0, 0.0, 600.0, 400.0),
+                    &data,
+                    &mut scroll,
+                    &mut list,
+                    &style,
+                    &mut input,
+                );
+                std::hint::black_box(&list);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Overhead of the `Frame::run` / `UiContext` interactive façade vs raw widgets.
+///
+/// Builds N `text_button` + `checkbox` + `slider` + `text_input` verbs through
+/// the auto-advancing facade. Measures the `UiState::begin_frame`/`end_frame`
+/// cost plus the per-verb `UiContext` indirection.
+fn bench_ui_context_frame(c: &mut Criterion) {
+    let harness = Harness::new();
+    let theme = Theme::default();
+    let counts: &[usize] = &[100, 1_000, 10_000];
+
+    let mut group = c.benchmark_group("ui_context_frame");
+    for &count in counts {
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            let mut list = harness.draw_list();
+            b.iter(|| {
+                list.clear();
+                let mut input = InputState::default();
+                let mut state = UiState::new();
+                Frame::new(&mut state, &mut input, &theme, &KeyboardNav)
+                    .run(&mut list, |ui| {
+                        for i in 0..count {
+                            ui.text_button(&format!("Btn {i}"), None, None);
+                            ui.checkbox("X", i % 2 == 0);
+                            ui.slider(i as u64, 0.5, 0.0, 1.0, None);
+                            let mut buf = format!("field {i}");
+                            ui.text_input(i as u64, &mut buf, "placeholder", None);
+                        }
+                    });
+                std::hint::black_box(&list);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// CPU cost of `AnimationState::tick` + `animate_color` for N unique widget IDs.
+///
+/// Simulates a frame where N widgets each request an eased color transition
+/// (the common pattern for hover/press feedback). Each `animate_color` call
+/// does a hash lookup + lerp; `tick` reaps stale entries.
+fn bench_animation(c: &mut Criterion) {
+    let counts: &[usize] = &[100, 1_000, 10_000];
+
+    let mut group = c.benchmark_group("animation");
+    for &count in counts {
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            let mut anim = AnimationState::new();
+            // First frame: settle all targets (no transition).
+            anim.tick(0.016);
+            for i in 0..count {
+                anim.animate_color(
+                    i as u64,
+                    AnimSlot::Bg,
+                    [0.3, 0.5, 0.8, 1.0],
+                    0.12,
+                    Easing::EaseOut,
+                );
+            }
+            b.iter(|| {
+                anim.tick(0.016);
+                for i in 0..count {
+                    // Alternate between two target colors so the transition
+                    // is always in-flight (re-basing each iteration).
+                    let target = if i % 2 == 0 {
+                        [0.3, 0.5, 0.8, 1.0]
+                    } else {
+                        [0.8, 0.5, 0.3, 1.0]
+                    };
+                    std::hint::black_box(anim.animate_color(
+                        i as u64,
+                        AnimSlot::Bg,
+                        target,
+                        0.12,
+                        Easing::EaseOut,
+                    ));
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_drawlist_build,
@@ -462,6 +895,14 @@ criterion_group!(
     bench_icons,
     bench_primitives_build,
     bench_primitives_render,
-    bench_layout
+    bench_layout,
+    bench_text_shape,
+    bench_interactive_widgets,
+    bench_text_input_edit,
+    bench_scroll_view,
+    bench_list_virtual,
+    bench_table,
+    bench_ui_context_frame,
+    bench_animation,
 );
 criterion_main!(benches);
