@@ -141,8 +141,9 @@ impl Blur {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("blur pipeline layout"),
-            bind_group_layouts: &[&uniform_bgl, &src_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&uniform_bgl), Some(&src_bgl)],
+            immediate_size: 0,
+
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -170,7 +171,7 @@ impl Blur {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -315,10 +316,12 @@ impl Blur {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             rp.set_pipeline(&self.pipeline);
             rp.set_bind_group(0, &self.uniform_bg_a, &[]);
@@ -335,10 +338,12 @@ impl Blur {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None
             });
             rp.set_pipeline(&self.pipeline);
             rp.set_bind_group(0, &self.uniform_bg_b, &[]);

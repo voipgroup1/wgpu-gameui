@@ -394,8 +394,8 @@ impl TextRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("msdf text pipeline layout"),
-            bind_group_layouts: &[&uniform_bgl, &atlas_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&uniform_bgl), Some(&atlas_bgl)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("msdf text pipeline"),
@@ -407,7 +407,7 @@ impl TextRenderer {
                     array_stride: std::mem::size_of::<MsdfVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &MSDF_VERTEX_ATTRIBS,
-                }],
+                }.into()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -423,7 +423,7 @@ impl TextRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -623,6 +623,7 @@ impl TextRenderer {
             label: Some("msdf icon pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
@@ -632,6 +633,7 @@ impl TextRenderer {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -1044,10 +1046,12 @@ impl TextRenderer {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -4451,13 +4455,12 @@ mod tests {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))?;
+        })).ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("text-cache test device"),
                 ..Default::default()
-            },
-            None,
+            }
         ))
         .ok()?;
         let fs = shared_font_system();

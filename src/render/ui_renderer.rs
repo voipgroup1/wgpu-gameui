@@ -349,8 +349,8 @@ impl UiRenderer {
         let color_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ui color pipeline layout"),
-                bind_group_layouts: &[&uniform_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&uniform_bgl)],
+                immediate_size: 0,
             });
 
         let color_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -363,7 +363,7 @@ impl UiRenderer {
                     array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &COLOR_VERTEX_ATTRIBS,
-                }],
+                }.into()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -379,7 +379,7 @@ impl UiRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -388,8 +388,8 @@ impl UiRenderer {
         // chrome unit-quad base mesh + per-instance records.
         let icon_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ui icon pipeline layout"),
-            bind_group_layouts: &[&uniform_bgl, &texture_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&uniform_bgl), Some(&texture_bgl)],
+            immediate_size: 0,
         });
 
         let icon_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -403,12 +403,12 @@ impl UiRenderer {
                         array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &CHROME_BASE_ATTRIBS,
-                    },
+                    }.into(),
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<IconInstance>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &ICON_INSTANCE_ATTRIBS,
-                    },
+                    }.into(),
                 ],
                 compilation_options: Default::default(),
             },
@@ -425,7 +425,7 @@ impl UiRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -434,8 +434,8 @@ impl UiRenderer {
         let chrome_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ui chrome pipeline layout"),
-                bind_group_layouts: &[&uniform_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&uniform_bgl)],
+                immediate_size: 0,
             });
 
         let chrome_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -449,12 +449,12 @@ impl UiRenderer {
                         array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &CHROME_BASE_ATTRIBS,
-                    },
+                    }.into(),
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<ChromeInstance>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &CHROME_INSTANCE_ATTRIBS,
-                    },
+                    }.into(),
                 ],
                 compilation_options: Default::default(),
             },
@@ -471,7 +471,7 @@ impl UiRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -489,12 +489,12 @@ impl UiRenderer {
                         array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &CHROME_BASE_ATTRIBS,
-                    },
+                    }.into(),
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<CircleInstance>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &CIRCLE_INSTANCE_ATTRIBS,
-                    },
+                    }.into(),
                 ],
                 compilation_options: Default::default(),
             },
@@ -511,7 +511,7 @@ impl UiRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -521,8 +521,8 @@ impl UiRenderer {
         let nine_slice_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ui nine-slice pipeline layout"),
-                bind_group_layouts: &[&uniform_bgl, &texture_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&uniform_bgl), Some(&texture_bgl)],
+                immediate_size: 0,
             });
 
         let nine_slice_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -536,13 +536,13 @@ impl UiRenderer {
                         array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &CHROME_BASE_ATTRIBS,
-                    },
+                    }.into(),
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<NineSliceInstance>()
                             as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &NINE_INSTANCE_ATTRIBS,
-                    },
+                    }.into(),
                 ],
                 compilation_options: Default::default(),
             },
@@ -559,7 +559,7 @@ impl UiRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1308,10 +1308,12 @@ impl UiRenderer {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.color_pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -1422,10 +1424,12 @@ impl UiRenderer {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
 
@@ -1496,10 +1500,12 @@ impl UiRenderer {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.icon_pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -1558,10 +1564,12 @@ impl UiRenderer {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.nine_slice_pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);

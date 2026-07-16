@@ -1,0 +1,4 @@
+{
+    "github.copilot.llm-gateway.serverUrl": "http://k8s.automotive-wan.com:8601",
+    "github.copilot.llm-gateway.defaultMaxOutputTokens": 16384
+}
