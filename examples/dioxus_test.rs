@@ -586,7 +586,7 @@ async fn run_wgpu_app() {
 
         input_state_clone.mouse_middle_down = wheel_button;
     
-        //web_sys::console::log_1(&format!("Mouse moved to: ({}, {})", x, y).into());
+        web_sys::console::log_1(&format!("Mouse moved to: ({}, {})", x, y).into());
     }) as Box<dyn FnMut(_)>);
     web_canvas.add_event_listener_with_callback("mousemove", mouse_move_closure.as_ref().unchecked_ref()).unwrap();
     mouse_move_closure.forget();
@@ -875,6 +875,7 @@ async fn run_wgpu_app() {
         // ---------- Image + custom font + alignment demo ----------
         // Decoded image drawn at full size, then the same image cropped
         // to its top-left quarter (UV [0,0,0.5,0.5]) stretched to match.
+        /*
         list.image(
             image_sprite,
             Rect::new(80.0, 320.0, 64.0, 64.0),
@@ -886,6 +887,7 @@ async fn run_wgpu_app() {
             [0.0, 0.0, 0.5, 0.5],
             [1.0, 1.0, 1.0, 1.0],
         );
+        */
         // A line shaped in the runtime-loaded custom font.
         list.text(
             TextBlock::new("Custom font: Noto Sans", 232.0, 322.0)
@@ -927,8 +929,9 @@ async fn run_wgpu_app() {
         let stack_font = custom_font.clone();
         {
             let mut ui = UiContext::new(list);
-            ui.translate(232.0, 410.0);
             ui.push();
+            ui.translate(232.0, 410.0);
+
             ui.font(stack_font, 18.0);
             ui.bold(true);
             ui.text_line("font-stack: pushed bold", [0.7, 0.9, 1.0, 1.0]);
