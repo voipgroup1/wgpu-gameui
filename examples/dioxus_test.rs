@@ -386,6 +386,9 @@ async fn run_wgpu_app() {
 
     let input_state = Rc::new(RefCell::new(InputState::new()));
     let input_state_clone = input_state.clone();
+    let input_state_clone2 = input_state.clone();
+    let input_state_clone3 = input_state.clone();
+    let input_state_clone4 = input_state.clone();
     let last_time = Rc::new(RefCell::new(web_window.performance().unwrap().now() / 1000.0));
 
     let drag= Rc::new(RefCell::new(DragTracker::new()));
@@ -487,10 +490,107 @@ async fn run_wgpu_app() {
         surface_clone1.configure(&device_clone1, &config_clone1);
 
     }) as Box<dyn FnMut(_)>);
-
     let observe_canvas_resize:web_sys::ResizeObserver =web_sys::ResizeObserver::new(canvas_resize_closure.as_ref().unchecked_ref()).unwrap();
     observe_canvas_resize.observe(&web_canvas);
     canvas_resize_closure.forget();
+
+    // Create a closure to handle mouse clicks
+    let mouse_up_closure = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+
+        let mut input_state_clone= input_state_clone4.borrow_mut();
+        // Access MouseEvent properties
+        let x  =  event.client_x() as f32;
+        let y =  event.client_y() as f32;
+
+        input_state_clone.mouse_x =x;
+        input_state_clone.mouse_y = y;
+        let left_button =  (event.buttons() & 1u16) != 0u16;
+        let right_button = (event.buttons() & 2u16) != 0u16;
+        let wheel_button  = (event.buttons() & 4u16) != 0u16;
+        let backward_button = (event.buttons() & 8u16) != 0u16;
+        let forward_button = (event.buttons() & 16u16) != 0u16;
+
+        if !left_button {
+            input_state_clone.mouse_down = false;
+            input_state_clone.mouse_released = true;
+        }
+
+        if !right_button {
+            input_state_clone.mouse_right_down = false;
+            input_state_clone.mouse_right_released = true;
+        }
+        if !wheel_button {
+            input_state_clone.mouse_middle_down = false;
+            input_state_clone.mouse_middle_released = true;
+        }
+        
+        //web_sys::console::log_1(&format!("Mouse up at: ({}, {})", x, y).into());
+    }) as Box<dyn FnMut(_)>);
+    web_canvas.add_event_listener_with_callback("mouseup", mouse_up_closure.as_ref().unchecked_ref()).unwrap();
+    mouse_up_closure.forget();
+
+        // Create a closure to handle mouse clicks
+    let mouse_down_closure = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+
+        let mut input_state_clone= input_state_clone3.borrow_mut();
+        // Access MouseEvent properties
+        let x  =  event.client_x() as f32;
+        let y =  event.client_y() as f32;
+
+        input_state_clone.mouse_x =x;
+        input_state_clone.mouse_y = y;
+        let left_button =  (event.buttons() & 1u16) != 0u16;
+        let right_button = (event.buttons() & 2u16) != 0u16;
+        let wheel_button  = (event.buttons() & 4u16) != 0u16;
+        let backward_button = (event.buttons() & 8u16) != 0u16;
+        let forward_button = (event.buttons() & 16u16) != 0u16;
+
+        if left_button {
+            input_state_clone.mouse_down = true;
+            input_state_clone.mouse_clicked = true;
+        }
+
+        if right_button {
+            input_state_clone.mouse_right_down = true;
+            input_state_clone.mouse_right_clicked = true;
+        }
+        if wheel_button {
+            input_state_clone.mouse_middle_down = true;
+            input_state_clone.mouse_middle_clicked = true;
+        }
+        
+        //web_sys::console::log_1(&format!("Mouse down at: ({}, {})", x, y).into());
+    }) as Box<dyn FnMut(_)>);
+    web_canvas.add_event_listener_with_callback("mousedown", mouse_down_closure.as_ref().unchecked_ref()).unwrap();
+    mouse_down_closure.forget();
+
+
+    let mouse_move_closure = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+
+        let mut input_state_clone= input_state_clone2.borrow_mut();
+        // Access MouseEvent properties
+        let x  =  event.client_x() as f32;
+        let y =  event.client_y() as f32;
+        input_state_clone.mouse_x =x;
+        input_state_clone.mouse_y = y;
+
+        let left_button =  (event.buttons() & 1u16) != 0u16;
+        let right_button = (event.buttons() & 2u16) != 0u16;
+        let wheel_button  = (event.buttons() & 4u16) != 0u16;
+        let backward_button = (event.buttons() & 8u16) != 0u16;
+        let forward_button = (event.buttons() & 16u16) != 0u16;
+
+        input_state_clone.mouse_down = left_button;
+
+        input_state_clone.mouse_right_down = right_button;
+
+        input_state_clone.mouse_middle_down = wheel_button;
+    
+        //web_sys::console::log_1(&format!("Mouse moved to: ({}, {})", x, y).into());
+    }) as Box<dyn FnMut(_)>);
+    web_canvas.add_event_listener_with_callback("mousemove", mouse_move_closure.as_ref().unchecked_ref()).unwrap();
+    mouse_move_closure.forget();
+
 
     let render_state_clone = render_state.clone();
     let surface_clone = surface.clone();

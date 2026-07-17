@@ -147,11 +147,12 @@ fn solid_with_border(size: u32, fill: [u8; 4], border: [u8; 4], thickness: u32) 
 #[test]
 #[ignore = "needs a GPU adapter; writes a PNG for manual inspection"]
 fn render_widget_gallery() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::default(),
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .expect("no GPU adapter available");
 
@@ -159,8 +160,7 @@ fn render_widget_gallery() {
         &wgpu::DeviceDescriptor {
             label: Some("gallery device"),
             ..Default::default()
-        },
-        None,
+        }
     ))
     .expect("request device");
 
@@ -2050,10 +2050,12 @@ fn render_widget_gallery() {
                         }),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
         }
         ui.render(&device, &queue, &mut scene_enc, &scene_view, (W, h), 1.0, &scene_list);
@@ -2088,10 +2090,12 @@ fn render_widget_gallery() {
                     }),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
     }
 
@@ -2174,8 +2178,8 @@ fn render_widget_gallery() {
 
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-    device.poll(wgpu::Maintain::Wait);
-    let data = slice.get_mapped_range();
+    device.poll(wgpu::PollType::Poll);
+    let data = slice.get_mapped_range().unwrap();
 
     // De-pad: the GPU buffer rows are 256-aligned (`bytes_per_row`), but a
     // tightly-packed RGBA image expects `row_stride` (W*4) per row. Copy each

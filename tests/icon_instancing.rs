@@ -92,10 +92,12 @@ fn render_list(
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
     }
     ui.render(device, queue, &mut encoder, &view, (W, H), 1.0, list);
@@ -124,8 +126,8 @@ fn render_list(
 
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-    device.poll(wgpu::Maintain::Wait);
-    let data = slice.get_mapped_range();
+    device.poll(wgpu::PollType::Poll);
+    let data = slice.get_mapped_range().unwrap();
 
     let row_stride = (W * 4) as usize;
     let bpr = bytes_per_row as usize;
@@ -161,19 +163,19 @@ fn classify(c: [u8; 4]) -> &'static str {
 }
 
 fn setup() -> (wgpu::Device, wgpu::Queue, UiRenderer, FontSystemHandle) {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::default(),
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .expect("no GPU adapter (run under DISPLAY=:0)");
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("icon device"),
             ..Default::default()
-        },
-        None,
+        }
     ))
     .expect("request device");
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;

@@ -15,11 +15,12 @@ const H: u32 = 256;
 #[test]
 #[ignore = "needs a GPU adapter; writes a PNG for manual inspection"]
 fn render_text_to_png() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::default(),
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .expect("no GPU adapter available");
 
@@ -27,8 +28,7 @@ fn render_text_to_png() {
         &wgpu::DeviceDescriptor {
             label: Some("msdf test device"),
             ..Default::default()
-        },
-        None,
+        }
     ))
     .expect("request device");
 
@@ -129,10 +129,12 @@ fn render_text_to_png() {
                     }),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
     }
 
@@ -164,8 +166,8 @@ fn render_text_to_png() {
 
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-    device.poll(wgpu::Maintain::Wait);
-    let data = slice.get_mapped_range();
+    device.poll(wgpu::PollType::Poll);
+    let data = slice.get_mapped_range().unwrap();
 
     std::fs::create_dir_all("test_output").unwrap();
     let img = image::RgbaImage::from_raw(W, H, data.to_vec()).expect("image from raw");

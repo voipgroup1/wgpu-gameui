@@ -11,19 +11,19 @@ use wgpu_gameui::{Backdrop, BlurParams, UiRenderer, shared_font_system};
 const SIZE: u32 = 64;
 
 fn device_queue() -> (wgpu::Device, wgpu::Queue) {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::default(),
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .expect("no GPU adapter (run under DISPLAY=:0)");
     pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("blur test device"),
             ..Default::default()
-        },
-        None,
+        }
     ))
     .expect("request device")
 }
@@ -132,10 +132,12 @@ fn blur_to_pixels(radius: f32, downsample: u32) -> Vec<u8> {
                     }),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
     }
 
@@ -184,8 +186,8 @@ fn blur_to_pixels(radius: f32, downsample: u32) -> Vec<u8> {
 
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-    device.poll(wgpu::Maintain::Wait);
-    let data = slice.get_mapped_range();
+    device.poll(wgpu::PollType::Poll);
+    let data = slice.get_mapped_range().unwrap();
 
     let mut pixels = Vec::with_capacity((row_stride * SIZE) as usize);
     for row in 0..SIZE as usize {
