@@ -443,7 +443,7 @@ async fn run_wgpu_app() {
     }));
 
 
-    let render_state_clone = render_state.clone();
+    //let render_state_clone = render_state.clone();
     let surface_clone = surface.clone();
     let device_clone = device.clone();
     let config_clone = config.clone();
@@ -956,7 +956,8 @@ async fn run_wgpu_app() {
             ui.rotate(270.0f32.to_radians());
             ui.font(stack_font, 18.0);
             ui.bold(true);
-            ui.text_line("font-stack: pushed bold", [0.7, 0.9, 1.0, 1.0]);
+            ui.center();
+            ui.text_line("font-stack: pushed bold", [0.7, 0.9, 1.0, 1.0],Some(250.0));
             ui.pop();
         }
 
@@ -1038,8 +1039,9 @@ async fn run_wgpu_app() {
             let mut ui = UiContext::with_layers(&mut layers);
             ui.push();
             ui.translate(660.0, 320.0);
-            ui.rotate(330.0_f32.to_radians());
-            ui.center();
+            ui.rotate(0.0_f32.to_radians());
+            //ui.center();
+            ui.align("left top");
             ui.rounded_rect(160.0, 40.0, 6.0, [0.95, 0.45, 0.30, 1.0]);
             ui.pop();
         }
