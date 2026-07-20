@@ -32,6 +32,9 @@ pub struct Affine2 {
     pub d: f32,
     /// Y translation (logical px).
     pub ty: f32,
+    ///
+    pub angle: f32,
+
 }
 
 impl Affine2 {
@@ -43,11 +46,12 @@ impl Affine2 {
         c: 0.0,
         d: 1.0,
         ty: 0.0,
+        angle: 0.0,
     };
 
     /// Construct directly from elements `[[a, b, tx], [c, d, ty]]`.
     pub const fn new(a: f32, b: f32, tx: f32, c: f32, d: f32, ty: f32) -> Self {
-        Self { a, b, tx, c, d, ty }
+        Self { a, b, tx, c, d, ty, angle: 0.0 }
     }
 
     /// Identity transform.
@@ -64,6 +68,7 @@ impl Affine2 {
             c: 0.0,
             d: 1.0,
             ty,
+            angle: 0.0,
         }
     }
 
@@ -77,6 +82,7 @@ impl Affine2 {
             c: s,
             d: c,
             ty: 0.0,
+            angle,
         }
     }
 
@@ -89,6 +95,7 @@ impl Affine2 {
             c: 0.0,
             d: sy,
             ty: 0.0,
+            angle: 0.0,
         }
     }
 
@@ -101,6 +108,7 @@ impl Affine2 {
             c: self.c * other.a + self.d * other.c,
             d: self.c * other.b + self.d * other.d,
             ty: self.c * other.tx + self.d * other.ty + self.ty,
+            angle: self.angle + other.angle,
         }
     }
 
@@ -116,13 +124,14 @@ impl Affine2 {
     /// Returns true if the linear part is the identity (a=d=1, b=c=0).
     /// In that case rectangle transforms remain axis-aligned and exact.
     pub fn is_translate_only(&self) -> bool {
-        self.a == 1.0 && self.b == 0.0 && self.c == 0.0 && self.d == 1.0
+        self.a == 1.0 && self.b == 0.0 && self.c == 0.0 && self.d == 1.0 && self.angle.cos() ==1.0
     }
 
     /// Returns true if there is no rotation or shear (off-diagonals are zero).
     /// Translation + axis-aligned scale only — rectangles remain axis-aligned.
     pub fn is_axis_aligned(&self) -> bool {
-        self.b == 0.0 && self.c == 0.0
+        ( self.b == 0.0 && self.c == 0.0 ) || self.angle.sin() ==0.0
+
     }
 
     /// Determinant of the linear (2x2) part — the signed area scale factor.
@@ -179,6 +188,7 @@ impl Affine2 {
             c: ic,
             d: id,
             ty: -(ic * self.tx + id * self.ty),
+            angle: -self.angle,
         }
     }
 

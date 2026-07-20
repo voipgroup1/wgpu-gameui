@@ -678,7 +678,7 @@ impl ApplicationHandler for App {
 
                     ui.font(stack_font, 18.0);
                     ui.bold(true);
-                    ui.text_line("font-stack: pushed bold", [0.7, 0.9, 1.0, 1.0]);
+                    ui.text_line("font-stack: pushed bold", [0.7, 0.9, 1.0, 1.0],Some(50.0));
                     ui.pop();
                 }
 

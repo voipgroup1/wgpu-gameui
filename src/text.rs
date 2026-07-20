@@ -23,6 +23,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::Affine2;
 use crate::layout::Rect;
 #[cfg(feature = "phosphor-icons")]
 use crate::render::{
@@ -854,10 +855,7 @@ impl TextRenderer {
             // no tile (atlas returns `None`) and are skipped — so every stored
             // glyph is guaranteed present in the atlas on later frames.
             let mut shaped: Vec<ShapedGlyph> = Vec::new();
-            let mut first_x : Option<f32> = None;
-            let mut last_x: Option<f32> = None;
-            let mut first_y: Option<f32> = None;
-            let mut last_y: Option<f32> = None;
+
             for run in buffer.layout_runs() {
                 let line_off_x = if block.vertical {
                     column_off_x + (column_w - run.line_w) / 2.0
@@ -963,6 +961,7 @@ impl TextRenderer {
                         softness: softness.min(safe),
                         offset,
                     },
+                    p.current_transform,
                 );
             }
         }
@@ -987,6 +986,7 @@ impl TextRenderer {
                         softness,
                         offset: [0.0, 0.0],
                     },
+                    p.current_transform,
                 );
             }
         }
@@ -1007,6 +1007,7 @@ impl TextRenderer {
                     softness: 0.0,
                     offset: [0.0, 0.0],
                 },
+                p.current_transform,
             );
         }
         verts
@@ -1267,6 +1268,7 @@ fn append_placements(
         .as_ref()
         .map(|g| (color_to_rgba(g.color), g.radius_px));
 
+    let current_transform = block.current_transform;
     for g in shaped {
         let font_key = resolve_font_key(font_keys, next_font_key, g.font_id);
         let Some(tile) = atlas.glyph(font_key, g.glyph_id, &[]) else {
@@ -1288,6 +1290,7 @@ fn append_placements(
             outline,
             shadow,
             glow,
+            current_transform
         });
     }
 }
@@ -1308,6 +1311,7 @@ struct GlyphPlacement {
     shadow: Option<([f32; 4], [f32; 2], f32)>,
     /// (color, radius_px)
     glow: Option<([f32; 4], f32)>,
+    current_transform: Affine2,
 }
 
 /// Maximum effect reach (screen px) a glyph's distance field supports at a given
@@ -1339,6 +1343,7 @@ fn push_glyph_quad(
     atlas_h: u32,
     px_range: f32,
     style: &QuadStyle,
+    current_transform: Affine2
 ) {
     let m = &p.tile.metrics;
     let font_size = p.font_size;
@@ -1357,10 +1362,8 @@ fn push_glyph_quad(
         None => ([0.0; 4], 0.0),
     };
 
-    let center_x = (x0+x1)/2.0;
-    let center_y = (y0+y1)/2.0;
-    let rotation_matrix = Mat4::from_rotation_z(90_f32.to_radians());
-    let center = Vec3::new(center_x, center_y , 0.0);
+    let rotation_matrix = Mat4::from_rotation_z(current_transform.angle);
+    let center = Vec3::new(current_transform.tx,current_transform.ty , 0.0);
     let translation_to_origin = Mat4::from_translation(-center);
     let translation_back = Mat4::from_translation(center);
     let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
@@ -1458,10 +1461,8 @@ fn push_icon_quad(
     let br = t.transform_point([x1, y1]);
     let bl = t.transform_point([x0, y1]);
 
-    let center_x = (x0+x1)/2.0;
-    let center_y = (y0+y1)/2.0;
-    let rotation_matrix = Mat4::from_rotation_z(90_f32.to_radians());
-    let center = Vec3::new(center_x, center_y , 0.0);
+    let rotation_matrix = Mat4::from_rotation_z(icon.transform.angle);
+    let center = Vec3::new(icon.transform.tx,icon.transform.ty , 0.0);
     let translation_to_origin = Mat4::from_translation(-center);
     let translation_back = Mat4::from_translation(center);
     let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
@@ -3135,6 +3136,8 @@ pub struct TextBlock {
     /// horizontally within [`max_width`](Self::with_max_width) (`Start`/`Left`,
     /// `Center`, `End`/`Right`). See [`with_vertical`](Self::with_vertical).
     pub vertical: bool,
+
+    pub current_transform: Affine2,
 }
 
 impl TextBlock {
@@ -3162,6 +3165,7 @@ impl TextBlock {
             spans: Vec::new(),
             wrap: WrapMode::default(),
             vertical: false,
+            current_transform: Affine2::IDENTITY,
         }
     }
 

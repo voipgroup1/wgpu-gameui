@@ -597,7 +597,7 @@ impl<'a> UiContext<'a> {
     /// weight, style), honoring align/transform like [`text`](Self::text). The
     /// line's box for alignment is the font size × line-height of the active
     /// `FontSpec`.
-    pub fn text_line(&mut self, text: &str, color: [f32; 4]) {
+    pub fn text_line(&mut self, text: &str, color: [f32; 4], max_width: Option<f32>) {
         let spec = self.current_font();
         let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0) as u8;
         let block = TextBlock::new(text, 0.0, 0.0)
@@ -611,7 +611,12 @@ impl<'a> UiContext<'a> {
             .with_font_opt(spec.font)
             .with_weight(spec.weight)
             .with_style(spec.style);
-        self.text_block(block);
+        if let Some(mw) = max_width {
+            self.text_block(block.with_max_width(mw));
+        }
+        else {
+            self.text_block(block);
+        }
     }
 
     /// Replace the current tint (Teardown's `UiColor`).
@@ -1090,10 +1095,10 @@ impl<'a> UiContext<'a> {
     /// font stack, then advance the layout cursor by the font size. The
     /// auto-advancing companion to [`text_block`](Self::text_block) /
     /// [`text_line`](Self::text_line).
-    pub fn text(&mut self, label: &str) {
+    pub fn text(&mut self, label: &str, max_width: Option<f32>) {
         let color = self.theme.map_or([1.0, 1.0, 1.0, 1.0], |t| t.text);
         let size = self.current_font().size;
-        self.text_line(label, color);
+        self.text_line(label, color, max_width);
         self.advance(size);
     }
 
@@ -2093,8 +2098,8 @@ mod tests {
         let mut list = DrawList::new();
         let mut ui = UiContext::new(&mut list);
         ui.set_auto_advance(false);
-        ui.text("a");
-        ui.text("b");
+        ui.text("a",None);
+        ui.text("b",None);
         drop(ui);
         assert_eq!(list.texts.len(), 2);
         assert!(
@@ -2678,7 +2683,7 @@ mod tests {
             ui.font(FontHandle("Noto Sans".into()), 28.0);
             ui.bold(true);
             ui.italic(true);
-            ui.text_line("hi", [1.0, 0.0, 0.0, 1.0]);
+            ui.text_line("hi", [1.0, 0.0, 0.0, 1.0],None);
         }
         assert_eq!(list.texts.len(), 1);
         let block = &list.texts[0];
@@ -3004,7 +3009,7 @@ mod tests {
             let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
             ui.font_size(24.0);
             let c0 = ui.cursor();
-            ui.text("hello");
+            ui.text("hello",None);
             let c1 = ui.cursor();
             assert!(approx(c1[1], c0[1] + 24.0 + theme.spacing));
         }

@@ -1305,6 +1305,7 @@ impl DrawList {
             );
             self.text_rotation_warned = true;
         }
+        block.current_transform = m;
 
         // When span mode is active, derive the display content from the
         // concatenated span texts so the shape cache and cursor-position calls

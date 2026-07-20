@@ -795,7 +795,7 @@ fn render_widget_gallery() {
             {
                 let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
                 ui.translate(r.x, r.y);
-                ui.text("text() label");
+                ui.text("text() label",None);
                 ui.text_button("text_button()", Some(200.0), None);
                 let _ = ui.slider(0, 0.6, 0.0, 1.0, Some(200.0));
                 let _ = ui.checkbox("checkbox()", true);
@@ -882,7 +882,7 @@ fn render_widget_gallery() {
                 // Place a small text label inside the group
                 ui.push();
                 ui.translate(inner.x - r.x, inner.y - r.y);
-                ui.text("Content");
+                ui.text("Content",None);
                 ui.pop();
             }
             list.pop_transform();
@@ -897,7 +897,7 @@ fn render_widget_gallery() {
                 ui.translate(r.x, r.y);
                 ui.panel(Some(200.0), 50.0);
                 ui.push();
-                ui.text("Inside panel");
+                ui.text("Inside panel",None);
                 ui.pop();
             }
             list.pop_transform();
@@ -980,11 +980,11 @@ fn render_widget_gallery() {
                     let inner = ui.scroll_begin(Some(200.0), 100.0);
                     ui.push();
                     ui.translate(inner.x - r.x, inner.y - r.y);
-                    ui.text("Row 1");
-                    ui.text("Row 2");
-                    ui.text("Row 3");
-                    ui.text("Row 4");
-                    ui.text("Row 5");
+                    ui.text("Row 1",None);
+                    ui.text("Row 2",None);
+                    ui.text("Row 3",None);
+                    ui.text("Row 4",None);
+                    ui.text("Row 5",None);
                     ui.pop();
                     ui.scroll_end();
                 }
