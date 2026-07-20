@@ -40,6 +40,10 @@ struct VsIn {
     @location(6) outline: vec4<f32>,
     @location(7) outline_width: f32,
     @location(8) softness: f32,
+    @location(9) model_col_0: vec4<f32>,
+    @location(10) model_col_1: vec4<f32>,
+    @location(11) model_col_2: vec4<f32>,
+    @location(12) model_col_3: vec4<f32>,
 };
 
 struct VsOut {
@@ -53,12 +57,24 @@ struct VsOut {
     @location(6) outline: vec4<f32>,
     @location(7) outline_width: f32,
     @location(8) softness: f32,
+    @location(9) model_col_0: vec4<f32>,
+    @location(10) model_col_1: vec4<f32>,
+    @location(11) model_col_2: vec4<f32>,
+    @location(12) model_col_3: vec4<f32>,
 };
 
 @vertex
 fn vs_msdf(in: VsIn) -> VsOut {
     var out: VsOut;
-    out.clip_position = uniforms.view_proj * vec4<f32>(in.position, 0.0, 1.0);
+    let model_matrix = mat4x4<f32>(
+        in.model_col_0,
+        in.model_col_1,
+        in.model_col_2,
+        in.model_col_3
+    );
+    let world_pos = uniforms.view_proj * model_matrix ;
+
+    out.clip_position = world_pos * vec4<f32>(in.position, 0.0, 1.0);
     out.uv = in.uv;
     out.fill = in.fill;
     out.clip = in.clip;
@@ -68,6 +84,10 @@ fn vs_msdf(in: VsIn) -> VsOut {
     out.outline = in.outline;
     out.outline_width = in.outline_width;
     out.softness = in.softness;
+    out.model_col_0 = in.model_col_0;
+    out.model_col_1 = in.model_col_1;
+    out.model_col_2 = in.model_col_2;
+    out.model_col_3 = in.model_col_3;
     return out;
 }
 

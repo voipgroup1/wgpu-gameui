@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::layout::Rect;
@@ -33,6 +34,12 @@ use crate::widgets::IconMsdf;
 
 use glyphon::cosmic_text::{Align as CosmicAlign, Wrap, fontdb};
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, Weight};
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct UniformsForText {
+    view_proj: [[f32; 4]; 4],
+}
 
 const MSDF_SHADER: &str = include_str!("render/ui_msdf.wgsl");
 
@@ -260,9 +267,15 @@ struct MsdfVertex {
     outline_width: f32,
     /// Extra AA spread in screen px (soft shadows / glow); 0 = crisp.
     softness: f32,
+    // new for rotate model translation
+    // let model_transform = translation_back (center) * rotation_matrix * translation_to_origin (-center);
+    model_col_0: [f32; 4],
+    model_col_1: [f32; 4],
+    model_col_2: [f32; 4],
+    model_col_3: [f32; 4],
 }
 
-const MSDF_VERTEX_ATTRIBS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
+const MSDF_VERTEX_ATTRIBS: [wgpu::VertexAttribute; 13] = wgpu::vertex_attr_array![
     0 => Float32x2,
     1 => Float32x2,
     2 => Float32x4,
@@ -272,6 +285,10 @@ const MSDF_VERTEX_ATTRIBS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array!
     6 => Float32x4,
     7 => Float32,
     8 => Float32,
+    9 => Float32x4,
+    10 => Float32x4,
+    11 => Float32x4,
+    12 => Float32x4,
 ];
 
 /// GPU text renderer: owns the MSDF glyph atlas (and optional Phosphor icon
@@ -349,7 +366,7 @@ impl TextRenderer {
             device,
             &wgpu::util::BufferInitDescriptor {
                 label: Some("msdf text uniform"),
-                contents: bytemuck::cast_slice(&[ortho_matrix(1.0, 1.0)]),
+                contents: bytemuck::cast_slice(&[UniformsForText{ view_proj : ortho_matrix(1.0, 1.0)}]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             },
         );
@@ -523,16 +540,17 @@ impl TextRenderer {
             Metrics::new(self.atlas.ref_px(), self.atlas.ref_px()),
         );
         buffer.set_text(
-            &mut fs,
+            //&mut fs,
             &ascii,
-            Attrs::new().family(Family::SansSerif),
+            &Attrs::new().family(Family::SansSerif),
             Shaping::Advanced,
+            None,
         );
         buffer.shape_until_scroll(&mut fs, false);
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
                 let font_key = self.font_key(glyph.font_id);
-                if let Some(font) = fs.get_font(glyph.font_id) {
+                if let Some(font) = fs.get_font(glyph.font_id,Weight::default()) {
                     self.atlas.glyph(font_key, glyph.glyph_id, font.data());
                 }
             }
@@ -759,21 +777,22 @@ impl TextRenderer {
             if block.vertical || block.ellipsize {
                 // Vertical: each line is one cluster, no wrapping; shrink-to-content
                 // so manual centering (below) governs horizontal placement.
-                buffer.set_wrap(&mut fs, Wrap::None);
-                buffer.set_size(&mut fs, None, None);
+                buffer.set_wrap( Wrap::None);
+                buffer.set_size( None, None);
             } else {
-                buffer.set_wrap(&mut fs, block.wrap.into());
-                buffer.set_size(&mut fs, Some(block.max_width), None);
+                buffer.set_wrap( block.wrap.into());
+                buffer.set_size( Some(block.max_width), None);
             }
             buffer.set_text(
-                &mut fs,
+                //&mut fs,
                 &shaped_text,
-                Attrs::new()
+                &Attrs::new()
                     .family(family)
                     .weight(block.weight)
                     .style(block.style)
                     .color(block.color),
                 Shaping::Advanced,
+                None,
             );
             // Horizontal alignment is set per buffer line before layout; `Start`
             // is cosmic-text's default so we only override for the rest. Vertical
@@ -835,6 +854,10 @@ impl TextRenderer {
             // no tile (atlas returns `None`) and are skipped — so every stored
             // glyph is guaranteed present in the atlas on later frames.
             let mut shaped: Vec<ShapedGlyph> = Vec::new();
+            let mut first_x : Option<f32> = None;
+            let mut last_x: Option<f32> = None;
+            let mut first_y: Option<f32> = None;
+            let mut last_y: Option<f32> = None;
             for run in buffer.layout_runs() {
                 let line_off_x = if block.vertical {
                     column_off_x + (column_w - run.line_w) / 2.0
@@ -851,7 +874,7 @@ impl TextRenderer {
                         &mut self.next_font_key,
                         glyph.font_id,
                     );
-                    let Some(font) = fs.get_font(glyph.font_id) else {
+                    let Some(font) = fs.get_font(glyph.font_id, Weight::default()) else {
                         continue;
                     };
                     if self
@@ -1018,7 +1041,7 @@ impl TextRenderer {
         queue.write_buffer(
             &self.uniform_buffer,
             0,
-            bytemuck::cast_slice(&[ortho_matrix(self.width as f32, self.height as f32)]),
+            bytemuck::cast_slice(&[UniformsForText{view_proj:ortho_matrix(self.width as f32, self.height as f32)}]),
         );
 
         let verts = self.build_vertices(texts);
@@ -1334,6 +1357,14 @@ fn push_glyph_quad(
         None => ([0.0; 4], 0.0),
     };
 
+    let center_x = (x0+x1)/2.0;
+    let center_y = (y0+y1)/2.0;
+    let rotation_matrix = Mat4::from_rotation_z(90_f32.to_radians());
+    let center = Vec3::new(center_x, center_y , 0.0);
+    let translation_to_origin = Mat4::from_translation(-center);
+    let translation_back = Mat4::from_translation(center);
+    let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
+
     let v = |x: f32, y: f32, u: f32, vv: f32| MsdfVertex {
         position: [x, y],
         uv: [u, vv],
@@ -1344,6 +1375,11 @@ fn push_glyph_quad(
         outline: style.outline,
         outline_width: style.outline_width,
         softness: style.softness,
+        model_col_0:model_transform[0],
+        model_col_1:model_transform[1],
+        model_col_2:model_transform[2],
+        model_col_3:model_transform[3],
+
     };
 
     // TL, TR, BR / TL, BR, BL
@@ -1422,6 +1458,14 @@ fn push_icon_quad(
     let br = t.transform_point([x1, y1]);
     let bl = t.transform_point([x0, y1]);
 
+    let center_x = (x0+x1)/2.0;
+    let center_y = (y0+y1)/2.0;
+    let rotation_matrix = Mat4::from_rotation_z(90_f32.to_radians());
+    let center = Vec3::new(center_x, center_y , 0.0);
+    let translation_to_origin = Mat4::from_translation(-center);
+    let translation_back = Mat4::from_translation(center);
+    let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
+
     let v = |pos: [f32; 2], u: f32, vv: f32| MsdfVertex {
         position: pos,
         uv: [u, vv],
@@ -1432,6 +1476,10 @@ fn push_icon_quad(
         outline: [0.0; 4],
         outline_width: 0.0,
         softness: 0.0,
+        model_col_0: model_transform[0],
+        model_col_1:model_transform[1],
+        model_col_2:model_transform[2],
+        model_col_3:model_transform[3],
     };
 
     // TL, TR, BR / TL, BR, BL
@@ -2020,20 +2068,21 @@ fn measure_with_font_system(
     let stacked;
     let shaped_text: &str = if vertical {
         stacked = vertical_stack_string(text);
-        buffer.set_wrap(font_system, Wrap::None);
-        buffer.set_size(font_system, None, None);
+        buffer.set_wrap(Wrap::None);
+        buffer.set_size(None, None);
         &stacked
     } else {
         let shape_width = max_width.unwrap_or(f32::MAX / 4.0);
-        buffer.set_wrap(font_system, wrap.into());
-        buffer.set_size(font_system, Some(shape_width), None);
+        buffer.set_wrap( wrap.into());
+        buffer.set_size( Some(shape_width), None);
         text
     };
     buffer.set_text(
-        font_system,
+        //font_system,
         shaped_text,
-        Attrs::new().family(family).weight(weight).style(style),
+        &Attrs::new().family(family).weight(weight).style(style),
         Shaping::Advanced,
+        None,
     );
     buffer.shape_until_scroll(font_system, false);
 
@@ -2067,13 +2116,14 @@ fn resolve_vmetrics(
     let ref_px = VMETRICS_REF_PX;
     let line_height = ref_px * LINE_HEIGHT_RATIO;
     let mut buffer = Buffer::new(font_system, Metrics::new(ref_px, line_height));
-    buffer.set_size(font_system, Some(f32::MAX / 4.0), None);
+    buffer.set_size( Some(f32::MAX / 4.0), None);
     let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
     buffer.set_text(
-        font_system,
+        //font_system,
         "H",
-        Attrs::new().family(family).weight(weight).style(style),
+        &Attrs::new().family(family).weight(weight).style(style),
         Shaping::Advanced,
+        None
     );
     buffer.shape_until_scroll(font_system, false);
 
@@ -2090,7 +2140,7 @@ fn resolve_vmetrics(
     // line-box centring when the metrics are unavailable.
     let embox_ratio = 2.0 * (baseline_ratio - LINE_HEIGHT_RATIO / 2.0);
     let face_metrics = font_id
-        .and_then(|id| font_system.get_font(id))
+        .and_then(|id| font_system.get_font(id,Weight::default()))
         .and_then(|f| face_vratios(f.data()));
     let (x_ratio, cap_ratio) = match face_metrics {
         Some((x, cap)) => (x, cap),
@@ -2106,12 +2156,13 @@ fn resolve_vmetrics(
     // above that baseline. Falls back to the roman baseline + cap-band centre when
     // no CJK face/glyph is available, so setups without a CJK font are unchanged.
     let mut cjk_buffer = Buffer::new(font_system, Metrics::new(ref_px, line_height));
-    cjk_buffer.set_size(font_system, Some(f32::MAX / 4.0), None);
+    cjk_buffer.set_size(Some(f32::MAX / 4.0), None);
     cjk_buffer.set_text(
-        font_system,
+        //font_system,
         CJK_PROBE,
-        Attrs::new().family(family).weight(weight).style(style),
+        &Attrs::new().family(family).weight(weight).style(style),
         Shaping::Advanced,
+        None,
     );
     cjk_buffer.shape_until_scroll(font_system, false);
     let mut cjk_line_y = None;
@@ -2121,7 +2172,7 @@ fn resolve_vmetrics(
         cjk_font_id = run.glyphs.first().map(|g| g.font_id);
     }
     let cjk_face_center = cjk_font_id
-        .and_then(|id| font_system.get_font(id))
+        .and_then(|id| font_system.get_font(id,Weight::default()))
         .and_then(|f| face_cjk_center(f.data()));
     let (cjk_baseline_ratio, cjk_center_ratio) = match (cjk_line_y, cjk_face_center) {
         (Some(line_y), Some(center)) => (line_y / ref_px, center),
@@ -2223,13 +2274,14 @@ pub fn text_cursor_positions(
     }
 
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_size(font_system, Some(max_width), None);
+    buffer.set_size(Some(max_width), None);
     let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
     buffer.set_text(
-        font_system,
+        //font_system,
         text,
-        Attrs::new().family(family),
+        &Attrs::new().family(family),
         Shaping::Advanced,
+        None,
     );
     buffer.shape_until_scroll(font_system, false);
 
@@ -2358,14 +2410,15 @@ pub fn text_caret_layout(
     }
 
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_wrap(font_system, wrap.into());
-    buffer.set_size(font_system, Some(max_width), None);
+    buffer.set_wrap( wrap.into());
+    buffer.set_size( Some(max_width), None);
     let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
     buffer.set_text(
-        font_system,
+        //font_system,
         &shaped,
-        Attrs::new().family(family),
+        &Attrs::new().family(family),
         Shaping::Advanced,
+        None,
     );
     buffer.shape_until_scroll(font_system, false);
 
@@ -2612,14 +2665,15 @@ pub fn text_visual_layout(
     }
 
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_wrap(font_system, wrap.into());
-    buffer.set_size(font_system, Some(max_width), None);
+    buffer.set_wrap( wrap.into());
+    buffer.set_size( Some(max_width), None);
     let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
     buffer.set_text(
-        font_system,
+        //font_system,
         &shaped,
-        Attrs::new().family(family),
+        &Attrs::new().family(family),
         Shaping::Advanced,
+        None,
     );
     buffer.shape_until_scroll(font_system, false);
 
@@ -2877,9 +2931,9 @@ fn ellipsize_to_width(
 
     // Shape the full content on a single line.
     let mut buffer = Buffer::new(fs, metrics);
-    buffer.set_wrap(fs, Wrap::None);
-    buffer.set_size(fs, None, None);
-    buffer.set_text(fs, content, attrs(), Shaping::Advanced);
+    buffer.set_wrap( Wrap::None);
+    buffer.set_size( None, None);
+    buffer.set_text( content, &attrs(), Shaping::Advanced, None,);
     buffer.shape_until_scroll(fs, false);
 
     let full_w = buffer
@@ -2892,9 +2946,9 @@ fn ellipsize_to_width(
 
     // Width of the ellipsis at this size/family, reserved at the right edge.
     let mut ell = Buffer::new(fs, metrics);
-    ell.set_wrap(fs, Wrap::None);
-    ell.set_size(fs, None, None);
-    ell.set_text(fs, "…", attrs(), Shaping::Advanced);
+    ell.set_wrap(Wrap::None);
+    ell.set_size(None, None);
+    ell.set_text("…", &attrs(), Shaping::Advanced,None,);
     ell.shape_until_scroll(fs, false);
     let ellipsis_w = ell.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
 
@@ -3834,10 +3888,11 @@ mod tests {
         let mut guard = fs.lock().unwrap();
         let mut buffer = Buffer::new(&mut guard, Metrics::new(20.0, 25.0));
         buffer.set_text(
-            &mut guard,
+            //&mut guard,
             "Ag",
-            Attrs::new().family(Family::Name(handle.family())),
+            &Attrs::new().family(Family::Name(handle.family())),
             Shaping::Advanced,
+            None,
         );
         buffer.shape_until_scroll(&mut guard, false);
         let font_id = buffer.layout_runs().next().unwrap().glyphs[0].font_id;
@@ -3922,12 +3977,13 @@ mod tests {
         let mut guard = fs.lock().unwrap();
         let leftmost = |guard: &mut glyphon::FontSystem, prefix: &str| -> f32 {
             let mut buffer = Buffer::new(guard, Metrics::new(16.0, 20.0));
-            buffer.set_size(guard, Some(400.0), None);
+            buffer.set_size(Some(400.0), None);
             buffer.set_text(
-                guard,
+                //guard,
                 &format!("{prefix}short"),
-                Attrs::new().family(Family::SansSerif),
+                &Attrs::new().family(Family::SansSerif),
                 Shaping::Advanced,
+                None,
             );
             buffer.shape_until_scroll(guard, false);
             // First glyph that carries ink (skip the zero-width mark at index 0).
@@ -4095,12 +4151,13 @@ mod tests {
         let mut guard = fs.lock().unwrap();
         let mut leftmost = |align: TextAlign| -> f32 {
             let mut buffer = Buffer::new(&mut guard, Metrics::new(16.0, 20.0));
-            buffer.set_size(&mut guard, Some(400.0), None);
+            buffer.set_size(Some(400.0), None);
             buffer.set_text(
-                &mut guard,
+                //&mut guard,
                 "short",
-                Attrs::new().family(Family::SansSerif),
+                &Attrs::new().family(Family::SansSerif),
                 Shaping::Advanced,
+                None,
             );
             if let Some(a) = cosmic_align(align) {
                 for line in buffer.lines.iter_mut() {
@@ -4222,10 +4279,11 @@ mod tests {
 
         let mut buffer = Buffer::new(&mut guard, Metrics::new(18.0, 22.0));
         buffer.set_text(
-            &mut guard,
+            //&mut guard,
             "Ag",
-            Attrs::new().family(Family::SansSerif),
+            &Attrs::new().family(Family::SansSerif),
             Shaping::Advanced,
+            None,
         );
         buffer.shape_until_scroll(&mut guard, false);
         let font_id = buffer.layout_runs().next().unwrap().glyphs[0].font_id;
@@ -4242,10 +4300,11 @@ mod tests {
         // Bold weight selects a heavier face from the same bundled family.
         let mut bold = Buffer::new(&mut guard, Metrics::new(18.0, 22.0));
         bold.set_text(
-            &mut guard,
+            //&mut guard,
             "Ag",
-            Attrs::new().family(Family::SansSerif).weight(Weight::BOLD),
+            &Attrs::new().family(Family::SansSerif).weight(Weight::BOLD),
             Shaping::Advanced,
+            None,
         );
         bold.shape_until_scroll(&mut guard, false);
         let bold_id = bold.layout_runs().next().unwrap().glyphs[0].font_id;

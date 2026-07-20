@@ -97,9 +97,10 @@ fn app() -> Element {
                     "Toggle Texture (Dioxus)"
                 }
             }
-
-            // Canvas for wgpu rendering
-            WgpuCanvas {}
+            div {
+                // Canvas for wgpu rendering
+                WgpuCanvas {}
+            }
         }
     }
 }
@@ -281,7 +282,7 @@ async fn run_wgpu_app() {
     #[cfg(not(target_arch="wasm32"))]
     let window = std::sync::Arc::new(winit::event_loop::EventLoop::builder().build().unwrap().create_window(winit::window::Window::default_attributes()
         .with_title("hello_ui — wgpu-gameui")
-        .with_inner_size(winit::dpi::LogicalSize::new(800.0, 480.0))).expect("create window"));
+        .with_inner_size(winit::dpi::LogicalSize::new(800.0, 800.0))).expect("create window"));
     #[cfg(not(target_arch="wasm32"))]
     let surface = instance
         .create_surface(window.clone())
@@ -449,7 +450,7 @@ async fn run_wgpu_app() {
     let canvas_resize_closure = Closure::wrap(Box::new (move |_entries: web_sys::wasm_bindgen::JsValue| {
 
         // Set canvas size to match display, clamped to device limits
-        let mut state :RefMut<RenderState> = render_state_clone.borrow_mut();
+        //let mut state :RefMut<RenderState> = render_state_clone.borrow_mut();
 
         let mut surface_clone1 = surface_clone.borrow_mut();
         let mut device_clone1=device_clone.borrow_mut();
@@ -496,19 +497,26 @@ async fn run_wgpu_app() {
 
     // Create a closure to handle mouse clicks
     let mouse_up_closure = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+        let web_window = web_sys::window().expect("no window");
+         
+        let web_document = web_window.document().expect("no document");
+    
+        let web_canvas = web_document
+            .get_element_by_id("wgpu-canvas")
+            .expect("no canvas");
 
         let mut input_state_clone= input_state_clone4.borrow_mut();
         // Access MouseEvent properties
         let x  =  event.client_x() as f32;
         let y =  event.client_y() as f32;
-
-        input_state_clone.mouse_x =x;
-        input_state_clone.mouse_y = y;
+        let rect = web_canvas.get_bounding_client_rect();
+        input_state_clone.mouse_x =x - rect.left() as f32;
+        input_state_clone.mouse_y = y - rect.top() as f32;;
         let left_button =  (event.buttons() & 1u16) != 0u16;
         let right_button = (event.buttons() & 2u16) != 0u16;
         let wheel_button  = (event.buttons() & 4u16) != 0u16;
-        let backward_button = (event.buttons() & 8u16) != 0u16;
-        let forward_button = (event.buttons() & 16u16) != 0u16;
+        //let backward_button = (event.buttons() & 8u16) != 0u16;
+        //let forward_button = (event.buttons() & 16u16) != 0u16;
 
         if !left_button {
             input_state_clone.mouse_down = false;
@@ -532,18 +540,27 @@ async fn run_wgpu_app() {
         // Create a closure to handle mouse clicks
     let mouse_down_closure = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
 
+        let web_window = web_sys::window().expect("no window");
+     
+        let web_document = web_window.document().expect("no document");
+    
+        let web_canvas = web_document
+            .get_element_by_id("wgpu-canvas")
+            .expect("no canvas");
+
         let mut input_state_clone= input_state_clone3.borrow_mut();
         // Access MouseEvent properties
         let x  =  event.client_x() as f32;
         let y =  event.client_y() as f32;
+        let rect = web_canvas.get_bounding_client_rect();
+        input_state_clone.mouse_x =x - rect.left() as f32;
+        input_state_clone.mouse_y = y - rect.top() as f32;;
 
-        input_state_clone.mouse_x =x;
-        input_state_clone.mouse_y = y;
         let left_button =  (event.buttons() & 1u16) != 0u16;
         let right_button = (event.buttons() & 2u16) != 0u16;
         let wheel_button  = (event.buttons() & 4u16) != 0u16;
-        let backward_button = (event.buttons() & 8u16) != 0u16;
-        let forward_button = (event.buttons() & 16u16) != 0u16;
+        //let backward_button = (event.buttons() & 8u16) != 0u16;
+        //let forward_button = (event.buttons() & 16u16) != 0u16;
 
         if left_button {
             input_state_clone.mouse_down = true;
@@ -567,18 +584,27 @@ async fn run_wgpu_app() {
 
     let mouse_move_closure = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
 
+        let web_window = web_sys::window().expect("no window");
+     
+        let web_document = web_window.document().expect("no document");
+    
+        let web_canvas = web_document
+            .get_element_by_id("wgpu-canvas")
+            .expect("no canvas");
+
         let mut input_state_clone= input_state_clone2.borrow_mut();
         // Access MouseEvent properties
         let x  =  event.client_x() as f32;
         let y =  event.client_y() as f32;
-        input_state_clone.mouse_x =x;
-        input_state_clone.mouse_y = y;
+        let rect = web_canvas.get_bounding_client_rect();
+        input_state_clone.mouse_x =x - rect.left() as f32;
+        input_state_clone.mouse_y = y - rect.top() as f32;;
 
         let left_button =  (event.buttons() & 1u16) != 0u16;
         let right_button = (event.buttons() & 2u16) != 0u16;
         let wheel_button  = (event.buttons() & 4u16) != 0u16;
-        let backward_button = (event.buttons() & 8u16) != 0u16;
-        let forward_button = (event.buttons() & 16u16) != 0u16;
+        //let backward_button = (event.buttons() & 8u16) != 0u16;
+        //let forward_button = (event.buttons() & 16u16) != 0u16;
 
         input_state_clone.mouse_down = left_button;
 
@@ -586,7 +612,7 @@ async fn run_wgpu_app() {
 
         input_state_clone.mouse_middle_down = wheel_button;
     
-        web_sys::console::log_1(&format!("Mouse moved to: ({}, {})", x, y).into());
+        //web_sys::console::log_1(&format!("Mouse moved to: ({}, {})", x, y).into());
     }) as Box<dyn FnMut(_)>);
     web_canvas.add_event_listener_with_callback("mousemove", mouse_move_closure.as_ref().unchecked_ref()).unwrap();
     mouse_move_closure.forget();
@@ -596,16 +622,14 @@ async fn run_wgpu_app() {
     let surface_clone = surface.clone();
     let device_clone = device.clone();
     let config_clone = config.clone();
-    //let render_state_clone2 = render_state.clone();
-    //let render_state_clone3 = render_state.clone();
-    //let render_state_clone4 = render_state.clone();
+
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
 
         let mut state :RefMut<RenderState> = render_state_clone.borrow_mut();
 
-        let mut surface_clone1 = surface_clone.borrow_mut();
-        let mut device_clone1=device_clone.borrow_mut();
-        let mut config_clone1 = config_clone.borrow_mut();
+        let surface_clone1 = surface_clone.borrow_mut();
+        let device_clone1=device_clone.borrow_mut();
+        let config_clone1 = config_clone.borrow_mut();
         //let state_2= render_state_clone2.borrow();
         //let mut state_3 = render_state_clone3.borrow_mut();
         //let mut state_4 = render_state_clone4.borrow_mut();
@@ -874,37 +898,35 @@ async fn run_wgpu_app() {
 
         // ---------- Image + custom font + alignment demo ----------
         // Decoded image drawn at full size, then the same image cropped
-        // to its top-left quarter (UV [0,0,0.5,0.5]) stretched to match.
-        /*
+        // to its top-left quarter (UV [0,0,0.5,0.5]) stretched to match
         list.image(
             image_sprite,
-            Rect::new(80.0, 320.0, 64.0, 64.0),
+            Rect::new(80.0, 520.0, 64.0, 64.0),
             [1.0, 1.0, 1.0, 1.0],
         );
         list.image_cropped(
             image_sprite,
-            Rect::new(152.0, 320.0, 64.0, 64.0),
+            Rect::new(152.0, 520.0, 64.0, 64.0),
             [0.0, 0.0, 0.5, 0.5],
             [1.0, 1.0, 1.0, 1.0],
         );
-        */
         // A line shaped in the runtime-loaded custom font.
         list.text(
-            TextBlock::new("Custom font: Noto Sans", 232.0, 322.0)
+            TextBlock::new("Custom font: Noto Sans", 232.0, 522.0)
                 .with_size(16.0)
                 .with_color(255, 228, 160)
                 .with_font(custom_font.clone()),
         );
         // Center- and right-aligned lines within a 300px-wide box.
         list.text(
-            TextBlock::new("centered in 300px", 232.0, 348.0)
+            TextBlock::new("centered in 300px", 232.0, 548.0)
                 .with_size(14.0)
                 .with_color(200, 210, 230)
                 .with_max_width(300.0)
                 .with_align(TextAlign::Center),
         );
         list.text(
-            TextBlock::new("right-aligned in 300px", 232.0, 366.0)
+            TextBlock::new("right-aligned in 300px", 232.0, 566.0)
                 .with_size(14.0)
                 .with_color(200, 210, 230)
                 .with_max_width(300.0)
@@ -912,13 +934,13 @@ async fn run_wgpu_app() {
         );
         // Bold + italic, using the bundled default sans-serif (real faces).
         list.text(
-            TextBlock::new("Bold", 232.0, 388.0)
+            TextBlock::new("Bold", 232.0, 588.0)
                 .with_size(16.0)
                 .with_color(255, 255, 255)
                 .bold(),
         );
         list.text(
-            TextBlock::new("Italic", 290.0, 388.0)
+            TextBlock::new("Italic", 290.0, 588.0)
                 .with_size(16.0)
                 .with_color(255, 255, 255)
                 .italic(),
@@ -930,8 +952,8 @@ async fn run_wgpu_app() {
         {
             let mut ui = UiContext::new(list);
             ui.push();
-            ui.translate(232.0, 410.0);
-
+            ui.translate(232.0, 610.0);
+            ui.rotate(270.0f32.to_radians());
             ui.font(stack_font, 18.0);
             ui.bold(true);
             ui.text_line("font-stack: pushed bold", [0.7, 0.9, 1.0, 1.0]);
@@ -1016,7 +1038,7 @@ async fn run_wgpu_app() {
             let mut ui = UiContext::with_layers(&mut layers);
             ui.push();
             ui.translate(660.0, 320.0);
-            ui.rotate(15.0_f32.to_radians());
+            ui.rotate(330.0_f32.to_radians());
             ui.center();
             ui.rounded_rect(160.0, 40.0, 6.0, [0.95, 0.45, 0.30, 1.0]);
             ui.pop();

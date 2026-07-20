@@ -17,6 +17,7 @@ use crate::widgets::{
     ChromeInstance, CircleInstance, ColorCmd, DrawList, IconDraw, NineSliceDraw, NineSliceId,
     Vertex,
 };
+use glam::{Mat4, Vec3};
 
 const SHADER: &str = include_str!("ui.wgsl");
 
@@ -1651,6 +1652,26 @@ fn create_atlas_texture(
         ],
     });
     (texture, sampler, bgl, bg)
+}
+
+pub(crate) fn ortho_matrix2(width: f32, height: f32, center_x: f32, center_y: f32) -> [[f32; 4]; 4] {
+    let ortho_matrix = glam::camera::lh::proj::directx::orthographic(0.0, width, height, 0.0, -1.0, 1.0);
+    let rotation_matrix = Mat4::from_rotation_z(90_f32.to_radians());
+    let center = Vec3::new(center_x, center_y , 0.0);
+    let translation_to_origin = Mat4::from_translation(-center);
+    let translation_back = Mat4::from_translation(center);
+    let model_transform = translation_back * rotation_matrix * translation_to_origin;
+    let final_matrix = ortho_matrix * model_transform;
+    final_matrix.to_cols_array_2d()
+    /*
+    let (l, r, t, b) = (0.0, width, 0.0,  height);
+    [
+        [2.0 / (r - l), 0.0, 0.0, 0.0],
+        [0.0, 2.0 / (t - b), 0.0, 0.0],
+        [0.0, 0.0, 0.5, 0.0],
+        [-(r + l) / (r - l), -(t + b) / (t - b), 0.5, 1.0],
+    ]
+    */
 }
 
 pub(crate) fn ortho_matrix(width: f32, height: f32) -> [[f32; 4]; 4] {

@@ -57,11 +57,12 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("no GPU adapter available (run under DISPLAY=:0 with a GPU)");
 
@@ -69,8 +70,7 @@ impl Harness {
             &wgpu::DeviceDescriptor {
                 label: Some("ui_stress device"),
                 ..Default::default()
-            },
-            None,
+            }
         ))
         .expect("request device");
 
@@ -136,10 +136,12 @@ impl Harness {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
         }
         self.ui.render(
@@ -152,7 +154,7 @@ impl Harness {
             list,
         );
         self.queue.submit(Some(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Poll);
+        self.device.poll(wgpu::PollType::Poll);
     }
 }
 

@@ -9,8 +9,9 @@ repository = "https://github.com/serialexp/wgpu-gameui"
 [dependencies]
 wgpu = { version = "30", features = ["webgl"] }
 bytemuck = { version = "1", features = ["derive"] }
-glyphon = "0.8"
+glyphon = "0.12"
 log = "0.4"
+glam = { version = "0.33.2"}
 # Grapheme-cluster segmentation for vertical (stacked) text layout — splitting a
 # label into one cluster per line. Already in the tree transitively via cosmic-text.
 unicode-segmentation = "1"
@@ -69,7 +70,7 @@ byteorder = { version = "1.5.0" }
 chrono = { version = "0.4.42" }
 tokio_with_wasm = { version = "0.8.7", features = ["time"]}
 js-sys = { version = "0.3" }
-web-sys = { version = "0.3", features = ["console","Document", "Window", "Element", "HtmlCanvasElement", "KeyboardEvent", "Performance","ResizeObserver","MouseEvent" ] }
+web-sys = { version = "0.3", features = ["console","Document", "Window", "Element", "HtmlCanvasElement", "KeyboardEvent", "Performance","ResizeObserver","MouseEvent","DomRect" ] }
 tracing = { version = "0.1" }
 
 [[example]]

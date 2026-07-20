@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-
+use wgpu::{CurrentSurfaceTexture, SurfaceColorSpace};
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{
     Button, ClickTracker, CursorIcon, CursorState, DragCapture, DragHandle, DragTracker,
@@ -161,7 +161,7 @@ impl ApplicationHandler for App {
         self.window = Some(window.clone());
 
         // Set up wgpu.
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
             .create_surface(window.clone())
             .expect("create surface");
@@ -169,6 +169,7 @@ impl ApplicationHandler for App {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("request adapter");
 
@@ -176,8 +177,7 @@ impl ApplicationHandler for App {
             &wgpu::DeviceDescriptor {
                 label: Some("hello_ui device"),
                 ..Default::default()
-            },
-            None,
+            }
         ))
         .expect("request device");
 
@@ -199,6 +199,7 @@ impl ApplicationHandler for App {
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            color_space: SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 
@@ -366,8 +367,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let frame = match gpu.surface.get_current_texture() {
-                    Ok(f) => f,
-                    Err(_) => {
+                    CurrentSurfaceTexture::Success(f) => f,
+                    _ => {
                         gpu.surface.configure(&gpu.device, &gpu.config);
                         return;
                     }
@@ -672,8 +673,9 @@ impl ApplicationHandler for App {
                 let stack_font = gpu.custom_font.clone();
                 {
                     let mut ui = UiContext::new(list);
-                    ui.translate(232.0, 410.0);
                     ui.push();
+                    ui.translate(232.0, 410.0);
+
                     ui.font(stack_font, 18.0);
                     ui.bold(true);
                     ui.text_line("font-stack: pushed bold", [0.7, 0.9, 1.0, 1.0]);
@@ -861,10 +863,12 @@ impl ApplicationHandler for App {
                                 }),
                                 store: wgpu::StoreOp::Store,
                             },
+                            depth_slice: None,
                         })],
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
                         occlusion_query_set: None,
+                        multiview_mask: None,
                     });
                 }
 
@@ -879,7 +883,8 @@ impl ApplicationHandler for App {
                 );
 
                 gpu.queue.submit(Some(encoder.finish()));
-                frame.present();
+                //frame.present();
+                gpu.queue.present(frame);
                 self.input.end_frame();
                 window.request_redraw();
             }
