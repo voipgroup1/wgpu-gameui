@@ -105,6 +105,31 @@ fn app() -> Element {
     }
 }
 
+/// Map the library's windowing-agnostic [`CursorIcon`] to winit's. This is the
+/// one place the application bridges UI cursor requests to the windowing system.
+fn set_css_cursor(icon: CursorIcon) -> () {
+    let web_window = web_sys::window().expect("no window");
+
+    let web_document = web_window.document().expect("no document");
+
+    let web_canvas = web_document
+        .get_element_by_id("wgpu-canvas")
+        .expect("no canvas")
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .expect("not a canvas");
+    let css_style = web_canvas.style();
+    match icon {
+        CursorIcon::Default => css_style.set_css_text("cursor: default"),
+        CursorIcon::Pointer => css_style.set_css_text("cursor: pointer"),
+        CursorIcon::Text => css_style.set_css_text("cursor: text"),
+        CursorIcon::Grab => css_style.set_css_text("cursor: grab"),
+        CursorIcon::Grabbing => css_style.set_css_text("cursor: grabbing"),
+        CursorIcon::ResizeHorizontal => css_style.set_css_text("cursor: ew-resize"),
+        CursorIcon::ResizeVertical => css_style.set_css_text("cursor: ns-resize"),
+        CursorIcon::NotAllowed => css_style.set_css_text("cursor: not-allowed"),
+    }
+}
+
 use wgpu_gameui::layout::Rect;
 use wgpu_gameui::{DrawList, InputState, Theme, UiRenderer, KeyboardNav, UiState, Frame};
 use wgpu_gameui::{
@@ -1128,6 +1153,7 @@ async fn run_wgpu_app() {
 
         // ---------- Double-click / hold demo (ClickTracker) ----------
         {
+
             let demo_rect = Rect::new(340.0, 430.0, 150.0, 56.0);
             let on_btn = !base_input.mouse_consumed
                 && demo_rect.contains(base_input.mouse_x, base_input.mouse_y);
@@ -1147,20 +1173,28 @@ async fn run_wgpu_app() {
             } else {
                 "dbl/hold"
             };
-            let list = layers.base_mut();
+            let mut ui = UiContext::new(layers.base_mut());
+            ui.push();
+            ui.translate(415.0, 458.0);
+            ui.center();
+            ui.rounded_rect(150.0, 56.0, 8.0, color);
+            ui.text_line(label, [230.0/256.0,235.0/256.0,245.0/256.0,1.0], Some(120.0));
+            /*
             list.rounded_rect(demo_rect, 8.0, color);
             list.text(
                 TextBlock::new(label, demo_rect.x + 18.0, demo_rect.y + 18.0)
                     .with_size(16.0)
                     .with_color(230, 235, 245),
             );
+            */
+            ui.pop();
         }
 
         input_state_clone.end_frame();
         // Apply the cursor requested by whichever widget the pointer is
         // over this frame (Default if none asked).
         //window.set_cursor(to_winit_cursor(frame_cursor.resolve()));
-
+        set_css_cursor(frame_cursor.resolve());
 
         let mut encoder =
             device_clone1
