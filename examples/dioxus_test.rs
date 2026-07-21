@@ -390,6 +390,7 @@ async fn run_wgpu_app() {
     let input_state_clone2 = input_state.clone();
     let input_state_clone3 = input_state.clone();
     let input_state_clone4 = input_state.clone();
+    let input_state_clone5 = input_state.clone();
     let last_time = Rc::new(RefCell::new(web_window.performance().unwrap().now() / 1000.0));
 
     let drag= Rc::new(RefCell::new(DragTracker::new()));
@@ -494,6 +495,38 @@ async fn run_wgpu_app() {
     let observe_canvas_resize:web_sys::ResizeObserver =web_sys::ResizeObserver::new(canvas_resize_closure.as_ref().unchecked_ref()).unwrap();
     observe_canvas_resize.observe(&web_canvas);
     canvas_resize_closure.forget();
+
+    // Create a closure to handle mouse clicks
+    let mouse_wheel_closure = Closure::wrap(Box::new(move |event: web_sys::WheelEvent| {
+        let web_window = web_sys::window().expect("no window");
+         
+        let web_document = web_window.document().expect("no document");
+    
+        let web_canvas = web_document
+            .get_element_by_id("wgpu-canvas")
+            .expect("no canvas");
+
+        let mut input_state_clone= input_state_clone5.borrow_mut();
+        // Access MouseEvent properties
+        let mut delta_y  =  event.delta_y() as f32;
+        let delta_mode = match event.delta_mode() {
+            web_sys::WheelEvent::DOM_DELTA_PIXEL => {
+                delta_y = delta_y / 20.0f32 ;
+                "pixel"
+            },
+            web_sys::WheelEvent::DOM_DELTA_LINE => {
+                "line" 
+            },
+            web_sys::WheelEvent::DOM_DELTA_PAGE => "page",
+            _=>"UNKNOWN",
+        };
+
+        input_state_clone.scroll_delta= delta_y;
+        
+        web_sys::console::log_1(&format!("Wheel up at: ({}, {})", delta_y, delta_mode).into());
+    }) as Box<dyn FnMut(_)>);
+    web_canvas.add_event_listener_with_callback("wheel", mouse_wheel_closure.as_ref().unchecked_ref()).unwrap();
+    mouse_wheel_closure.forget();
 
     // Create a closure to handle mouse clicks
     let mouse_up_closure = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {

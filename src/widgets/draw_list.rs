@@ -1412,9 +1412,11 @@ impl DrawList {
         }
 
         // Transform origin.
-        let origin = m.transform_point([block.x, block.y]);
-        block.x = origin[0];
-        block.y = origin[1];
+        //let origin = m.transform_point([block.x, block.y]);
+        //block.x = origin[0];
+        //block.y = origin[1];
+        block.x = block.x + m.tx;
+        block.y = block.y + m.ty;
 
         // Apply uniform-ish scale: geometric mean of the two basis lengths,
         // which equals sqrt(|det|). This handles non-uniform axis-aligned
