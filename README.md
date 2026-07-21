@@ -253,6 +253,13 @@ cycles through registered `FocusId`s, scoped to the active layer.
 
 ---
 
+## example
+```bash
+dx serve --platform web --example dioxus_test
+DISPLAY=:0 cargo run --example hello_ui
+```
+![dioxus_test](https://raw.githubusercontent.com/voipgroup1/wgpu-gameui/master/examples/dioxus_test.png)
+
 ## Testing & benchmarks
 
 ```bash

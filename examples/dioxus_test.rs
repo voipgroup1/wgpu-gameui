@@ -523,7 +523,8 @@ async fn run_wgpu_app() {
 
         input_state_clone.scroll_delta= delta_y;
         
-        web_sys::console::log_1(&format!("Wheel up at: ({}, {})", delta_y, delta_mode).into());
+        //web_sys::console::log_1(&format!("Wheel up at: ({}, {})", delta_y, delta_mode).into());
+        event.prevent_default();
     }) as Box<dyn FnMut(_)>);
     web_canvas.add_event_listener_with_callback("wheel", mouse_wheel_closure.as_ref().unchecked_ref()).unwrap();
     mouse_wheel_closure.forget();
@@ -1068,14 +1069,18 @@ async fn run_wgpu_app() {
         // Bonus: rotated badge from the original demo, on the base layer
         // (built via UiContext::with_layers so it stays clipped to the
         // base list).
+        let stack_font = custom_font.clone();
         {
             let mut ui = UiContext::with_layers(&mut layers);
             ui.push();
             ui.translate(660.0, 320.0);
-            ui.rotate(0.0_f32.to_radians());
-            //ui.center();
+            ui.rotate(45.0_f32.to_radians());
+            ui.font(stack_font, 20.0 * 0.8);
+            ui.bold(true);
+            ui.center();
             ui.align("left top");
-            ui.rounded_rect(160.0, 40.0, 6.0, [0.95, 0.45, 0.30, 1.0]);
+            ui.rounded_rect(160.0, 20.0, 6.0, [0.95, 0.45, 0.30, 1.0]);
+            ui.text_line("rotated text label", [0.0, 0.8, 0.0, 1.0], Some(160.0));
             ui.pop();
         }
 
