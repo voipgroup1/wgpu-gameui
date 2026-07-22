@@ -1153,10 +1153,20 @@ async fn run_wgpu_app() {
 
         // ---------- Double-click / hold demo (ClickTracker) ----------
         {
-
+            let mut ui = UiContext::new(layers.base_mut());
+            ui.push();
+            /*
             let demo_rect = Rect::new(340.0, 430.0, 150.0, 56.0);
             let on_btn = !base_input.mouse_consumed
                 && demo_rect.contains(base_input.mouse_x, base_input.mouse_y);
+            */
+            let demo_rect = Rect::new(-75.0, -28.0, 150.0, 56.0);
+            ui.translate(415.0, 508.0);
+            ui.rotate(45.0_f32.to_radians());
+            ui.center();
+            let after_translate_mouse= ui.list().current_transform().inverse().transform_point([base_input.mouse_x, base_input.mouse_y]);
+            let on_btn = !base_input.mouse_consumed
+                && demo_rect.contains(after_translate_mouse[0], after_translate_mouse[1]);
             let color = if on_btn && base_input.mouse_held {
                 [0.85, 0.30, 0.30, 1.0] // red = held
             } else if on_btn && base_input.mouse_double_clicked {
@@ -1173,12 +1183,8 @@ async fn run_wgpu_app() {
             } else {
                 "dbl/hold"
             };
-            let mut ui = UiContext::new(layers.base_mut());
-            ui.push();
-            ui.translate(415.0, 458.0);
-            ui.center();
             ui.rounded_rect(150.0, 56.0, 8.0, color);
-            ui.text_line(label, [230.0/256.0,235.0/256.0,245.0/256.0,1.0], Some(120.0));
+            ui.text_line(label, [230.0/255.0,235.0/255.0,245.0/255.0,1.0], Some(120.0));
             /*
             list.rounded_rect(demo_rect, 8.0, color);
             list.text(
