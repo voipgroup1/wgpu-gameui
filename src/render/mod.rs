@@ -31,7 +31,7 @@ pub(crate) use phosphor::{PHOSPHOR_FONT_ID, phosphor_font_data, phosphor_glyph_i
 pub use atlas::{AtlasRegion, SpriteAtlas, SpriteId};
 pub use blur::{Backdrop, BlurParams};
 pub use image_cache::{ImageCache, ImageEntry, ImageError};
-pub(crate) use ui_renderer::{ortho_matrix,ortho_matrix2};
+pub(crate) use ui_renderer::{ortho_matrix};
 pub use ui_renderer::{NineSliceMeta, UiRenderer};
 
 pub use crate::widgets::NineSliceId;
