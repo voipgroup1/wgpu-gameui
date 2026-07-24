@@ -11,7 +11,6 @@ wgpu = { version = "30", features = ["webgl"] }
 bytemuck = { version = "1", features = ["derive"] }
 glyphon = "0.12"
 log = "0.4"
-glam = { version = "0.33.2"}
 # Grapheme-cluster segmentation for vertical (stacked) text layout — splitting a
 # label into one cluster per line. Already in the tree transitively via cosmic-text.
 unicode-segmentation = "1"
@@ -24,7 +23,7 @@ tracing = { version = "0.1", optional = true }
 fdsm = "0.8"
 fdsm-ttf-parser = "0.2"
 ttf-parser = "0.25"
-nalgebra = "0.34"
+nalgebra = "0.34.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Bundled default UI font (Noto Sans regular/bold/italic/bold-italic). Optional,
 # enabled by the default `bundled-font` feature so the UI renders identically on

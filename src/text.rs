@@ -20,7 +20,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+
+use nalgebra::{Matrix4, Vector3};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::Affine2;
@@ -1362,12 +1363,18 @@ fn push_glyph_quad(
         None => ([0.0; 4], 0.0),
     };
 
-    let rotation_matrix = Mat4::from_rotation_z(current_transform.angle);
-    let center = Vec3::new(current_transform.tx,current_transform.ty , 0.0);
-    let translation_to_origin = Mat4::from_translation(-center);
-    let translation_back = Mat4::from_translation(center);
-    let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
+    //let rotation_matrix = Mat4::from_rotation_z(current_transform.angle);
+    //let center = Vec3::new(current_transform.tx,current_transform.ty , 0.0);
+    //let translation_to_origin = Mat4::from_translation(-center);
+    //let translation_back = Mat4::from_translation(center);
+    //let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
+    let center = Vector3::new(current_transform.tx,current_transform.ty , 0.0);
+    let rotation_matrix = Matrix4::new_rotation(Vector3::z() * current_transform.angle);
+    let translation_to_origin = Matrix4::new_translation(&-center);
+    let translation_back = Matrix4::new_translation(&center);
+    let model_transform = translation_back * rotation_matrix * translation_to_origin;
 
+    let raw_slice =  model_transform.as_slice();
     let v = |x: f32, y: f32, u: f32, vv: f32| MsdfVertex {
         position: [x, y],
         uv: [u, vv],
@@ -1378,10 +1385,10 @@ fn push_glyph_quad(
         outline: style.outline,
         outline_width: style.outline_width,
         softness: style.softness,
-        model_col_0:model_transform[0],
-        model_col_1:model_transform[1],
-        model_col_2:model_transform[2],
-        model_col_3:model_transform[3],
+        model_col_0:[raw_slice[0],raw_slice[1],raw_slice[2],raw_slice[3]],
+        model_col_1:[raw_slice[4],raw_slice[5],raw_slice[6],raw_slice[7]],
+        model_col_2:[raw_slice[8],raw_slice[9],raw_slice[10],raw_slice[11]],
+        model_col_3:[raw_slice[12],raw_slice[13],raw_slice[14],raw_slice[15]],
 
     };
 
@@ -1461,12 +1468,18 @@ fn push_icon_quad(
     let br = t.transform_point([x1, y1]);
     let bl = t.transform_point([x0, y1]);
 
-    let rotation_matrix = Mat4::from_rotation_z(icon.transform.angle);
-    let center = Vec3::new(icon.transform.tx,icon.transform.ty , 0.0);
-    let translation_to_origin = Mat4::from_translation(-center);
-    let translation_back = Mat4::from_translation(center);
-    let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
+    //let rotation_matrix = Mat4::from_rotation_z(icon.transform.angle);
+    //let center = Vec3::new(icon.transform.tx,icon.transform.ty , 0.0);
+    //let translation_to_origin = Mat4::from_translation(-center);
+    //let translation_back = Mat4::from_translation(center);
+    //let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
+    let center = Vector3::new(icon.transform.tx,icon.transform.ty , 0.0);
+    let rotation_matrix = Matrix4::new_rotation(Vector3::z() * icon.transform.angle);
+    let translation_to_origin = Matrix4::new_translation(&-center);
+    let translation_back = Matrix4::new_translation(&center);
+    let model_transform = translation_back * rotation_matrix * translation_to_origin;
 
+    let raw_slice =  model_transform.as_slice();
     let v = |pos: [f32; 2], u: f32, vv: f32| MsdfVertex {
         position: pos,
         uv: [u, vv],
@@ -1477,10 +1490,10 @@ fn push_icon_quad(
         outline: [0.0; 4],
         outline_width: 0.0,
         softness: 0.0,
-        model_col_0: model_transform[0],
-        model_col_1:model_transform[1],
-        model_col_2:model_transform[2],
-        model_col_3:model_transform[3],
+        model_col_0:[raw_slice[0],raw_slice[1],raw_slice[2],raw_slice[3]],
+        model_col_1:[raw_slice[4],raw_slice[5],raw_slice[6],raw_slice[7]],
+        model_col_2:[raw_slice[8],raw_slice[9],raw_slice[10],raw_slice[11]],
+        model_col_3:[raw_slice[12],raw_slice[13],raw_slice[14],raw_slice[15]],
     };
 
     // TL, TR, BR / TL, BR, BL
