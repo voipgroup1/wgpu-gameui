@@ -26,11 +26,11 @@
 //! // result.get(3) = down button rect
 //! ```
 
+
 // Public API is the contract for integrating apps; every exported type, field,
 // and method must carry rustdoc. `warn` (not `deny`) so a work-in-progress
 // build still compiles, but the project's warning-clean bar surfaces any gap.
 #![warn(missing_docs)]
-
 mod text;
 
 pub use text::{

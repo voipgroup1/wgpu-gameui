@@ -20,10 +20,10 @@ tracing = { version = "0.1", optional = true }
 # MSDF text: pure-Rust multi-channel signed distance field generation from glyph
 # outlines. `image` provides the `RgbImage` buffer fdsm fills, plus PNG/JPEG codecs
 # for runtime UI image loading (UiImage/UiImageBox etc.).
-fdsm = "0.8"
-fdsm-ttf-parser = "0.2"
+nalgebra = "0.35.0"
+fdsm = {path = "fdsm/"}
 ttf-parser = "0.25"
-nalgebra = "0.34.2"
+
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Bundled default UI font (Noto Sans regular/bold/italic/bold-italic). Optional,
 # enabled by the default `bundled-font` feature so the UI renders identically on
