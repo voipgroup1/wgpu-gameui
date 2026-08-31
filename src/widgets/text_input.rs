@@ -835,6 +835,11 @@ impl TextInput {
                 Some(text_max_w),
                 wrap,
                 self.direction,
+                if let Some(font) = s.theme().font.as_ref() {
+                    Some(font.family())
+                } else {
+                    None
+                }
             )
         } else {
             Vec::new()
@@ -958,6 +963,11 @@ impl TextInput {
                 Some(text_max_w),
                 wrap,
                 self.direction,
+                if let Some(font) = s.theme().font.as_ref() {
+                    Some(font.family())
+                } else {
+                    None
+                }
             )
         } else {
             Vec::new()
@@ -1866,7 +1876,7 @@ mod tests {
 
     /// Build a `[CaretPos]` layout matching what a multiline field lays out, so
     /// keyboard tests can exercise vertical nav / line Home-End off-screen.
-    fn caret_layout(text: &str, max_width: f32) -> Vec<CaretPos> {
+    fn caret_layout(text: &str, max_width: f32, family_name: Option<&str>) -> Vec<CaretPos> {
         let fsh = crate::text::shared_font_system();
         let mut fs = fsh.lock().unwrap();
         crate::text::text_caret_layout(
@@ -1876,7 +1886,7 @@ mod tests {
             20.0,
             max_width,
             WrapMode::WordOrGlyph,
-            None,
+            family_name,
             crate::text::TextDirection::Auto,
         )
     }
@@ -1908,7 +1918,7 @@ mod tests {
     fn up_down_move_across_lines() {
         // Two short lines; the layout is unambiguous.
         let mut ti = make_input("foo\nbar").with_multiline(true);
-        let layout = caret_layout("foo\nbar", 1000.0);
+        let layout = caret_layout("foo\nbar", 1000.0, Some("Alibaba PuHuiTi 2.0"));
         // Put the cursor at the end of line 0 ("foo", byte 3).
         ti.cursor_pos = 3;
         // Down → land on line 1.
@@ -1934,7 +1944,7 @@ mod tests {
     #[test]
     fn up_at_top_and_down_at_bottom_are_noops() {
         let mut ti = make_input("foo\nbar").with_multiline(true);
-        let layout = caret_layout("foo\nbar", 1000.0);
+        let layout = caret_layout("foo\nbar", 1000.0, Some("Alibaba PuHuiTi 2.0"));
         ti.cursor_pos = 1; // line 0
         let mut up = fake_input();
         up.key_up = true;
@@ -1959,7 +1969,7 @@ mod tests {
     #[test]
     fn shift_down_extends_selection() {
         let mut ti = make_input("foo\nbar").with_multiline(true);
-        let layout = caret_layout("foo\nbar", 1000.0);
+        let layout = caret_layout("foo\nbar", 1000.0, Some("Alibaba PuHuiTi 2.0"));
         ti.cursor_pos = 1;
         let mut ev = fake_input();
         ev.key_down = true;
@@ -1979,7 +1989,7 @@ mod tests {
         // column on line 0 should keep the column across the short middle line.
         let text = "abcdefghij\nx\nabcdefghij";
         let mut ti = make_input(text).with_multiline(true);
-        let layout = caret_layout(text, 1000.0);
+        let layout = caret_layout(text, 1000.0, Some("Alibaba PuHuiTi 2.0"));
         // Place the caret near the end of line 0 (byte 10, the '\n').
         ti.cursor_pos = 10;
         let start_x = caret_for_byte(&layout, ti.cursor_pos).x;
@@ -2016,7 +2026,7 @@ mod tests {
     fn home_end_are_line_relative_in_multiline() {
         let text = "hello\nworld";
         let mut ti = make_input(text).with_multiline(true);
-        let layout = caret_layout(text, 1000.0);
+        let layout = caret_layout(text, 1000.0, Some("Alibaba PuHuiTi 2.0"));
         // Cursor in the middle of line 1 ("world", byte 8).
         ti.cursor_pos = 8;
         let mut home = fake_input();
@@ -2032,7 +2042,7 @@ mod tests {
     #[test]
     fn line_bounds_finds_visual_line_extent() {
         let text = "ab\ncd";
-        let layout = caret_layout(text, 1000.0);
+        let layout = caret_layout(text, 1000.0,Some("Alibaba PuHuiTi 2.0"));
         // Byte 4 is on line 1 ("cd", bytes 3..5).
         let (lo, hi) = line_bounds(&layout, 4);
         assert_eq!(lo, 3);

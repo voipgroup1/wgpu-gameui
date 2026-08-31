@@ -421,12 +421,13 @@ impl DrawList {
         max_width: Option<f32>,
         wrap: crate::text::WrapMode,
         direction: crate::text::TextDirection,
+        family_name: Option<&str>,
     ) -> Vec<crate::text::CaretPos> {
         let handle = self.text_measurer.font_system_handle();
         let mut fs = handle.lock().expect("FontSystem poisoned");
         let mw = max_width.unwrap_or(f32::MAX / 4.0);
         let lh = font_size * 1.25;
-        crate::text::text_caret_layout(&mut fs, text, font_size, lh, mw, wrap, None, direction)
+        crate::text::text_caret_layout(&mut fs, text, font_size, lh, mw, wrap, family_name, direction)
     }
 
     /// Visual-order glyph layout for bidi-aware editing — the source for
