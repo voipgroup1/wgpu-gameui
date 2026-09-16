@@ -217,9 +217,9 @@ pub struct TextInput {
     /// Set via [`with_direction`](Self::with_direction).
     pub direction: crate::TextDirection,
     /// Clipboard getter — returns the current clipboard contents.
-    clipboard_get: Option<Box<dyn FnMut() -> String>>,
+    clipboard_get: Option<Box<dyn FnMut() -> String + Send>>,
     /// Clipboard setter — writes text to the clipboard.
-    clipboard_set: Option<Box<dyn FnMut(String)>>,
+    clipboard_set: Option<Box<dyn FnMut(String) + Send>>,
 }
 
 impl Default for TextInput {
@@ -349,12 +349,12 @@ impl TextInput {
     }
 
     /// Set the clipboard getter closure (e.g. `|| arboard::Clipboard::new().unwrap().get_text().unwrap_or_default()`).
-    pub fn set_clipboard_get(&mut self, f: impl FnMut() -> String + 'static) {
+    pub fn set_clipboard_get(&mut self, f: impl FnMut() -> String + Send + 'static) {
         self.clipboard_get = Some(Box::new(f));
     }
 
     /// Set the clipboard setter closure (e.g. `|t| { let _ = arboard::Clipboard::new().unwrap().set_text(t); }`).
-    pub fn set_clipboard_set(&mut self, f: impl FnMut(String) + 'static) {
+    pub fn set_clipboard_set(&mut self, f: impl FnMut(String) + Send + 'static) {
         self.clipboard_set = Some(Box::new(f));
     }
 
@@ -1720,37 +1720,41 @@ mod tests {
 
     #[test]
     fn cut_with_clipboard() {
-        let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let mut ti = make_input("hello world");
         ti.selection_start = Some(0);
         ti.cursor_pos = 5; // select "hello"
-        ti.set_clipboard_set({
-            let copied = copied.clone();
-            move |t| *copied.borrow_mut() = t
+        let copied_clone= copied.clone();
+        ti.set_clipboard_set(move |t|{
+            let mut copied = copied_clone.lock().unwrap();
+            copied.clone_from(&t)
         });
         ti.cut();
         assert_eq!(ti.value, " world");
         assert_eq!(ti.cursor_pos, 0);
         assert_eq!(ti.selection_start, None);
-        assert_eq!(*copied.borrow(), "hello");
+        let copied_clone= copied.clone();
+        assert_eq!(*copied_clone.lock().unwrap(), "hello");
     }
 
     #[test]
     fn copy_with_clipboard() {
-        let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let mut ti = make_input("hello world");
         ti.selection_start = Some(6);
         ti.cursor_pos = 11; // select "world"
-        ti.set_clipboard_set({
-            let copied = copied.clone();
-            move |t| *copied.borrow_mut() = t
+        let copied_clone= copied.clone();
+        ti.set_clipboard_set(move |t|{
+            let mut copied = copied_clone.lock().unwrap();
+            copied.clone_from(&t)
         });
         ti.copy();
         // Value unchanged after copy.
         assert_eq!(ti.value, "hello world");
         assert_eq!(ti.selection_start, Some(6));
         assert_eq!(ti.cursor_pos, 11);
-        assert_eq!(*copied.borrow(), "world");
+        let copied_clone= copied.clone();
+        assert_eq!(*copied_clone.lock().unwrap(), "world");
     }
 
     #[test]
@@ -1777,13 +1781,14 @@ mod tests {
 
     #[test]
     fn ctrl_x_cut_with_clipboard() {
-        let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let mut ti = make_input("abcdef");
         ti.selection_start = Some(1);
         ti.cursor_pos = 4; // select "bcd"
-        ti.set_clipboard_set({
-            let copied = copied.clone();
-            move |t| *copied.borrow_mut() = t
+        let copied_clone= copied.clone();
+        ti.set_clipboard_set(move |t|{
+            let mut copied = copied_clone.lock().unwrap();
+            copied.clone_from(&t)
         });
         let mut input = fake_input();
         input.ctrl_pressed = true;
@@ -1791,25 +1796,28 @@ mod tests {
         input.text_input = "\x18".to_string();
         ti.process_keyboard(&input);
         assert_eq!(ti.value, "aef");
-        assert_eq!(*copied.borrow(), "bcd");
+        let copied_clone= copied.clone();
+        assert_eq!(*copied_clone.lock().unwrap(), "bcd");
     }
 
     #[test]
     fn ctrl_c_copy_with_clipboard() {
-        let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let mut ti = make_input("abcdef");
         ti.selection_start = Some(2);
         ti.cursor_pos = 5; // select "cde"
-        ti.set_clipboard_set({
-            let copied = copied.clone();
-            move |t| *copied.borrow_mut() = t
+        let copied_clone= copied.clone();
+        ti.set_clipboard_set(move |t|{
+            let mut copied = copied_clone.lock().unwrap();
+            copied.clone_from(&t)
         });
         let mut input = fake_input();
         input.ctrl_pressed = true;
         input.text_input = "\x03".to_string(); // Ctrl+C ASCII code
         ti.process_keyboard(&input);
         assert_eq!(ti.value, "abcdef"); // unchanged
-        assert_eq!(*copied.borrow(), "cde");
+        let copied_clone= copied.clone();
+        assert_eq!(*copied_clone.lock().unwrap(), "cde");
     }
 
     #[test]
