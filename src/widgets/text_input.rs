@@ -503,11 +503,16 @@ impl TextInput {
         if clip.is_empty() {
             return;
         }
+        let clip_fix = if !self.multiline {
+            clip.chars().filter(|c| *c!='\r'&& *c!='\n').collect()
+        }else {
+            String::from(&clip)
+        };
         // Delete any active selection first.
         if self.selection_start.is_some() {
             self.delete_selection();
         }
-        self.value.insert_str(self.cursor_pos, &clip);
+        self.value.insert_str(self.cursor_pos, &clip_fix);
         self.cursor_pos += clip.len();
         self.selection_start = None;
     }
@@ -864,6 +869,11 @@ impl TextInput {
                 Some(text_max_w),
                 wrap,
                 self.direction,
+                if let Some(font) = s.theme().font.as_ref() {
+                    Some(font.family())
+                } else {
+                    None
+                }
             )
         } else {
             Vec::new()
@@ -1030,6 +1040,11 @@ impl TextInput {
                     Some(text_max_w),
                     wrap,
                     self.direction,
+                    if let Some(font) = s.theme().font.as_ref() {
+                        Some(font.family())
+                    } else {
+                        None
+                    }
                 )
             } else {
                 Vec::new()
