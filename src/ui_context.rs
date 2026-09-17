@@ -11,26 +11,27 @@
 
 use crate::InputState;
 use crate::affine::Affine2;
+use crate::animation::AnimationState;
 use crate::color::Hsva;
 use crate::layer::{LayerKind, LayerStack};
 use crate::layout::Rect;
+use crate::render::SpriteId;
 use crate::style::{StyleKey, StyleOverlay, StyleResolver, StyleValue};
 use crate::text::{FontHandle, TextBlock};
 use crate::theme::Theme;
 use crate::widgets::DrawList;
-use crate::animation::AnimationState;
-use crate::render::SpriteId;
 use crate::widgets::{
     Banner, Button, Checkbox, ColorPicker, ColorPickerOutput, DragCapture, DragHandle,
-    DragHandleOutput, DragId, DrawContext, Dropdown, DropdownId, DropdownState,
-    FocusId, FocusState, Group, HitZone, HitZoneOutput, ImageButton, NumberInput, Panel,
-    ProgressBar, RadioGroup, ScrollBegin, ScrollState, ScrollView, Separator, Severity, Slider,
-    Tabs, TextInput, ToastStack, TooltipLayer, TreeId, TreeNode, TreeNodeOutput,
-    TreeState,
+    DragHandleOutput, DragId, DrawContext, Dropdown, DropdownId, DropdownState, FocusId,
+    FocusState, Group, HitZone, HitZoneOutput, ImageButton, NumberInput, Panel, ProgressBar,
+    RadioGroup, ScrollBegin, ScrollState, ScrollView, Separator, Severity, Slider, Tabs, TextInput,
+    ToastStack, TooltipLayer, TreeId, TreeNode, TreeNodeOutput, TreeState,
 };
-use glyphon::{Style, Weight};
+#[cfg(feature = "phosphor-icons")]
+use crate::{Icon, PhosphorIcon};
+use glyphon::cosmic_text::{Style, Weight};
 use std::collections::HashMap;
-
+use std::sync::{Arc, Mutex};
 /// Horizontal alignment relative to the current origin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AlignH {
@@ -120,6 +121,8 @@ pub struct FontSpec {
     pub font: Option<FontHandle>,
     /// Font size in pixels.
     pub size: f32,
+    /// Additional spacing between glyphs in pixels.
+    pub letter_spacing: f32,
     /// Weight (e.g. `Weight::NORMAL` / `Weight::BOLD`).
     pub weight: Weight,
     /// Style (`Normal` / `Italic` / `Oblique`).
@@ -131,6 +134,7 @@ impl Default for FontSpec {
         Self {
             font: None,
             size: 16.0,
+            letter_spacing: 0.0,
             weight: Weight::NORMAL,
             style: Style::Normal,
         }
@@ -162,6 +166,10 @@ pub struct UiState {
     pub focus: FocusState,
     /// Open-dropdown / selection state for `Dropdown` widgets.
     pub dropdowns: DropdownState,
+    /// Retained hit geometry used for topmost-first pointer dispatch. Input is
+    /// resolved against the previous completed frame while this frame registers
+    /// replacement geometry.
+    pub interactions: crate::InteractionScene,
     /// Scroll offsets for `ScrollView` widgets.
     pub scroll: ScrollState,
     /// Expansion + selection state for `tree_node`/`tree_leaf` verbs.
@@ -171,6 +179,10 @@ pub struct UiState {
     /// these directly — the verb owns the cursor while the caller owns the
     /// `String`.
     text_inputs: HashMap<FocusId, TextInput>,
+    /// Shared platform clipboard reader installed on retained text editors.
+    clipboard_get: Option<crate::widgets::ClipboardGet>,
+    /// Shared platform clipboard writer installed on retained text editors.
+    clipboard_set: Option<crate::widgets::ClipboardSet>,
     /// Vertical gap inserted between auto-advanced verbs. Re-seeded from
     /// `theme.spacing` each frame by [`UiState::begin_frame`].
     pub item_gap: f32,
@@ -204,13 +216,32 @@ impl UiState {
         Self::default()
     }
 
-    /// Per-frame setup: fill this frame's navigation intents via `nav`, arm focus
-    /// navigation for the resulting confirm/cancel/next/prev/directional edges,
-    /// seed the auto-advance gap from the theme, and advance the animation clock
-    /// by `dt` seconds. Call before building the frame's interactive verbs
-    /// (mirrors [`InputState::end_frame`] timing). Pass `0.0` for `dt` to freeze
-    /// animations (e.g. a paused frame or a static render); the eased verbs then
-    /// hold their current value.
+    /// Install platform clipboard callbacks used by all text and textarea fields.
+    pub fn set_clipboard(
+        &mut self,
+        get: impl FnMut() -> String + 'static + Send,
+        set: impl FnMut(String) + 'static + Send,
+    ) {
+        self.clipboard_get = Some(Arc::new(Mutex::new(Box::new(get))));
+        self.clipboard_set = Some(Arc::new(Mutex::new(Box::new(set))));
+    }
+
+    /// Per-frame setup: fill this frame's navigation intents via `nav`, let each
+    /// consumer **claim** the intents it will act on, arm focus navigation for
+    /// whatever is left, seed the auto-advance gap from the theme, and advance the
+    /// animation clock by `dt` seconds. Call before building the frame's
+    /// interactive verbs (mirrors [`InputState::end_frame`] timing). Pass `0.0`
+    /// for `dt` to freeze animations (e.g. a paused frame or a static render); the
+    /// eased verbs then hold their current value.
+    ///
+    /// The consumer order is a **contract**, not an implementation detail. Each
+    /// consumer runs at frame-top and zeroes the `nav` intents it owns in the
+    /// shared `InputState`, so consumers later in the list — and the base layer,
+    /// which draws after all of them — never see an intent somebody else already
+    /// handled. The order is: nav map → dropdowns → tree → focus → interactions.
+    /// Dropdowns before focus is what stops a single Escape from both closing an
+    /// open list and blurring the focused field; the tree and focus both read
+    /// directional intents, so they must come after whichever popup claims them.
     ///
     /// `nav` is a [`NavMap`](crate::NavMap) — pass [`KeyboardNav`](crate::KeyboardNav)
     /// for the default keyboard binding, a closure that also folds in a
@@ -226,9 +257,10 @@ impl UiState {
         nav: &dyn crate::NavMap,
     ) {
         nav.apply(input);
-        self.focus.begin_frame(input);
-        self.tree.begin_frame(input);
         self.dropdowns.begin_frame(input);
+        self.tree.begin_frame(input);
+        self.focus.begin_frame(input);
+        self.interactions.begin_frame(input);
         self.item_gap = theme.spacing;
         self.next_auto_id = 0;
         self.tree_focus_registered = false;
@@ -236,15 +268,22 @@ impl UiState {
     }
 
     /// Per-frame teardown: resolve tree arrow-navigation (gated on the tree
-    /// holding focus), then resolve focus/Tab navigation against the widgets
-    /// registered this frame. Call after building the frame's verbs.
+    /// holding focus), hand each popup's pointer claim to focus, then resolve
+    /// focus/Tab navigation against the widgets registered this frame. Call after
+    /// building the frame's verbs.
+    ///
+    /// Order matters here too: the dropdown reports its row claim to
+    /// [`FocusState`] **before** focus resolves click-elsewhere blur, so choosing
+    /// an option does not blur the widget the option acts on.
     pub fn end_frame(&mut self) {
         // Resolve tree nav before Tab moves focus, using this frame's focus owner.
         let tree_focused = self.focus.is_focused(TREE_FOCUS_ID);
         self.tree.end_frame(tree_focused);
+        // Dismiss the open dropdown on Escape or click-outside; a claimed row
+        // click is handed to focus first so it does not blur.
+        self.dropdowns.end_frame(&mut self.focus);
         self.focus.end_frame(None);
-        // Dismiss the open dropdown on Escape or click-outside.
-        self.dropdowns.end_frame();
+        self.interactions.end_frame();
     }
 
     /// Push the popup layer for the open dropdown (using last frame's geometry)
@@ -313,10 +352,18 @@ pub struct UiContext<'a> {
     /// `window_stack` length recorded at each `push`, restored at the matching
     /// `pop`.
     window_depth_stack: Vec<usize>,
+    /// Open debug-scope depth recorded at each `push`, restored at the matching
+    /// `pop`, so a scope opened inside a `push`/`pop` frame (notably by
+    /// [`window_begin`](UiContext::window_begin)) closes with it.
+    debug_scope_depth_stack: Vec<usize>,
     /// Stack of layer kinds still open — used by Drop debug_assert, by
     /// modal_end / popup_end to verify the caller closed the right kind, and
     /// to detect unbalanced begin/end pairs. Length == number of open layers.
     open_layer_kinds: Vec<LayerKind>,
+    /// Number of local rectangle scopes opened by [`rect_begin`](Self::rect_begin)
+    /// and not yet closed by [`rect_end`](Self::rect_end). Kept separate from the
+    /// general push stack so bindings get a useful mismatched-end assertion.
+    open_rect_scopes: usize,
     /// Names of unknown align tokens we've already warned about, to keep one
     /// typo from spamming the log every frame.
     warned_align_tokens: std::collections::HashSet<String>,
@@ -356,9 +403,20 @@ pub struct UiContext<'a> {
     /// and saved/restored across nesting. `false` by default.
     input_disabled: bool,
     /// Saved viewport rect for a [`scroll_begin`](Self::scroll_begin) /
-    /// [`scroll_end`](Self::scroll_end) pair. `None` when no scroll is in
-    /// progress.
+    /// [`scroll_end`](Self::scroll_end) pair, in **local** space (what the
+    /// widget draws against). `None` when no scroll is in progress.
     pending_scroll_viewport: Option<Rect>,
+    /// Viewport height of the pending scroll region, used by
+    /// [`scroll_end`](Self::scroll_end) to advance the layout cursor once the
+    /// scroll transform has been popped.
+    pending_scroll_height: Option<f32>,
+    /// Inverse of the transform in force at the matching `scroll_begin`.
+    /// `scroll_end` draws the scrollbars *after* `ScrollView::end` pops the
+    /// clip/transform that `begin` pushed, so it must map the pointer with the
+    /// begin-time inverse rather than whatever is on the stack when it is
+    /// called. Without this the scrollbar hover/drag test reads world-space
+    /// coordinates against a local-space rect.
+    pending_scroll_inv: Option<Affine2>,
     /// Saved [`ScrollBegin`] from the most recent
     /// [`scroll_begin`](Self::scroll_begin), handed back to
     /// [`scroll_end`](Self::scroll_end).
@@ -376,7 +434,9 @@ impl<'a> UiContext<'a> {
             clip_depth_stack: Vec::new(),
             window_stack: Vec::new(),
             window_depth_stack: Vec::new(),
+            debug_scope_depth_stack: Vec::new(),
             open_layer_kinds: Vec::new(),
+            open_rect_scopes: 0,
             warned_align_tokens: std::collections::HashSet::new(),
             font_stack: vec![FontSpec::default()],
             style_stack: vec![StyleOverlay::new()],
@@ -387,6 +447,8 @@ impl<'a> UiContext<'a> {
             auto_advance: true,
             input_disabled: false,
             pending_scroll_viewport: None,
+            pending_scroll_height: None,
+            pending_scroll_inv: None,
             pending_scroll_begin: None,
         }
     }
@@ -399,7 +461,9 @@ impl<'a> UiContext<'a> {
             clip_depth_stack: Vec::new(),
             window_stack: Vec::new(),
             window_depth_stack: Vec::new(),
+            debug_scope_depth_stack: Vec::new(),
             open_layer_kinds: Vec::new(),
+            open_rect_scopes: 0,
             warned_align_tokens: std::collections::HashSet::new(),
             font_stack: vec![FontSpec::default()],
             style_stack: vec![StyleOverlay::new()],
@@ -410,6 +474,8 @@ impl<'a> UiContext<'a> {
             auto_advance: true,
             input_disabled: false,
             pending_scroll_viewport: None,
+            pending_scroll_height: None,
+            pending_scroll_inv: None,
             pending_scroll_begin: None,
         }
     }
@@ -463,6 +529,8 @@ impl<'a> UiContext<'a> {
         self.style_stack.push(style_top);
         self.clip_depth_stack.push(clip_depth);
         self.window_depth_stack.push(window_depth);
+        let scope_depth = self.backend.list_mut().debug_scope_depth();
+        self.debug_scope_depth_stack.push(scope_depth);
     }
 
     /// Pop transform + tint + align + clip/window scope (Teardown's `UiPop`).
@@ -487,6 +555,9 @@ impl<'a> UiContext<'a> {
         }
         if let Some(depth) = self.window_depth_stack.pop() {
             self.window_stack.truncate(depth);
+        }
+        if let Some(depth) = self.debug_scope_depth_stack.pop() {
+            self.backend.list_mut().truncate_debug_scopes(depth);
         }
     }
 
@@ -553,6 +624,14 @@ impl<'a> UiContext<'a> {
         }
     }
 
+    /// Set additional spacing between glyphs in pixels. Scoped to the enclosing
+    /// [`push`](Self::push)/[`pop`](Self::pop) frame.
+    pub fn letter_spacing(&mut self, letter_spacing: f32) {
+        if let Some(top) = self.font_stack.last_mut() {
+            top.letter_spacing = letter_spacing;
+        }
+    }
+
     /// Set just the current font family, leaving size/weight/style intact.
     pub fn font_family(&mut self, font: FontHandle) {
         if let Some(top) = self.font_stack.last_mut() {
@@ -602,6 +681,7 @@ impl<'a> UiContext<'a> {
         let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0) as u8;
         let block = TextBlock::new(text, 0.0, 0.0)
             .with_size(spec.size)
+            .with_letter_spacing(spec.letter_spacing)
             .with_rgba(
                 to_u8(color[0]),
                 to_u8(color[1]),
@@ -617,6 +697,74 @@ impl<'a> UiContext<'a> {
         else {
             self.text_block(block);
         }
+    }
+
+    /// Natural size of a single line under the active font stack. Use this when
+    /// composing custom horizontal rows so the next widget starts after the
+    /// actual label rather than a guessed character width.
+    pub fn text_line_size(&mut self, text: &str) -> (f32, f32) {
+        let block = self.text_line_block(text, [1.0; 4]);
+        self.backend.list_mut().measure_block(&block)
+    }
+
+    /// Run one pure contextual measurement operation using the active theme,
+    /// style overlay, and font stack. The callback cannot draw or register input:
+    /// it receives only the narrow CPU measurement context.
+    pub fn measure<R>(
+        &mut self,
+        constraints: crate::MeasureConstraints,
+        scale_factor: f32,
+        wrap: crate::WrapMode,
+        measure: impl FnOnce(&mut crate::MeasureContext<'_>) -> R,
+    ) -> R {
+        let theme = self
+            .theme
+            .expect("UiContext::measure requires interactive state");
+        let styles = StyleResolver::with_overlay(
+            theme,
+            self.style_stack.last().expect("style stack is never empty"),
+        );
+        let font = self.current_font();
+        let text = self.backend.list_mut().text_measurer_mut();
+        let mut cx =
+            crate::MeasureContext::new(text, styles, font, constraints, scale_factor, wrap);
+        measure(&mut cx)
+    }
+
+    /// Draw prepared text once, consuming its owned block so content/spans are
+    /// transferred into the draw list without cloning.
+    pub fn draw_measured_text(&mut self, text: crate::MeasuredText) {
+        self.text_block(text.into_block());
+    }
+
+    /// Draw wrapping text constrained to `max_width`, returning its measured
+    /// `(width, height)`. This is the non-auto-advancing counterpart to
+    /// [`text`](Self::text): callers composing variable-height content can advance
+    /// by the returned height rather than assuming a single line.
+    pub fn wrapped_text(&mut self, text: &str, color: [f32; 4], max_width: f32) -> (f32, f32) {
+        let block = self
+            .text_line_block(text, color)
+            .with_max_width(max_width.max(0.0));
+        let size = self.backend.list_mut().measure_block(&block);
+        self.text_block(block);
+        size
+    }
+
+    fn text_line_block(&self, text: &str, color: [f32; 4]) -> TextBlock {
+        let spec = self.current_font();
+        let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0) as u8;
+        TextBlock::new(text, 0.0, 0.0)
+            .with_size(spec.size)
+            .with_letter_spacing(spec.letter_spacing)
+            .with_rgba(
+                to_u8(color[0]),
+                to_u8(color[1]),
+                to_u8(color[2]),
+                to_u8(color[3]),
+            )
+            .with_font_opt(spec.font)
+            .with_weight(spec.weight)
+            .with_style(spec.style)
     }
 
     /// Replace the current tint (Teardown's `UiColor`).
@@ -713,13 +861,27 @@ impl<'a> UiContext<'a> {
     /// the current origin under the active alignment, then transform through
     /// the active affine.
     pub fn place_rect(&mut self, width: f32, height: f32) -> Rect {
-        let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
-        let [ox, oy] = align.offset(width, height);
-        let local = Rect::new(ox, oy, width, height);
+        let local = self.place_local(width, height);
         self.backend
             .list_mut()
             .current_transform()
             .transform_rect_aabb(local)
+    }
+
+    /// The **local**-space rect for a widget of the given size at the current
+    /// origin under the active alignment — i.e. [`place_rect`](Self::place_rect)
+    /// without the transform applied.
+    ///
+    /// This is what a widget that draws through `DrawList` must be handed.
+    /// `DrawList` applies the active transform itself at push time, so passing
+    /// it an already-transformed rect applies the transform twice. Interactive
+    /// verbs go the other way round — they need world space for hit-testing and
+    /// then undo it via `localize` — but a purely visual widget only ever wants
+    /// the local rect.
+    fn place_local(&mut self, width: f32, height: f32) -> Rect {
+        let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
+        let [ox, oy] = align.offset(width, height);
+        Rect::new(ox, oy, width, height)
     }
 
     /// Clip subsequent drawing to a `w`×`h` rect at the current origin
@@ -742,15 +904,141 @@ impl<'a> UiContext<'a> {
     /// [`clip_rect`](Self::clip_rect) for the `inherit` semantics). Scoped to the
     /// enclosing `push`/`pop`.
     pub fn window_begin(&mut self, w: f32, h: f32, clip: bool, inherit: bool) {
+        let depth = self.window_stack.len();
+        self.window_begin_named(&format!("window#{depth}"), w, h, clip, inherit);
+    }
+
+    /// [`window_begin`](Self::window_begin) with a name for layout inspection.
+    ///
+    /// Identical in every rendering respect, but the window also opens a debug
+    /// scope declaring its rect, so [`DebugReport`](crate::debug::DebugReport)
+    /// can name this region and check that its contents actually stayed inside
+    /// it. Prefer this over `window_begin` — the name costs nothing at runtime
+    /// and is the difference between a report that reads `window#0` and one that
+    /// reads `inventory_panel`.
+    ///
+    /// The scope closes at the matching [`pop`](Self::pop), like the window
+    /// itself.
+    pub fn window_begin_named(&mut self, name: &str, w: f32, h: f32, clip: bool, inherit: bool) {
+        let local = Rect::new(0.0, 0.0, w, h);
         let rect = self
             .backend
             .list_mut()
             .current_transform()
-            .transform_rect_aabb(Rect::new(0.0, 0.0, w, h));
+            .transform_rect_aabb(local);
         self.window_stack.push(WindowFrame { rect });
+        self.backend.list_mut().push_debug_scope_rect(name, local);
         if clip {
             self.clip_rect(w, h, inherit);
         }
+    }
+
+    /// Begin drawing inside a layout-resolved rectangle local to the current
+    /// transform. This pushes all normal UI state, translates the origin to the
+    /// rectangle, resets alignment to left/top, and establishes a local window of
+    /// the rectangle's size. Balance with [`rect_end`](Self::rect_end).
+    ///
+    /// This explicit begin/end form is suitable for scripting bindings. Rust code
+    /// usually prefers [`draw_in_rect`](Self::draw_in_rect). Drawing remains
+    /// immediate: no widget commands or callbacks are retained or replayed.
+    pub fn rect_begin(&mut self, rect: Rect, clip: bool, inherit_clip: bool) {
+        let depth = self.open_rect_scopes;
+        self.rect_begin_named(&format!("rect#{depth}"), rect, clip, inherit_clip);
+    }
+
+    /// Named variant of [`rect_begin`](Self::rect_begin) for debug reports.
+    pub fn rect_begin_named(&mut self, name: &str, rect: Rect, clip: bool, inherit_clip: bool) {
+        self.push();
+        self.open_rect_scopes += 1;
+        self.translate(rect.x, rect.y);
+        if let Some(align) = self.align_stack.last_mut() {
+            *align = AlignSpec::DEFAULT;
+        }
+        self.window_begin_named(name, rect.width, rect.height, clip, inherit_clip);
+    }
+
+    /// End the innermost local rectangle scope opened by
+    /// [`rect_begin`](Self::rect_begin) or
+    /// [`rect_begin_named`](Self::rect_begin_named).
+    pub fn rect_end(&mut self) {
+        debug_assert!(
+            self.open_rect_scopes > 0,
+            "UiContext::rect_end called without a matching rect_begin"
+        );
+        if self.open_rect_scopes == 0 {
+            return;
+        }
+        self.open_rect_scopes -= 1;
+        self.pop();
+    }
+
+    /// Draw once inside a local layout rectangle and restore all UI state after
+    /// `body` returns. The body is never invoked for a separate measurement pass.
+    pub fn draw_in_rect<R>(
+        &mut self,
+        rect: Rect,
+        clip: bool,
+        body: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.rect_begin(rect, clip, true);
+        let result = body(self);
+        self.rect_end();
+        result
+    }
+
+    /// Named [`draw_in_rect`](Self::draw_in_rect) variant for debug reports.
+    pub fn draw_in_rect_named<R>(
+        &mut self,
+        name: &str,
+        rect: Rect,
+        clip: bool,
+        body: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.rect_begin_named(name, rect, clip, true);
+        let result = body(self);
+        self.rect_end();
+        result
+    }
+
+    /// Open a named debug scope (see [`DrawList::push_debug_scope`]). Pure
+    /// instrumentation: nothing is drawn and rendering is unaffected.
+    ///
+    /// Must be balanced with [`pop_debug_scope`](Self::pop_debug_scope), or
+    /// closed implicitly by a [`pop`](Self::pop) of the enclosing frame.
+    pub fn push_debug_scope(&mut self, name: impl Into<String>) {
+        self.backend.list_mut().push_debug_scope(name);
+    }
+
+    /// Close the innermost debug scope.
+    pub fn pop_debug_scope(&mut self) {
+        self.backend.list_mut().pop_debug_scope();
+    }
+
+    /// Run `body` inside a named debug scope, closing it afterwards.
+    ///
+    /// Purely a **label** for a region of your UI, to give the
+    /// [`DebugReport`](crate::debug::DebugReport) tree a heading you recognise:
+    ///
+    /// ```ignore
+    /// ui.debug_scope("Sidebar", |ui| {
+    ///     ui.text("Settings");
+    /// });
+    /// ```
+    ///
+    /// You do not pass the rect the region occupies, and should not need to:
+    /// every widget in this crate declares its own allocation (via
+    /// [`DrawList::push_debug_scope_rect`]), so the overflow and "drew nothing"
+    /// checks already apply to what you drew. Supplying coordinates here would
+    /// only duplicate a number the layout engine owns.
+    pub fn debug_scope<R>(
+        &mut self,
+        name: impl Into<String>,
+        body: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.push_debug_scope(name);
+        let out = body(self);
+        self.pop_debug_scope();
+        out
     }
 
     /// The current `UiWindow` rect in world space, or `None` when no window is
@@ -879,6 +1167,32 @@ impl<'a> UiContext<'a> {
         self.backend.list_mut().icon(key, ox, oy, w, h);
     }
 
+    /// Draw a vector [`PhosphorIcon`] fit-centered into a `w`×`h` box at the
+    /// aligned origin, crisp at any size through the MSDF icon atlas.
+    ///
+    /// The vector sibling of [`icon`](Self::icon): no atlas key, no sprite to
+    /// register, and the current tint colorizes it. Like `icon`, it does **not**
+    /// advance the cursor — wrap it in `push`/`pop` and position it yourself.
+    #[cfg(feature = "phosphor-icons")]
+    pub fn phosphor_icon(&mut self, icon: crate::render::PhosphorIcon, w: f32, h: f32) {
+        if let Some(glyph) = icon.glyph() {
+            self.vector_icon(glyph, w, h);
+        }
+    }
+
+    /// [`phosphor_icon`](Self::phosphor_icon) for a glyph from an
+    /// application-registered icon font (see
+    /// [`register_icon_font`](crate::render::register_icon_font)). Resolve the
+    /// [`IconGlyph`](crate::render::IconGlyph) once at startup and keep it.
+    #[cfg(feature = "phosphor-icons")]
+    pub fn vector_icon(&mut self, glyph: crate::render::IconGlyph, w: f32, h: f32) {
+        let align = *self.align_stack.last().unwrap_or(&AlignSpec::DEFAULT);
+        let [ox, oy] = align.offset(w, h);
+        self.backend
+            .list_mut()
+            .icon_msdf(Rect::new(ox, oy, w, h), glyph, [1.0, 1.0, 1.0, 1.0]);
+    }
+
     /// Draw a pre-built [`TextBlock`] whose origin honours align/transform.
     /// (The auto-advancing string verb is [`text`](Self::text).)
     pub fn text_block(&mut self, mut block: TextBlock) {
@@ -914,7 +1228,7 @@ impl<'a> UiContext<'a> {
         let style = StyleResolver::with_overlay_opt(theme, overlay.as_ref());
         let width = self.default_field_width();
         let thickness = style.scalar(StyleKey::BorderWidth).max(1.0);
-        let rect = self.place_rect(width, thickness);
+        let rect = self.place_local(width, thickness);
         Separator::horizontal().draw(rect, self.backend.list_mut(), &style);
         self.advance(thickness);
     }
@@ -931,7 +1245,7 @@ impl<'a> UiContext<'a> {
         let style = StyleResolver::with_overlay_opt(theme, overlay.as_ref());
         let width = w.unwrap_or_else(|| self.default_field_width());
         let height = style.scalar(StyleKey::InputHeight);
-        let rect = self.place_rect(width, height);
+        let rect = self.place_local(width, height);
         ProgressBar::new(value).draw(rect, self.backend.list_mut(), &style);
         self.advance(height);
     }
@@ -953,7 +1267,7 @@ impl<'a> UiContext<'a> {
             let list = self.backend.list_mut();
             b.measure_height(list, &style, width)
         };
-        let rect = self.place_rect(width, h);
+        let rect = self.place_local(width, h);
         b.draw(rect, self.backend.list_mut(), &style);
         self.advance(h);
     }
@@ -973,7 +1287,7 @@ impl<'a> UiContext<'a> {
         };
         let style = StyleResolver::with_overlay_opt(theme, overlay.as_ref());
         let width = w.unwrap_or_else(|| self.default_field_width());
-        let rect = self.place_rect(width, h);
+        let rect = self.place_local(width, h);
         let content = Group::new(title).draw(rect, self.backend.list_mut(), &style);
         self.advance(h);
         content
@@ -990,7 +1304,7 @@ impl<'a> UiContext<'a> {
         };
         let style = StyleResolver::with_overlay_opt(theme, overlay.as_ref());
         let width = w.unwrap_or_else(|| self.default_field_width());
-        let rect = self.place_rect(width, h);
+        let rect = self.place_local(width, h);
         Panel::draw_at(rect, self.backend.list_mut(), &style);
         self.advance(h);
     }
@@ -1095,23 +1409,58 @@ impl<'a> UiContext<'a> {
     /// font stack, then advance the layout cursor by the font size. The
     /// auto-advancing companion to [`text_block`](Self::text_block) /
     /// [`text_line`](Self::text_line).
-    pub fn text(&mut self, label: &str, max_width: Option<f32>) {
+    pub fn text(&mut self, label: &str) {
         let color = self.theme.map_or([1.0, 1.0, 1.0, 1.0], |t| t.text);
         let size = self.current_font().size;
-        self.text_line(label, color, max_width);
+        self.text_line(label, color,None);
         self.advance(size);
     }
 
+    /// Contextual measurement of a text button under the active theme and style
+    /// scope. Buttons use the widget theme font, matching their paint path. Call
+    /// once with the constraints its parent has resolved, then
+    /// pass the returned plain record into measured arrangement.
+    pub fn measure_text_button(
+        &mut self,
+        label: &str,
+        constraints: crate::MeasureConstraints,
+        scale_factor: f32,
+    ) -> crate::Measurement {
+        let button = Button::new(label);
+        self.measure(constraints, scale_factor, crate::WrapMode::None, |cx| {
+            button.measure(cx)
+        })
+    }
+
+    /// Natural size of a text button under the active theme and style scope.
+    pub fn text_button_size(&mut self, label: &str) -> (f32, f32) {
+        let measurement =
+            self.measure_text_button(label, crate::MeasureConstraints::UNBOUNDED, 1.0);
+        (measurement.preferred[0], measurement.preferred[1])
+    }
+
     /// Draw a chrome text button and report whether it was clicked this frame.
-    /// `w`/`h` default to `default_field_width` /
-    /// `theme.button_height`. Auto-advances by the button height.
+    /// An omitted width fits the caption plus themed horizontal padding; an
+    /// omitted height uses `theme.button_height`. Pass an explicit width for
+    /// fill/fixed layouts. Auto-advances by the button height.
     pub fn text_button(&mut self, label: &str, w: Option<f32>, h: Option<f32>) -> bool {
         let (input, theme) = match self.interactive_refs() {
             Some(v) => v,
             None => return false,
         };
-        let width = w.unwrap_or_else(|| self.default_field_width());
-        let height = h.unwrap_or(theme.button_height);
+        let button = Button::new(label);
+        let (width, height) = match (w, h) {
+            (Some(width), Some(height)) => (width, height),
+            (width, height) => {
+                let styles = StyleResolver::with_overlay(
+                    theme,
+                    self.style_stack.last().expect("style stack is never empty"),
+                );
+                let (fit_width, fit_height) =
+                    button.intrinsic_size(self.backend.list_mut(), &styles);
+                (width.unwrap_or(fit_width), height.unwrap_or(fit_height))
+            }
+        };
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
         let (local, local_input) = self.localize(inv, world, input);
@@ -1130,14 +1479,75 @@ impl<'a> UiContext<'a> {
                 .expect("text_button requires interactive state");
             // Two disjoint `UiState` fields at once: focus (Tab ring) + anim
             // (hover/press easing). The eased path reuses `fid` as the anim key.
-            let UiState { focus, anim, .. } = &mut **state;
+            let UiState {
+                focus,
+                anim,
+                interactions,
+                ..
+            } = &mut **state;
             let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
                 .with_style(self.style_stack.last().expect("style stack is never empty"))
-                .with_animations(anim);
-            Button::new(label)
+                .with_animations(anim)
+                .with_interactions(interactions);
+            button.focusable(fid).animated(fid).draw(local, &mut ctx)
+        };
+        self.advance(height);
+        clicked
+    }
+
+    /// Draw a square button containing a fit-centered Phosphor vector icon.
+    /// Width and height default to the themed button height. Auto-advances by
+    /// the resolved height.
+    #[cfg(feature = "phosphor-icons")]
+    pub fn icon_button(&mut self, icon: PhosphorIcon, w: Option<f32>, h: Option<f32>) -> bool {
+        let (input, theme) = match self.interactive_refs() {
+            Some(v) => v,
+            None => return false,
+        };
+        let height = h.unwrap_or(theme.button_height);
+        let width = w.unwrap_or(height);
+        let world = self.place_rect(width, height);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (local, local_input) = self.localize(inv, world, input);
+        let fid = self
+            .state
+            .as_mut()
+            .map(|s| s.auto_id())
+            .expect("icon_button requires interactive state");
+        let clicked = {
+            let list = self.backend.list_mut();
+            let state = self
+                .state
+                .as_mut()
+                .expect("icon_button requires interactive state");
+            let UiState {
+                focus,
+                anim,
+                interactions,
+                ..
+            } = &mut **state;
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"))
+                .with_animations(anim)
+                .with_interactions(interactions);
+            let clicked = Button::new("")
                 .focusable(fid)
                 .animated(fid)
-                .draw(local, &mut ctx)
+                .draw(local, &mut ctx);
+            let styles = ctx.styles();
+            let pad = styles
+                .scalar(StyleKey::Padding)
+                .min(width.min(height) * 0.2);
+            let icon_rect = Rect::new(
+                local.x + pad,
+                local.y + pad,
+                (local.width - pad * 2.0).max(0.0),
+                (local.height - pad * 2.0).max(0.0),
+            );
+            Icon::new(icon)
+                .tint(styles.color(StyleKey::Text))
+                .draw(icon_rect, ctx.draw_list);
+            clicked
         };
         self.advance(height);
         clicked
@@ -1216,7 +1626,8 @@ impl<'a> UiContext<'a> {
                     return value;
                 }
             };
-            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
+            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"));
             // Reuse the DragId value as the FocusId so the slider is also
             // keyboard-adjustable (arrow keys) through the façade.
             Slider::new(min, max)
@@ -1236,10 +1647,12 @@ impl<'a> UiContext<'a> {
             Some(v) => v,
             None => return checked,
         };
-        let height = theme.font_size.max(20.0);
-        // The checkbox box is fitted to rect height; give the row enough width
-        // for the box plus the label area (default field width).
-        let width = self.default_field_width();
+        let checkbox = Checkbox::new();
+        let styles = StyleResolver::with_overlay(
+            theme,
+            self.style_stack.last().expect("style stack is never empty"),
+        );
+        let (width, height) = checkbox.intrinsic_size(label, self.backend.list_mut(), &styles);
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
         let (local, local_input) = self.localize(inv, world, input);
@@ -1258,7 +1671,7 @@ impl<'a> UiContext<'a> {
             let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
                 .with_style(self.style_stack.last().expect("style stack is never empty"))
                 .with_animations(anim);
-            Checkbox::new()
+            checkbox
                 .focusable(fid)
                 .animated(fid)
                 .draw(checked, label, local, &mut ctx)
@@ -1301,7 +1714,8 @@ impl<'a> UiContext<'a> {
                 .state
                 .as_mut()
                 .expect("radio_group requires interactive state");
-            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
+            let mut ctx = DrawContext::new(list, &mut state.focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"));
             RadioGroup::new(options)
                 .focusable(fid)
                 .draw(selected, local, &mut ctx)
@@ -1377,9 +1791,13 @@ impl<'a> UiContext<'a> {
                     return false;
                 }
             };
-            // Touch two `UiState` fields at once.
+            // Touch the retained editor, focus, and shared clipboard together.
             let UiState {
-                text_inputs, focus, ..
+                text_inputs,
+                focus,
+                clipboard_get,
+                clipboard_set,
+                ..
             } = &mut **state;
             let ti = text_inputs.entry(id).or_insert_with(|| {
                 let mut t = TextInput::new(local.x, local.y, local.width, local.height);
@@ -1393,6 +1811,12 @@ impl<'a> UiContext<'a> {
             ti.width = local.width;
             ti.height = local.height;
             ti.mask = mask;
+            if let Some(get) = clipboard_get {
+                ti.set_shared_clipboard_get(get.clone());
+            }
+            if let Some(set) = clipboard_set {
+                ti.set_shared_clipboard_set(set.clone());
+            }
             ti.placeholder.clear();
             ti.placeholder.push_str(placeholder);
             // External changes to the caller's buffer win over our cached value.
@@ -1404,7 +1828,8 @@ impl<'a> UiContext<'a> {
                 ti.selection_start = None;
             }
             let before = ti.value.clone();
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"));
             ti.draw(id, &mut ctx);
             let changed = ti.value != before;
             if changed {
@@ -1430,6 +1855,42 @@ impl<'a> UiContext<'a> {
         w: Option<f32>,
         rows: u16,
     ) -> bool {
+        self.text_area_impl(
+            id,
+            buffer,
+            placeholder,
+            w,
+            rows,
+            #[cfg(feature = "syntax-highlighting")]
+            None,
+        )
+    }
+
+    /// Multi-line source editor with retained syntax highlighting. This has the
+    /// same sizing, editing, and return contract as [`text_area`](Self::text_area),
+    /// while caching highlight byte ranges until either `buffer` or `syntax` changes.
+    #[cfg(feature = "syntax-highlighting")]
+    pub fn text_area_syntax(
+        &mut self,
+        id: FocusId,
+        buffer: &mut String,
+        placeholder: &str,
+        w: Option<f32>,
+        rows: u16,
+        syntax: &crate::SyntaxHighlighting,
+    ) -> bool {
+        self.text_area_impl(id, buffer, placeholder, w, rows, Some(syntax.clone()))
+    }
+
+    fn text_area_impl(
+        &mut self,
+        id: FocusId,
+        buffer: &mut String,
+        placeholder: &str,
+        w: Option<f32>,
+        rows: u16,
+        #[cfg(feature = "syntax-highlighting")] syntax: Option<crate::SyntaxHighlighting>,
+    ) -> bool {
         let (input, theme) = match self.interactive_refs() {
             Some(v) => v,
             None => return false,
@@ -1450,7 +1911,11 @@ impl<'a> UiContext<'a> {
                 }
             };
             let UiState {
-                text_inputs, focus, ..
+                text_inputs,
+                focus,
+                clipboard_get,
+                clipboard_set,
+                ..
             } = &mut **state;
             let ti = text_inputs.entry(id).or_insert_with(|| {
                 let mut t = TextInput::new(local.x, local.y, local.width, local.height)
@@ -1464,6 +1929,14 @@ impl<'a> UiContext<'a> {
             ti.width = local.width;
             ti.height = local.height;
             ti.multiline = true;
+            #[cfg(feature = "syntax-highlighting")]
+            ti.set_syntax_highlighting(syntax);
+            if let Some(get) = clipboard_get {
+                ti.set_shared_clipboard_get(get.clone());
+            }
+            if let Some(set) = clipboard_set {
+                ti.set_shared_clipboard_set(set.clone());
+            }
             ti.placeholder.clear();
             ti.placeholder.push_str(placeholder);
             if ti.value != *buffer {
@@ -1474,7 +1947,8 @@ impl<'a> UiContext<'a> {
                 ti.selection_start = None;
             }
             let before = ti.value.clone();
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"));
             ti.draw(id, &mut ctx);
             let changed = ti.value != before;
             if changed {
@@ -1533,7 +2007,8 @@ impl<'a> UiContext<'a> {
             let ti = text_inputs
                 .entry(id)
                 .or_insert_with(|| TextInput::new(local.x, local.y, local.width, local.height));
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"));
             let out = NumberInput::new()
                 .with_range(min, max)
                 .with_step(step)
@@ -1599,7 +2074,8 @@ impl<'a> UiContext<'a> {
                 }
             };
             let UiState { tree, focus, .. } = &mut **state;
-            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0).with_style(self.style_stack.last().expect("style stack is never empty"));
+            let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
+                .with_style(self.style_stack.last().expect("style stack is never empty"));
             let out = node.with_depth(depth).draw(id, local, tree, &mut ctx);
             // Focus ring on the selected row while the tree holds keyboard focus.
             if ctx.focus.is_focused(TREE_FOCUS_ID) && tree.is_selected(id) {
@@ -1666,10 +2142,7 @@ impl<'a> UiContext<'a> {
     /// Draw a row of tab buttons. Returns `Some(index)` when a tab was clicked
     /// this frame (the caller updates `active`). Auto-advances by the tab height.
     pub fn tabs(&mut self, labels: &[&str], active: usize) -> Option<usize> {
-        let (input, theme) = match self.interactive_refs() {
-            Some(v) => v,
-            None => return None,
-        };
+        let (input, theme) = self.interactive_refs()?;
         let width = self.default_field_width();
         let tab_height = theme.font_size + theme.padding * 2.0;
         let world = self.place_rect(width, tab_height);
@@ -1677,10 +2150,7 @@ impl<'a> UiContext<'a> {
         let (local, local_input) = self.localize(inv, world, input);
         let clicked = {
             let list = self.backend.list_mut();
-            let style = StyleResolver::with_overlay_opt(
-                theme,
-                self.style_stack.last(),
-            );
+            let style = StyleResolver::with_overlay_opt(theme, self.style_stack.last());
             let anim = self.state.as_mut().map(|s| &mut s.anim);
             Tabs::new(labels)
                 .with_height(tab_height)
@@ -1703,10 +2173,7 @@ impl<'a> UiContext<'a> {
         let (local, local_input) = self.localize(inv, world, input);
         let clicked = {
             let list = self.backend.list_mut();
-            let style = StyleResolver::with_overlay_opt(
-                theme,
-                self.style_stack.last(),
-            );
+            let style = StyleResolver::with_overlay_opt(theme, self.style_stack.last());
             ImageButton::key(key)
                 .natural_size(w, h)
                 .draw(local, list, &style, &local_input)
@@ -1727,10 +2194,7 @@ impl<'a> UiContext<'a> {
         let (local, local_input) = self.localize(inv, world, input);
         let clicked = {
             let list = self.backend.list_mut();
-            let style = StyleResolver::with_overlay_opt(
-                theme,
-                self.style_stack.last(),
-            );
+            let style = StyleResolver::with_overlay_opt(theme, self.style_stack.last());
             ImageButton::sprite(sprite)
                 .natural_size(w, h)
                 .draw(local, list, &style, &local_input)
@@ -1757,7 +2221,7 @@ impl<'a> UiContext<'a> {
                     rgba: [hsva.h, hsva.s, hsva.v, hsva.a],
                     changed: false,
                     dragging: false,
-                }
+                };
             }
         };
         let width = w.unwrap_or_else(|| self.default_field_width());
@@ -1795,12 +2259,7 @@ impl<'a> UiContext<'a> {
     /// Draw a drag handle (grab/move region) and report this frame's drag result.
     /// `id` is a stable [`DragId`]; the handle claims the drag only when the
     /// capture is free and the press lands on its rect. Auto-advances by `h`.
-    pub fn drag_handle(
-        &mut self,
-        id: DragId,
-        w: Option<f32>,
-        h: f32,
-    ) -> DragHandleOutput {
+    pub fn drag_handle(&mut self, id: DragId, w: Option<f32>, h: f32) -> DragHandleOutput {
         let (input, theme) = match self.interactive_refs() {
             Some(v) => v,
             None => return DragHandleOutput::idle(),
@@ -1848,14 +2307,16 @@ impl<'a> UiContext<'a> {
             }
         };
         let width = w.unwrap_or_else(|| self.default_field_width());
-        let viewport = self.place_rect(width, h);
+        // Hit-testing needs world space, drawing needs local space (the
+        // `DrawList` re-applies the active transform at push time). Localize, as
+        // every other interactive verb does — passing the world rect through to
+        // the widget would double-apply the translation and put the scrollbars
+        // at twice their intended offset.
+        let world = self.place_rect(width, h);
+        let inv = self.backend.list_mut().current_transform().inverse();
+        let (viewport, mut local_input) = self.localize(inv, world, input);
         let sv = ScrollView::new(viewport);
-        let style = StyleResolver::with_overlay_opt(
-            theme,
-            self.style_stack.last(),
-        );
-        // Need a mutable InputState clone since ScrollView::begin takes &mut.
-        let mut local_input = self.effective_input(input);
+        let style = StyleResolver::with_overlay_opt(theme, self.style_stack.last());
         let begun = {
             let list = self.backend.list_mut();
             let state = match self.state.as_mut() {
@@ -1868,8 +2329,15 @@ impl<'a> UiContext<'a> {
             sv.begin(&mut state.scroll, list, &style, &mut local_input)
         };
         self.pending_scroll_viewport = Some(viewport);
+        self.pending_scroll_inv = Some(inv);
         self.pending_scroll_begin = Some(begun);
-        self.advance(h);
+        self.pending_scroll_height = Some(h);
+        // NB: the layout cursor is advanced by `scroll_end`, not here.
+        // `ScrollView::begin` has just pushed a transform for the scroll offset;
+        // advancing now would shift the caller's *content* down by the height of
+        // the viewport it is supposed to sit inside — and `ScrollView::end` pops
+        // that transform, so the advance would be discarded before it could move
+        // anything that follows.
         begun.inner
     }
 
@@ -1884,29 +2352,54 @@ impl<'a> UiContext<'a> {
         let viewport = match self.pending_scroll_viewport.take() {
             Some(v) => v,
             None => {
-                debug_assert!(false, "UiContext::scroll_end called without a matching scroll_begin");
+                debug_assert!(
+                    false,
+                    "UiContext::scroll_end called without a matching scroll_begin"
+                );
                 return;
             }
         };
         let begun = match self.pending_scroll_begin.take() {
             Some(b) => b,
             None => {
-                debug_assert!(false, "UiContext::scroll_end called without a matching scroll_begin");
+                debug_assert!(
+                    false,
+                    "UiContext::scroll_end called without a matching scroll_begin"
+                );
                 return;
             }
         };
         let sv = ScrollView::new(viewport);
-        let style = StyleResolver::with_overlay_opt(
-            theme,
-            self.style_stack.last(),
-        );
+        let style = StyleResolver::with_overlay_opt(theme, self.style_stack.last());
+        let inv = self.pending_scroll_inv.take().unwrap_or(Affine2::IDENTITY);
         let mut local_input = self.effective_input(input);
+        let [mx, my] = inv.transform_point([local_input.mouse_x, local_input.mouse_y]);
+        local_input.mouse_x = mx;
+        local_input.mouse_y = my;
         let list = self.backend.list_mut();
         let state = match self.state.as_mut() {
             Some(s) => s,
             None => return,
         };
-        sv.end(&mut state.scroll, list, &style, &mut local_input, begun);
+        sv.end(&mut state.scroll, list, &style, &local_input, begun);
+        // Now that `end` has popped the scroll transform, move the layout cursor
+        // past the whole viewport so the next verb does not draw over it.
+        if let Some(h) = self.pending_scroll_height.take() {
+            self.advance(h);
+        }
+    }
+
+    /// Natural size required by a dropdown's widest option under the active
+    /// theme and style scope.
+    pub fn dropdown_size(&mut self, options: &[&str], selected: usize) -> (f32, f32) {
+        let theme = self
+            .theme
+            .expect("dropdown_size requires interactive state");
+        let styles = StyleResolver::with_overlay(
+            theme,
+            self.style_stack.last().expect("style stack is never empty"),
+        );
+        Dropdown::new(options, selected).intrinsic_size(self.backend.list_mut(), &styles)
     }
 
     /// Draw a dropdown button showing `options[selected]`. Clicking the button
@@ -1915,19 +2408,18 @@ impl<'a> UiContext<'a> {
     /// The caller applies the selection returned by
     /// [`draw_dropdown_layer`](UiState::draw_dropdown_layer). Auto-advances by
     /// `theme.input_height`.
-    pub fn dropdown(
-        &mut self,
-        id: DropdownId,
-        options: &[&str],
-        selected: usize,
-        w: Option<f32>,
-    ) {
+    pub fn dropdown(&mut self, id: DropdownId, options: &[&str], selected: usize, w: Option<f32>) {
         let (input, theme) = match self.interactive_refs() {
             Some(v) => v,
             None => return,
         };
-        let width = w.unwrap_or_else(|| self.default_field_width());
-        let height = theme.input_height;
+        let dropdown = Dropdown::new(options, selected);
+        let styles = StyleResolver::with_overlay(
+            theme,
+            self.style_stack.last().expect("style stack is never empty"),
+        );
+        let (fit_width, height) = dropdown.intrinsic_size(self.backend.list_mut(), &styles);
+        let width = w.unwrap_or(fit_width);
         let world = self.place_rect(width, height);
         let inv = self.backend.list_mut().current_transform().inverse();
         let (local, local_input) = self.localize(inv, world, input);
@@ -1945,7 +2437,7 @@ impl<'a> UiContext<'a> {
             } = &mut **state;
             let mut ctx = DrawContext::new(list, focus, theme, &local_input, 0.0, 0.0)
                 .with_style(self.style_stack.last().expect("style stack is never empty"));
-            Dropdown::new(options, selected).draw(id, local, dropdowns, &mut ctx)
+            dropdown.draw(id, local, dropdowns, &mut ctx)
         };
         self.advance(height);
     }
@@ -2052,6 +2544,19 @@ impl<'a> Drop for UiContext<'a> {
             "UiContext dropped with {} unbalanced modal_begin/end or popup_begin/end pair(s)",
             self.open_layer_kinds.len()
         );
+        debug_assert_eq!(
+            self.open_rect_scopes, 0,
+            "UiContext dropped with {} unbalanced rect_begin/rect_end pair(s)",
+            self.open_rect_scopes
+        );
+        // An unbalanced debug scope does not corrupt rendering, but it silently
+        // swallows every later draw into the leaked scope and makes the layout
+        // report wrong — which is exactly when someone is relying on it.
+        let open_scopes = self.backend.list_mut().debug_scope_depth();
+        debug_assert_eq!(
+            open_scopes, 0,
+            "UiContext dropped with {open_scopes} unbalanced push_debug_scope/pop_debug_scope pair(s)"
+        );
     }
 }
 
@@ -2069,6 +2574,54 @@ mod tests {
         let mut ui = UiContext::new(&mut list);
         let r = ui.place_rect(10.0, 20.0);
         assert_eq!(r, Rect::new(0.0, 0.0, 10.0, 20.0));
+    }
+
+    #[test]
+    fn rect_scope_translates_once_and_restores_state() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.translate(100.0, 50.0);
+        ui.align("center middle");
+        let before = ui.list().current_transform();
+
+        let mut calls = 0;
+        let returned =
+            ui.draw_in_rect_named("cell", Rect::new(10.0, 20.0, 30.0, 40.0), false, |ui| {
+                calls += 1;
+                assert_eq!(ui.place_rect(4.0, 6.0), Rect::new(110.0, 70.0, 4.0, 6.0));
+                ui.quad(4.0, 6.0, [1.0; 4]);
+                17
+            });
+
+        assert_eq!(calls, 1);
+        assert_eq!(returned, 17);
+        assert_eq!(ui.list().current_transform(), before);
+        assert_eq!(ui.place_rect(4.0, 6.0), Rect::new(98.0, 47.0, 4.0, 6.0));
+        let chrome = ui.list().chrome_instances.last().expect("quad instance");
+        assert_eq!(chrome.rect, [110.0, 70.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn nested_rect_scopes_and_clips_restore() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.push();
+        ui.clip_rect(100.0, 100.0, true);
+        let outer_clip = ui.list().current_clip();
+        ui.rect_begin(Rect::new(10.0, 10.0, 40.0, 40.0), true, true);
+        assert_eq!(
+            ui.list().current_clip(),
+            Some(Rect::new(10.0, 10.0, 40.0, 40.0))
+        );
+        ui.rect_begin(Rect::new(5.0, 5.0, 10.0, 10.0), true, true);
+        assert_eq!(
+            ui.list().current_clip(),
+            Some(Rect::new(15.0, 15.0, 10.0, 10.0))
+        );
+        ui.rect_end();
+        ui.rect_end();
+        assert_eq!(ui.list().current_clip(), outer_clip);
+        ui.pop();
     }
 
     #[test]
@@ -2098,8 +2651,8 @@ mod tests {
         let mut list = DrawList::new();
         let mut ui = UiContext::new(&mut list);
         ui.set_auto_advance(false);
-        ui.text("a",None);
-        ui.text("b",None);
+        ui.text("a");
+        ui.text("b");
         drop(ui);
         assert_eq!(list.texts.len(), 2);
         assert!(
@@ -2193,7 +2746,10 @@ mod tests {
         ui.disabled_scope(|ui| {
             clicked = ui.text_button("OK", Some(100.0), Some(30.0));
         });
-        assert!(!clicked, "button click is swallowed inside a disabled scope");
+        assert!(
+            !clicked,
+            "button click is swallowed inside a disabled scope"
+        );
     }
 
     #[test]
@@ -2205,8 +2761,14 @@ mod tests {
         let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
         ui.disabled_scope(|ui| {
             let out = ui.hit_zone(Some(100.0), 30.0);
-            assert!(!out.hovered, "hit_zone does not hover inside a disabled scope");
-            assert!(!out.clicked, "hit_zone does not click inside a disabled scope");
+            assert!(
+                !out.hovered,
+                "hit_zone does not hover inside a disabled scope"
+            );
+            assert!(
+                !out.clicked,
+                "hit_zone does not click inside a disabled scope"
+            );
         });
     }
 
@@ -2223,10 +2785,16 @@ mod tests {
             ui.enabled_scope(true, |ui| {
                 clicked = ui.text_button("OK", Some(100.0), Some(30.0));
             });
-            assert!(clicked, "enabled_scope(true) re-enables inside a disabled scope");
+            assert!(
+                clicked,
+                "enabled_scope(true) re-enables inside a disabled scope"
+            );
             // ...and restores the disabled state for siblings after it.
             let also_clicked = ui.text_button("OK2", Some(100.0), Some(30.0));
-            assert!(!also_clicked, "disabled state is restored after the inner scope");
+            assert!(
+                !also_clicked,
+                "disabled state is restored after the inner scope"
+            );
         });
     }
 
@@ -2265,14 +2833,15 @@ mod tests {
             // After the matching pop the override is gone → theme color again.
             ui.text_button("B", Some(80.0), Some(24.0));
         }
-        assert_eq!(list.chrome_instances.len(), 2);
+        assert_eq!(list.chrome_instances.len(), 6);
         assert_eq!(
-            list.chrome_instances[0].bg,
-            [1.0, 0.0, 0.0, 1.0],
-            "button under the overlay uses the overridden fill"
+            list.chrome_instances[1].bg,
+            crate::widgets::sheen_over([1.0, 0.0, 0.0, 1.0], theme.face_top),
+            "button under the overlay uses the overridden fill (under the sheen)"
         );
         assert_eq!(
-            list.chrome_instances[1].bg, theme.button,
+            list.chrome_instances[4].bg,
+            crate::widgets::sheen_over(theme.button, theme.face_top),
             "button after pop falls back to the theme fill"
         );
     }
@@ -2639,11 +3208,13 @@ mod tests {
         let mut list = DrawList::new();
         let mut ui = UiContext::new(&mut list);
         ui.font(FontHandle("Noto Sans".into()), 24.0);
+        ui.letter_spacing(2.5);
         ui.bold(true);
         ui.italic(true);
         let f = ui.current_font();
         assert_eq!(f.font, Some(FontHandle("Noto Sans".into())));
         assert_eq!(f.size, 24.0);
+        assert_eq!(f.letter_spacing, 2.5);
         assert_eq!(f.weight, Weight::BOLD);
         assert_eq!(f.style, Style::Italic);
         // Independent setters leave the rest intact.
@@ -2661,17 +3232,21 @@ mod tests {
         let mut list = DrawList::new();
         let mut ui = UiContext::new(&mut list);
         ui.font(FontHandle("Base".into()), 16.0);
+        ui.letter_spacing(1.0);
         ui.push();
         ui.font(FontHandle("Inner".into()), 32.0);
+        ui.letter_spacing(4.0);
         ui.bold(true);
         let inner = ui.current_font();
         assert_eq!(inner.font, Some(FontHandle("Inner".into())));
         assert_eq!(inner.size, 32.0);
+        assert_eq!(inner.letter_spacing, 4.0);
         assert_eq!(inner.weight, Weight::BOLD);
         ui.pop();
         let outer = ui.current_font();
         assert_eq!(outer.font, Some(FontHandle("Base".into())));
         assert_eq!(outer.size, 16.0);
+        assert_eq!(outer.letter_spacing, 1.0);
         assert_eq!(outer.weight, Weight::NORMAL);
     }
 
@@ -2681,6 +3256,7 @@ mod tests {
         {
             let mut ui = UiContext::new(&mut list);
             ui.font(FontHandle("Noto Sans".into()), 28.0);
+            ui.letter_spacing(3.0);
             ui.bold(true);
             ui.italic(true);
             ui.text_line("hi", [1.0, 0.0, 0.0, 1.0],None);
@@ -2689,6 +3265,7 @@ mod tests {
         let block = &list.texts[0];
         assert_eq!(block.font, Some(FontHandle("Noto Sans".into())));
         assert_eq!(block.font_size, 28.0);
+        assert_eq!(block.letter_spacing, 3.0);
         assert_eq!(block.weight, Weight::BOLD);
         assert_eq!(block.style, Style::Italic);
     }
@@ -2703,6 +3280,203 @@ mod tests {
         // Re-balance the align stack so only the font-stack assert can fire.
         // (push() also grows align_stack; here we touched font_stack directly,
         // so align_stack is still balanced.)
+        drop(ui);
+    }
+
+    // ---- Non-interactive verbs must not double-apply the transform ----
+
+    /// `place_rect` returns world space, but `DrawList` applies the active
+    /// transform itself at push time. A verb that hands the world rect straight
+    /// to a widget therefore applies the translation twice — the widget lands at
+    /// `2 * offset` and, for a large enough offset, entirely off screen. These
+    /// pin each affected verb to the correct position.
+    fn drawn_bounds(list: &DrawList) -> Rect {
+        let mut acc = Rect::zero();
+        for c in &list.chrome_instances {
+            acc = acc.union(Rect::new(c.rect[0], c.rect[1], c.rect[2], c.rect[3]));
+        }
+        for v in &list.vertices {
+            let p = Rect::new(v.position[0], v.position[1], 0.0, 0.0);
+            acc = if acc.is_empty() {
+                Rect::new(p.x, p.y, 0.0, 0.0)
+            } else {
+                Rect::new(
+                    acc.x.min(p.x),
+                    acc.y.min(p.y),
+                    acc.right().max(p.x) - acc.x.min(p.x),
+                    acc.bottom().max(p.y) - acc.y.min(p.y),
+                )
+            };
+        }
+        acc
+    }
+
+    #[test]
+    fn panel_verb_lands_at_the_translated_origin_not_twice_it() {
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        {
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            ui.push();
+            ui.translate(300.0, 200.0);
+            ui.panel(Some(100.0), 40.0);
+            ui.pop();
+        }
+        let b = drawn_bounds(&list);
+        assert!(
+            (b.x - 300.0).abs() < 0.5 && (b.y - 200.0).abs() < 0.5,
+            "panel should land at the translated origin (300, 200), got {b:?}"
+        );
+    }
+
+    #[test]
+    fn group_begin_lands_at_the_translated_origin_and_returns_a_local_rect() {
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        let content;
+        {
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            ui.push();
+            ui.translate(400.0, 100.0);
+            content = ui.group_begin("Title", Some(200.0), 80.0);
+            ui.pop();
+        }
+        let b = drawn_bounds(&list);
+        assert!(
+            (b.x - 400.0).abs() < 0.5 && (b.y - 100.0).abs() < 0.5,
+            "group should land at (400, 100), got {b:?}"
+        );
+        // The content rect is in the caller's local space, so drawing into it
+        // through the same context needs no compensation for the translate.
+        assert!(
+            content.x >= 0.0 && content.x < 40.0,
+            "content rect should be local, got {content:?}"
+        );
+    }
+
+    #[test]
+    fn separator_progress_and_banner_land_at_the_translated_origin() {
+        for which in 0..3 {
+            let mut list = DrawList::new();
+            let theme = Theme::default();
+            let input = InputState::default();
+            let mut state = UiState::new();
+            {
+                let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+                ui.push();
+                ui.translate(250.0, 150.0);
+                match which {
+                    0 => ui.separator(),
+                    1 => ui.progress_bar(0.5, Some(120.0)),
+                    _ => ui.banner(Severity::Info, "hello", Some(160.0)),
+                }
+                ui.pop();
+            }
+            let b = drawn_bounds(&list);
+            assert!(
+                (b.x - 250.0).abs() < 1.0 && (b.y - 150.0).abs() < 1.0,
+                "verb {which} should land at (250, 150), got {b:?}"
+            );
+        }
+    }
+
+    // ---- Debug scopes ----
+
+    #[test]
+    fn window_begin_named_declares_its_rect_as_a_scope() {
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::new(&mut list);
+            ui.push();
+            ui.translate(40.0, 20.0);
+            ui.window_begin_named("inventory", 200.0, 120.0, false, true);
+            ui.pop();
+        }
+        let scopes = list.debug_scopes();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].name, "inventory");
+        assert!(scopes[0].closed, "pop() must close the window's scope");
+        assert_eq!(
+            scopes[0].declared,
+            Some(Rect::new(40.0, 20.0, 200.0, 120.0)),
+            "the declared rect is the window rect in world space"
+        );
+    }
+
+    #[test]
+    fn plain_window_begin_still_gets_an_auto_named_scope() {
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::new(&mut list);
+            ui.push();
+            ui.window_begin(100.0, 50.0, false, true);
+            ui.pop();
+        }
+        assert_eq!(list.debug_scopes()[0].name, "window#0");
+    }
+
+    #[test]
+    fn pop_closes_scopes_opened_inside_the_frame() {
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::new(&mut list);
+            ui.push();
+            ui.push_debug_scope("leaked_by_caller");
+            ui.pop();
+            // The scope must not leak past the frame that opened it, or every
+            // later draw would be attributed to it.
+            assert_eq!(ui.backend.list_mut().debug_scope_depth(), 0);
+        }
+        assert!(list.debug_scopes()[0].closed);
+    }
+
+    #[test]
+    fn debug_scope_closure_balances_itself() {
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::new(&mut list);
+            let out = ui.debug_scope("card", |ui| {
+                ui.quad(10.0, 10.0, [1.0; 4]);
+                7
+            });
+            assert_eq!(out, 7);
+        }
+        let s = list.debug_scopes();
+        assert_eq!(s.len(), 1);
+        assert!(s[0].closed);
+        // The application-facing form is a label and nothing more: declaring a
+        // rect is the widget's job, not the caller's.
+        assert_eq!(s[0].declared, None);
+    }
+
+    #[test]
+    fn nested_windows_nest_their_scopes() {
+        let mut list = DrawList::new();
+        {
+            let mut ui = UiContext::new(&mut list);
+            ui.push();
+            ui.window_begin_named("outer", 300.0, 200.0, false, true);
+            ui.push();
+            ui.window_begin_named("inner", 100.0, 40.0, false, true);
+            ui.pop();
+            ui.pop();
+        }
+        let s = list.debug_scopes();
+        assert_eq!(s[0].name, "outer");
+        assert_eq!(s[1].name, "inner");
+        assert_eq!(s[1].parent, Some(0), "the inner window nests in the outer");
+    }
+
+    #[test]
+    #[should_panic(expected = "unbalanced push_debug_scope/pop_debug_scope")]
+    fn unbalanced_debug_scope_drop_panics_in_debug() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        ui.push_debug_scope("never_popped");
         drop(ui);
     }
 
@@ -2786,6 +3560,98 @@ mod tests {
     }
 
     #[test]
+    fn text_line_size_uses_the_active_font_stack() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        let normal = ui.text_line_size("Settings");
+        ui.font_size(28.0);
+        let large = ui.text_line_size("Settings");
+        assert!(large.0 > normal.0);
+        assert!(large.1 > normal.1);
+    }
+
+    #[test]
+    fn text_line_size_propagates_letter_spacing() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        let plain = ui.text_line_size("Settings");
+        ui.letter_spacing(3.0);
+        let spaced = ui.text_line_size("Settings");
+        assert!(spaced.0 > plain.0);
+        assert_eq!(spaced.1, plain.1);
+    }
+
+    #[test]
+    fn wrapped_text_reports_multiline_height_without_advancing() {
+        let mut list = DrawList::new();
+        let mut ui = UiContext::new(&mut list);
+        let origin = ui.cursor();
+        let single = ui.text_line_size("calendar URL").1;
+        let (_, wrapped) = ui.wrapped_text(
+            "https://calendar.example.test/a/very/long/path/to/calendar.ics",
+            [1.0; 4],
+            60.0,
+        );
+        assert!(wrapped > single, "{wrapped} should exceed {single}");
+        assert_eq!(ui.cursor(), origin);
+        assert_eq!(ui.list().texts.len(), 1);
+        assert_eq!(ui.list().texts[0].max_width, 60.0);
+    }
+
+    #[test]
+    fn checkbox_fits_its_caption_by_default() {
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let expected = Checkbox::new()
+            .intrinsic_size(
+                "A substantially long caption",
+                &mut list,
+                &StyleResolver::new(&theme),
+            )
+            .0;
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        ui.checkbox("A substantially long caption", false);
+        drop(ui);
+        let scope = list.debug_scopes().last().expect("checkbox scope");
+        assert_eq!(scope.declared.expect("declared rect").width, expected);
+    }
+
+    #[test]
+    fn dropdown_without_width_fits_its_widest_option() {
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let options = ["Short", "A much wider option"];
+        let expected = Dropdown::new(&options, 0)
+            .intrinsic_size(&mut list, &StyleResolver::new(&theme))
+            .0;
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        ui.dropdown(1, &options, 0, None);
+        drop(ui);
+        let scope = list.debug_scopes().last().expect("dropdown scope");
+        assert_eq!(scope.declared.expect("declared rect").width, expected);
+    }
+
+    #[cfg(feature = "phosphor-icons")]
+    #[test]
+    fn icon_button_draws_vector_icon_and_uses_square_default() {
+        let theme = Theme::default();
+        let input = click_at(10.0, 10.0);
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        assert!(ui.icon_button(PhosphorIcon::X, None, None));
+        drop(ui);
+        assert_eq!(list.chrome_instances[0].rect[2], theme.button_height);
+        assert_eq!(list.chrome_instances[0].rect[3], theme.button_height);
+        assert_eq!(list.icons_msdf.len(), 1);
+        assert!(list.texts.iter().all(|text| text.content.is_empty()));
+    }
+
+    #[test]
     fn text_button_reports_click_inside_and_not_outside() {
         let theme = Theme::default();
         // Inside.
@@ -2807,31 +3673,56 @@ mod tests {
     }
 
     #[test]
+    fn text_button_without_width_fits_caption_and_padding() {
+        let mut theme = Theme::default();
+        theme.padding = 7.0;
+        let input = InputState::default();
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let expected = Button::new("Fit me")
+            .intrinsic_size(&mut list, &StyleResolver::new(&theme))
+            .0;
+
+        let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+        ui.text_button("Fit me", None, None);
+        drop(ui);
+
+        assert!((list.chrome_instances[0].rect[2] - expected).abs() < 0.01);
+        assert!(list.chrome_instances[0].rect[2] < 200.0);
+        assert_eq!(list.chrome_instances[0].rect[3], theme.button_height);
+    }
+
+    #[test]
     fn animated_text_button_eases_bg_mid_transition() {
         // The façade auto-wires `.animated(auto_id)` + the shared AnimationState,
-        // so an interactive `text_button` eases its hover fill once `begin_frame`
-        // is ticked with a non-zero dt.
+        // so an interactive `text_button` eases its label color once
+        // `begin_frame` is ticked with a non-zero dt. The 4a face itself is
+        // discrete (sheen over the state base), so the eased channel is
+        // observable on the label vertices.
         let theme = Theme::default();
         let mut state = UiState::new();
-        // Idle pointer parked far off the button so frame 1 settles at `button`.
+        // Idle pointer parked far off the button so frame 1 settles at rest.
         let mut idle = InputState {
             mouse_x: -100.0,
             mouse_y: -100.0,
             ..Default::default()
         };
 
-        // Frame 1: idle, dt = 0 settles the bg at `theme.button`.
+        // Frame 1: idle, dt = 0 settles the label at `text`.
         state.begin_frame(&mut idle, &theme, 0.0, &crate::KeyboardNav);
         let mut list = DrawList::new();
         {
             let mut ui = UiContext::interactive(&mut list, &idle, &mut state, &theme);
             ui.text_button("OK", Some(100.0), Some(30.0));
         }
-        assert_eq!(list.chrome_instances[0].bg, theme.button);
+        assert_eq!(
+            list.chrome_instances[1].bg,
+            crate::widgets::sheen_over(theme.button, theme.face_top)
+        );
         state.end_frame();
 
         // Frame 2: hover the same (call-order-stable) button at dt < duration →
-        // the fill is strictly between `button` and `button_hover`.
+        // the label color is strictly between `text` and its hover target.
         let mut hover = InputState {
             mouse_x: 10.0,
             mouse_y: 10.0,
@@ -2843,19 +3734,15 @@ mod tests {
             let mut ui = UiContext::interactive(&mut list, &hover, &mut state, &theme);
             ui.text_button("OK", Some(100.0), Some(30.0));
         }
-        let bg = list.chrome_instances[0].bg;
+        let label: Vec<[f32; 4]> = list.vertices.iter().map(|v| v.color).collect();
         state.end_frame();
 
-        let (lo, hi) = (
-            theme.button[0].min(theme.button_hover[0]),
-            theme.button[0].max(theme.button_hover[0]),
-        );
+        // The label white must not be brighter than the hover target while
+        // easing (it approaches it), and must differ from the settled idle text.
+        let idle_text = theme.text;
         assert!(
-            bg[0] > lo && bg[0] < hi,
-            "façade text_button bg {} should be mid-transition between {} and {}",
-            bg[0],
-            lo,
-            hi
+            label.iter().all(|c| (c[0] - idle_text[0]).abs() < 0.6),
+            "eased label near the text hue"
         );
     }
 
@@ -2968,13 +3855,24 @@ mod tests {
                 let mut ui = UiContext::interactive(&mut list, &input2, &mut state, &theme);
                 ui.password_input(1, &mut buffer, "", Some(150.0))
             };
-            let drawn = list.texts.last().map(|t| t.content.clone()).unwrap_or_default();
+            let drawn = list
+                .texts
+                .last()
+                .map(|t| t.content.clone())
+                .unwrap_or_default();
             (changed, drawn)
         };
         state.end_frame();
         assert!(changed, "typing should report a change");
-        assert_eq!(buffer.chars().count(), 3, "buffer keeps real plaintext char");
-        assert!(buffer.contains('x'), "typed char reached the plaintext buffer");
+        assert_eq!(
+            buffer.chars().count(),
+            3,
+            "buffer keeps real plaintext char"
+        );
+        assert!(
+            buffer.contains('x'),
+            "typed char reached the plaintext buffer"
+        );
         assert_eq!(drawn, "•••", "rendered field shows one bullet per char");
         assert!(!drawn.contains('x'), "plaintext must not be drawn");
     }
@@ -3009,7 +3907,7 @@ mod tests {
             let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
             ui.font_size(24.0);
             let c0 = ui.cursor();
-            ui.text("hello",None);
+            ui.text("hello");
             let c1 = ui.cursor();
             assert!(approx(c1[1], c0[1] + 24.0 + theme.spacing));
         }
@@ -3030,5 +3928,138 @@ mod tests {
         assert!(approx(ui.default_field_width(), 360.0));
         ui.pop();
         assert!(approx(ui.default_field_width(), 200.0));
+    }
+
+    #[test]
+    fn contextual_measurement_is_pure_and_sees_style_font_and_scale() {
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let before = list.prim_counts();
+        let metrics = {
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            ui.font_size(24.0);
+            ui.set_style_scalar(StyleKey::Padding, 7.0);
+            ui.measure(
+                crate::MeasureConstraints::with_max_width(80.0),
+                2.0,
+                crate::WrapMode::Word,
+                |cx| {
+                    assert_eq!(cx.font().size, 24.0);
+                    assert_eq!(cx.styles().scalar(StyleKey::Padding), 7.0);
+                    assert_eq!(cx.scale_factor(), 2.0);
+                    let block = cx.text_block("contextual text wraps");
+                    cx.measure_text(block).metrics
+                },
+            )
+        };
+        assert!(metrics.line_count > 1);
+        assert_eq!(before, list.prim_counts(), "measurement must not paint");
+    }
+
+    #[test]
+    fn measured_stack_draw_bodies_run_once() {
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = UiState::new();
+        let mut list = DrawList::new();
+        let mut layout = crate::layout::LayoutResult::default();
+        let mut measured = crate::MeasureBuffer::new();
+        let mut calls = 0;
+        {
+            let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
+            let a = ui.measure_text_button("A", crate::MeasureConstraints::UNBOUNDED, 1.0);
+            let b = ui.measure_text_button("B", crate::MeasureConstraints::UNBOUNDED, 1.0);
+            measured.push(crate::MeasuredChild::fit(a).id(1));
+            measured.push(crate::MeasuredChild::fit(b).id(2));
+            measured
+                .arrange_hstack_into(
+                    Rect::new(0.0, 0.0, 200.0, 44.0),
+                    8.0,
+                    0.0,
+                    crate::layout::MainAlign::Start,
+                    &mut layout,
+                )
+                .unwrap();
+            for item in layout.child_items() {
+                ui.draw_in_rect(item.rect, false, |ui| {
+                    calls += 1;
+                    ui.text_button("button", Some(item.rect.width), Some(item.rect.height));
+                });
+            }
+        }
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn an_open_dropdown_escape_does_not_blur_the_focused_field() {
+        // Regression for a pre-existing bug: `FocusState` blurred on the Escape
+        // edge, and an open dropdown also closed on that same edge, so one press
+        // did both. `UiState::begin_frame` now runs the dropdown first so it
+        // claims the edge before focus reads it.
+        let theme = Theme::default();
+        let mut state = UiState::new();
+        state.focus.focus(7);
+        state
+            .dropdowns
+            .open_for_test(1, Rect::new(10.0, 10.0, 120.0, 28.0), &["Red", "Green"], 0);
+
+        let mut input = InputState {
+            key_escape: true,
+            ..InputState::default()
+        };
+        crate::map_keyboard(&mut input);
+        assert!(input.nav.cancel, "Escape maps to the cancel intent");
+
+        state.begin_frame(&mut input, &theme, 0.0, &crate::ManualNav);
+        assert!(
+            !input.nav.cancel,
+            "the open list claimed the cancel edge at frame-top, so focus never sees it"
+        );
+
+        state.end_frame();
+
+        assert!(!state.dropdowns.is_open(1), "Escape closes the open list");
+        assert!(
+            state.focus.is_focused(7),
+            "and the same Escape must not blur the focused field"
+        );
+    }
+
+    #[test]
+    fn an_open_dropdown_claims_directional_intents_from_the_base_layer() {
+        // The other half of the contract: intents the open list acts on must not
+        // also reach a focused list/tree behind the popup, and Tab is never
+        // claimed (the list is not a focus trap).
+        let theme = Theme::default();
+        let mut state = UiState::new();
+        state
+            .dropdowns
+            .open_for_test(1, Rect::new(10.0, 10.0, 120.0, 28.0), &["Red", "Green"], 0);
+
+        let mut input = InputState {
+            key_up: true,
+            key_down: true,
+            enter_pressed: true,
+            key_escape: true,
+            key_tab: true,
+            ..InputState::default()
+        };
+        crate::map_keyboard(&mut input);
+        assert!(input.nav.up && input.nav.down && input.nav.confirm);
+        assert!(input.nav.next, "Tab maps to the next intent");
+
+        state.begin_frame(&mut input, &theme, 0.0, &crate::ManualNav);
+
+        assert!(
+            !input.nav.up && !input.nav.down && !input.nav.confirm && !input.nav.cancel,
+            "an open list claims the intents it acts on"
+        );
+        assert!(
+            input.nav.next,
+            "but Tab is left alone for the focus ring (Shift+Tab follows `shift_pressed` \
+             and is never claimed either)"
+        );
     }
 }

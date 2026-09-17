@@ -316,6 +316,7 @@ impl List {
     }
 
     /// Draw the list and return interaction results.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw<F>(
         &self,
         rect: Rect,
@@ -329,6 +330,7 @@ impl List {
     where
         F: FnMut(&mut DrawList, Rect, ListItem),
     {
+        list.push_debug_scope_rect("List", rect);
         let item_h = self
             .item_height
             .unwrap_or(style.scalar(StyleKey::FontSize) + 10.0)
@@ -423,10 +425,8 @@ impl List {
                 state.scroll.clamp([rect.width, rect.height]);
             }
 
-            if k.activate {
-                if let Some(c) = state.cursor {
-                    activated = Some(c);
-                }
+            if k.activate && state.cursor.is_some() {
+                activated = state.cursor;
             }
         }
 
@@ -540,6 +540,7 @@ impl List {
                 }
             });
 
+        list.pop_debug_scope();
         ListOutput {
             clicked,
             activated,

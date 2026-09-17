@@ -124,7 +124,11 @@ struct ColorAnim {
 
 impl ColorAnim {
     fn current(&self, easing: Easing, duration: f32) -> [f32; 4] {
-        let frac = if duration <= 0.0 { 1.0 } else { self.t / duration };
+        let frac = if duration <= 0.0 {
+            1.0
+        } else {
+            self.t / duration
+        };
         lerp_color(self.start, self.target, ease(easing, frac))
     }
 }
@@ -139,7 +143,11 @@ struct ScalarAnim {
 
 impl ScalarAnim {
     fn current(&self, easing: Easing, duration: f32) -> f32 {
-        let frac = if duration <= 0.0 { 1.0 } else { self.t / duration };
+        let frac = if duration <= 0.0 {
+            1.0
+        } else {
+            self.t / duration
+        };
         lerp(self.start, self.target, ease(easing, frac))
     }
 }
@@ -323,7 +331,12 @@ mod tests {
 
     #[test]
     fn ease_endpoints_and_clamp() {
-        for e in [Easing::Linear, Easing::EaseIn, Easing::EaseOut, Easing::EaseInOut] {
+        for e in [
+            Easing::Linear,
+            Easing::EaseIn,
+            Easing::EaseOut,
+            Easing::EaseInOut,
+        ] {
             assert_eq!(ease(e, 0.0), 0.0, "{e:?} at 0");
             assert_eq!(ease(e, 1.0), 1.0, "{e:?} at 1");
             assert_eq!(ease(e, -5.0), 0.0, "{e:?} clamps low");
@@ -334,7 +347,12 @@ mod tests {
 
     #[test]
     fn ease_is_monotonic() {
-        for e in [Easing::Linear, Easing::EaseIn, Easing::EaseOut, Easing::EaseInOut] {
+        for e in [
+            Easing::Linear,
+            Easing::EaseIn,
+            Easing::EaseOut,
+            Easing::EaseInOut,
+        ] {
             let mut prev = -1.0;
             for i in 0..=20 {
                 let v = ease(e, i as f32 / 20.0);
@@ -360,7 +378,10 @@ mod tests {
     fn first_sight_returns_target_exactly() {
         let mut a = AnimationState::new();
         a.tick(1.0 / 60.0);
-        assert_eq!(a.animate_color(1, AnimSlot::Bg, RED, DUR, Easing::EaseOut), RED);
+        assert_eq!(
+            a.animate_color(1, AnimSlot::Bg, RED, DUR, Easing::EaseOut),
+            RED
+        );
     }
 
     #[test]
@@ -368,10 +389,16 @@ mod tests {
         let mut a = AnimationState::new();
         a.tick(1.0 / 60.0);
         // First sight settled at RED.
-        assert_eq!(a.animate_color(1, AnimSlot::Bg, RED, 0.0, Easing::EaseOut), RED);
+        assert_eq!(
+            a.animate_color(1, AnimSlot::Bg, RED, 0.0, Easing::EaseOut),
+            RED
+        );
         a.tick(1.0 / 60.0);
         // Target jumps to BLUE with duration 0 → snaps immediately.
-        assert_eq!(a.animate_color(1, AnimSlot::Bg, BLUE, 0.0, Easing::EaseOut), BLUE);
+        assert_eq!(
+            a.animate_color(1, AnimSlot::Bg, BLUE, 0.0, Easing::EaseOut),
+            BLUE
+        );
     }
 
     #[test]
@@ -379,7 +406,10 @@ mod tests {
         let mut a = AnimationState::new();
         // Frame 1: settle at RED.
         a.tick(0.0);
-        assert_eq!(a.animate_color(1, AnimSlot::Bg, RED, DUR, Easing::Linear), RED);
+        assert_eq!(
+            a.animate_color(1, AnimSlot::Bg, RED, DUR, Easing::Linear),
+            RED
+        );
         // Frame 2: target → BLUE, advance half the duration → strictly between.
         a.tick(DUR / 2.0);
         let mid = a.animate_color(1, AnimSlot::Bg, BLUE, DUR, Easing::Linear);
@@ -414,14 +444,20 @@ mod tests {
         // Reverse the target back to RED from the mid value — no jump.
         a.tick(0.0);
         let after = a.animate_color(1, AnimSlot::Bg, RED, DUR, Easing::Linear);
-        assert_eq!(after, mid, "retarget on dt==0 must start from current value");
+        assert_eq!(
+            after, mid,
+            "retarget on dt==0 must start from current value"
+        );
     }
 
     #[test]
     fn scalar_overlay_alpha_animates() {
         let mut a = AnimationState::new();
         a.tick(0.0);
-        assert_eq!(a.animate_scalar(7, AnimSlot::Overlay, 0.0, DUR, Easing::Linear), 0.0);
+        assert_eq!(
+            a.animate_scalar(7, AnimSlot::Overlay, 0.0, DUR, Easing::Linear),
+            0.0
+        );
         a.tick(DUR / 2.0);
         let mid = a.animate_scalar(7, AnimSlot::Overlay, 1.0, DUR, Easing::Linear);
         assert!(mid > 0.0 && mid < 1.0, "alpha mid: {mid}");

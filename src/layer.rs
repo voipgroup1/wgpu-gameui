@@ -38,7 +38,8 @@
 //!     layers.pop_layer();
 //! }
 //!
-//! // 4. Render
+//! // 4. Render. `begin_frame` opens the frame: one submission = one frame.
+//! ui_renderer.begin_frame();
 //! ui_renderer.render_layers(..., &layers);
 //! ```
 //!

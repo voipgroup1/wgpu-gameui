@@ -4,7 +4,12 @@ use crate::layout::Rect;
 use crate::text::TextBlock;
 use crate::{AnimSlot, AnimationState, Easing, InputState, StyleKey, StyleResolver};
 
-use super::DrawList;
+use super::{DrawList, material};
+
+/// Tab-strip well inset, expressed in border-width units to stay DPI-relative.
+const STRIP_INSET_BORDERS: f32 = 2.0;
+/// Gap separating the individual tab keys inside their shared well.
+const TAB_GAP_BORDERS: f32 = 3.0;
 
 /// Output from drawing tabs.
 pub struct TabsOutput {
@@ -79,23 +84,38 @@ impl<'a> Tabs<'a> {
             };
         }
 
-        let tab_width = rect.width / tab_count as f32;
         let bar_rect = Rect::new(rect.x, rect.y, rect.width, self.tab_height);
-        let mut clicked = None;
-
-        // Draw background for entire tab bar
-        list.quad(
-            bar_rect.x,
-            bar_rect.y,
-            bar_rect.width,
-            bar_rect.height,
-            style.color(StyleKey::TabInactive),
+        // Non-document tabs live in the same sunken, padded container as the
+        // 4a gallery. Document tabs deliberately use their separate edge-to-
+        // edge `DocTabs` treatment.
+        list.push_debug_scope_rect("Tabs", bar_rect);
+        let border = style.scalar(StyleKey::BorderWidth);
+        let inset = STRIP_INSET_BORDERS * border;
+        let gap = TAB_GAP_BORDERS * border;
+        let inner = bar_rect.inset(inset);
+        let total_gap = gap * (tab_count.saturating_sub(1) as f32);
+        let tab_width = ((inner.width - total_gap) / tab_count as f32).max(0.0);
+        let tab_height = inner.height;
+        let radius = style.scalar(StyleKey::BorderRadius);
+        list.chrome_rect(
+            bar_rect,
+            radius,
+            border,
+            style.color(StyleKey::InputBackground),
+            style.color(StyleKey::PanelBorder),
         );
+        material::draw_inset_shadow(
+            list,
+            style,
+            bar_rect,
+            style.scalar(StyleKey::InnerShadowDepth),
+            border,
+        );
+        let mut clicked: Option<usize> = None;
 
-        // Draw each tab
         for (i, label) in self.labels.iter().enumerate() {
-            let tab_x = rect.x + i as f32 * tab_width;
-            let tab_rect = Rect::new(tab_x, rect.y, tab_width, self.tab_height);
+            let tab_x = inner.x + i as f32 * (tab_width + gap);
+            let tab_rect = Rect::new(tab_x, inner.y, tab_width, tab_height);
 
             let is_active = i == active;
             let is_hovered = tab_rect.contains(input.mouse_x, input.mouse_y);
@@ -105,8 +125,10 @@ impl<'a> Tabs<'a> {
                 clicked = Some(i);
             }
 
-            // Tab background — resolve the discrete target, then ease toward it
-            // (no-op without an AnimationState/anim_id → byte-identical).
+            // Tab = a key on the strip: active is held (flush, face gradient,
+            // bright text), inactive is the sunken well, hover lifts slightly.
+            // Resolve the discrete target, then ease toward it (no-op without
+            // an AnimationState/anim_id → byte-identical).
             let target_bg = if is_active {
                 style.color(StyleKey::TabActive)
             } else if is_hovered {
@@ -124,27 +146,27 @@ impl<'a> Tabs<'a> {
                 ),
                 _ => target_bg,
             };
-            list.quad(tab_x, rect.y, tab_width, self.tab_height, bg_color);
-
-            // Active indicator (bottom border for active tab)
+            // Active tabs drop flush (inset 0 at the bottom edge = held key);
+            // inactive tabs sit 2px up so the bar line shows beneath them.
+            let drop = if is_active { 0.0 } else { 2.0 };
+            let face = Rect::new(tab_x, inner.y, tab_width, (tab_height - drop).max(0.0));
+            list.chrome_rect_gradient(
+                face,
+                radius,
+                1.0,
+                bg_color,
+                bg_color,
+                [0.0, 0.0, 0.0, if is_active { 0.55 } else { 0.35 }],
+            );
             if is_active {
+                // 1px inset highlight under the held key's top edge.
+                let hl = style.color(StyleKey::EdgeHighlight);
                 list.quad(
-                    tab_x,
-                    rect.y + self.tab_height - 2.0,
-                    tab_width,
-                    2.0,
-                    style.color(StyleKey::Accent),
-                );
-            }
-
-            // Tab separator (right edge, except for last tab)
-            if i < tab_count - 1 {
-                list.quad(
-                    tab_x + tab_width - 1.0,
-                    rect.y + 4.0,
+                    face.x + 1.0,
+                    face.y + 1.0,
+                    (face.width - 2.0).max(0.0),
                     1.0,
-                    self.tab_height - 8.0,
-                    style.color(StyleKey::TabBorder),
+                    hl,
                 );
             }
 
@@ -152,7 +174,7 @@ impl<'a> Tabs<'a> {
             let target_text = if is_active {
                 style.color(StyleKey::TextHighlight)
             } else {
-                style.color(StyleKey::Text)
+                style.color(StyleKey::TextDim)
             };
             let text_color = match (self.anim_id, anim.as_deref_mut()) {
                 (Some(base), Some(a)) => a.animate_color(
@@ -166,8 +188,8 @@ impl<'a> Tabs<'a> {
             };
             let font_size = style.scalar(StyleKey::FontSize) * 0.8;
             let text_y = list.vcentered_text_y(
-                rect.y,
-                self.tab_height,
+                face.y,
+                face.height,
                 font_size,
                 style.theme().font.as_ref(),
                 label,
@@ -186,15 +208,7 @@ impl<'a> Tabs<'a> {
             list.text(text);
         }
 
-        // Bottom border for tab bar
-        list.quad(
-            rect.x,
-            rect.y + self.tab_height - 1.0,
-            rect.width,
-            1.0,
-            style.color(StyleKey::TabBorder),
-        );
-
+        list.pop_debug_scope();
         TabsOutput {
             clicked,
             rect: bar_rect,
@@ -223,19 +237,46 @@ mod tests {
         }
     }
 
-    /// Background fill of tab `i` (the full-size bg quad at that tab's x, height
-    /// `TAB_H` — distinguishes it from the 2px indicator and 1px separators).
+    /// Background fill of tab `i` (the gradient face chrome at that tab's x —
+    /// active tabs are full height, inactive drop 2px short of the bar line).
     fn tab_bg(list: &DrawList, i: usize, tab_width: f32) -> [f32; 4] {
-        let tab_x = i as f32 * tab_width;
+        let tab_x = 2.0 + i as f32 * (tab_width + 3.0);
         list.chrome_instances
             .iter()
             .find(|c| {
                 (c.rect[0] - tab_x).abs() < 0.01
                     && (c.rect[2] - tab_width).abs() < 0.01
-                    && (c.rect[3] - TAB_H).abs() < 0.01
+                    && ((c.rect[3] - (TAB_H - 4.0 - 2.0)).abs() < 0.01
+                        || (c.rect[3] - (TAB_H - 4.0)).abs() < 0.01)
             })
             .map(|c| c.bg)
             .expect("tab should emit a background quad")
+    }
+
+    #[test]
+    fn strip_insets_and_gaps_tabs_inside_the_sunken_container() {
+        let theme = Theme::default();
+        let style = StyleResolver::new(&theme);
+        let labels = ["A", "B", "C"];
+        let mut list = DrawList::new();
+        Tabs::new(&labels).draw(rect(), 0, &mut list, &style, &idle(), None);
+
+        let strip = list
+            .chrome_instances
+            .iter()
+            .find(|c| c.rect == [0.0, 0.0, W, TAB_H])
+            .expect("tabs should paint their shared sunken container");
+        assert_eq!(strip.bg, theme.input_background);
+        let tab_w = (W - 4.0 - 6.0) / 3.0;
+        let faces: Vec<_> = list
+            .chrome_instances
+            .iter()
+            .filter(|c| (c.rect[2] - tab_w).abs() < 0.01)
+            .collect();
+        assert_eq!(faces.len(), 3);
+        assert_eq!(faces[0].rect[0], 2.0);
+        assert_eq!(faces[1].rect[0] - faces[0].rect[0] - tab_w, 3.0);
+        assert_eq!(faces[2].rect[0] - faces[1].rect[0] - tab_w, 3.0);
     }
 
     #[test]
@@ -243,7 +284,7 @@ mod tests {
         let theme = Theme::default();
         let s = StyleResolver::new(&theme);
         let labels = ["A", "B", "C"];
-        let tab_width = W / 3.0;
+        let tab_width = (W - 4.0 - 2.0 * 3.0) / 3.0;
 
         let mut plain = DrawList::new();
         Tabs::new(&labels).draw(rect(), 0, &mut plain, &s, &idle(), None);
@@ -262,7 +303,7 @@ mod tests {
         let theme = Theme::default();
         let s = StyleResolver::new(&theme);
         let labels = ["A", "B", "C"];
-        let tab_width = W / 3.0;
+        let tab_width = (W - 4.0 - 2.0 * 3.0) / 3.0;
         let mut state = AnimationState::new();
 
         // Frame 1: tab 0 active → tab 1 settles at TabInactive.
@@ -297,7 +338,7 @@ mod tests {
         let theme = Theme::default();
         let s = StyleResolver::new(&theme);
         let labels = ["A", "B", "C"];
-        let tab_width = W / 3.0;
+        let tab_width = (W - 4.0 - 2.0 * 3.0) / 3.0;
         let mut state = AnimationState::new();
 
         // First sight: active tab 1 draws TabActive directly (no fade-in).

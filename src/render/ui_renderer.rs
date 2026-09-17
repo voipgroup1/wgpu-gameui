@@ -12,12 +12,12 @@ use crate::layout::Rect;
 use crate::render::atlas::{SpriteAtlas, SpriteId};
 use crate::render::blur::{Backdrop, Blur, BlurParams};
 use crate::render::image_cache::{ImageCache, ImageEntry, ImageError, decode_rgba8};
+use crate::render::uniform_arena::UniformArena;
 use crate::text::FontSystemHandle;
 use crate::widgets::{
-    ChromeInstance, CircleInstance, ColorCmd, DrawList, IconDraw, NineSliceDraw, NineSliceId,
+    ChromeInstance, CircleInstance, DrawList, IconDraw, NineSliceDraw, NineSliceId, PaintCmd,
     Vertex,
 };
-
 
 const SHADER: &str = include_str!("ui.wgsl");
 
@@ -34,6 +34,28 @@ pub struct NineSliceMeta {
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+}
+
+/// Size of one ortho uniform, and therefore of one dynamic-offset slot.
+const UNIFORM_SIZE: u64 = std::mem::size_of::<Uniforms>() as u64;
+
+/// Per-frame GPU arena bytes one submission may consume before the renderer
+/// assumes its frame boundary was missed (see [`UiRenderer::begin_frame`]). A
+/// renderer that crosses this limit refuses later render calls until the caller
+/// opens a new frame, rather than geometrically growing an arena into wgpu's hard
+/// maximum-buffer validation failure.
+const ARENA_SANITY_CAP: u64 = 64 * 1024 * 1024;
+
+fn frame_arena_within_cap(bytes: u64) -> bool {
+    bytes <= ARENA_SANITY_CAP
+}
+
+#[derive(Clone, Copy)]
+struct OrderedColorUpload {
+    vertex_offset: u64,
+    index_offset: u64,
+    chrome_offset: u64,
+    circle_offset: u64,
 }
 
 /// Per-instance icon/image record — matches `vs_icon` in `ui.wgsl`.
@@ -56,7 +78,11 @@ struct IconInstance {
     tint: [f32; 4],
     /// Clip rect `[x, y, w, h]` (ignored unless `flags[0] > 0.5`).
     clip: [f32; 4],
-    /// `[clip_enabled, _pad, _pad, _pad]`.
+    /// `[clip_enabled, tile_wrap, tile_span_u, tile_span_v]`: `flags[1] > 0.5`
+    /// makes the fragment shader repeat the source region modulo **one tile**
+    /// (`flags[2..]` = the single-tile UV span in atlas units — the instance's
+    /// `uv_rect` spans `tile_count` tiles after `apply_crop_uv`, so its own
+    /// size can't serve as the wrap modulus). See [`DrawList::image_tiled`].
     flags: [f32; 4],
 }
 
@@ -84,12 +110,13 @@ const CHROME_BASE_ATTRIBS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array!
 ];
 
 /// Per-instance chrome attributes — matches [`ChromeInstance`] / `vs_chrome`.
-const CHROME_INSTANCE_ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+const CHROME_INSTANCE_ATTRIBS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
     1 => Float32x4, // rect
-    2 => Float32x4, // bg
-    3 => Float32x4, // border
-    4 => Float32x4, // clip
-    5 => Float32x4, // params (radius, thickness, clip_enabled, _pad)
+    2 => Float32x4, // bg (gradient top)
+    3 => Float32x4, // bg2 (gradient bottom)
+    4 => Float32x4, // border
+    5 => Float32x4, // clip
+    6 => Float32x4, // params (radius, thickness, clip_enabled, _pad)
 ];
 
 /// Per-instance circle attributes — matches [`CircleInstance`] / `vs_circle`
@@ -210,6 +237,93 @@ impl StaleListDetector {
     }
 }
 
+/// Cheap counters describing the GPU work encoded by one UI render call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderStats {
+    /// Draw lists rendered, including layers.
+    pub draw_lists: usize,
+    /// Total submitted primitives.
+    pub primitives: usize,
+    /// Ordered paint-stream runs.
+    pub paint_runs: usize,
+    /// GPU draw calls encoded.
+    pub draw_calls: usize,
+    /// Soup/chrome/circle runs.
+    pub color_runs: usize,
+    /// Text runs.
+    pub text_runs: usize,
+    /// Atlas-image, nine-slice, and vector-icon runs.
+    pub icon_runs: usize,
+    /// Queue buffer-write operations.
+    pub buffer_write_calls: usize,
+    /// Bytes written to dynamic GPU buffers.
+    pub buffer_bytes_uploaded: u64,
+    /// Full or partial atlas texture uploads.
+    pub atlas_uploads: usize,
+    /// Approximate bytes uploaded to atlas textures.
+    pub atlas_bytes_uploaded: u64,
+    /// Dynamic buffers replaced to increase capacity.
+    pub buffer_reallocations: usize,
+}
+
+impl RenderStats {
+    /// Paint runs per primitive; values above one indicate very fine-grained
+    /// family alternation rather than simply a large UI.
+    pub fn fragmentation_ratio(self) -> f32 {
+        self.paint_runs as f32 / self.primitives.max(1) as f32
+    }
+
+    /// Human-readable performance findings suitable for logs and debug reports.
+    pub fn warnings(self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.paint_runs >= 128 && self.fragmentation_ratio() >= 0.75 {
+            warnings.push(format!(
+                "{} paint runs for {} primitives ({:.2} runs/primitive); primitive-family alternation is producing many small submissions",
+                self.paint_runs,
+                self.primitives,
+                self.fragmentation_ratio()
+            ));
+        }
+        if self.buffer_reallocations > 0 {
+            warnings.push(format!(
+                "{} dynamic GPU buffer reallocation(s); capacity is warming or the frame exceeded its previous high-water mark",
+                self.buffer_reallocations
+            ));
+        }
+        if self.atlas_uploads > 1 {
+            warnings.push(format!(
+                "{} atlas uploads in one frame; batch resource/glyph registration before rendering where possible",
+                self.atlas_uploads
+            ));
+        }
+        warnings
+    }
+}
+
+#[derive(Default)]
+struct RenderPressureDetector {
+    streak: u32,
+    warned: bool,
+}
+
+impl RenderPressureDetector {
+    const WARN_AFTER: u32 = 120;
+
+    fn observe(&mut self, stats: RenderStats) -> bool {
+        if stats.warnings().is_empty() {
+            self.streak = 0;
+        } else {
+            self.streak = self.streak.saturating_add(1);
+        }
+        if !self.warned && self.streak >= Self::WARN_AFTER {
+            self.warned = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Public renderer.
 pub struct UiRenderer {
     // Pipelines
@@ -219,9 +333,17 @@ pub struct UiRenderer {
     circle_pipeline: wgpu::RenderPipeline,
     nine_slice_pipeline: wgpu::RenderPipeline,
 
-    // Uniforms (shared by both pipelines via group(0))
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
+    // Uniforms (shared by both pipelines via group(0)). One arena slot per pass:
+    // the projection is per pass (two passes can target differently sized views),
+    // and passes sharing a slot would all read the last matrix written. Reset by
+    // `begin_frame`; see `render::uniform_arena`.
+    uniform: UniformArena,
+    /// The slot the pass being recorded binds. Set by `prepare_pass`.
+    pass_uniform_offset: u32,
+    /// Once an arena crosses the submission cap, refuse further rendering until
+    /// `begin_frame` resets all cursors. This turns a missed frame boundary into
+    /// one actionable log rather than a fatal oversized-buffer allocation.
+    frame_boundary_required: bool,
 
     // Atlas resources
     atlas: SpriteAtlas,
@@ -242,22 +364,26 @@ pub struct UiRenderer {
     // slice at the running `*_offset` and advances it, so the many draws issued
     // per submit (nine-slices + icons per layer, every layer) occupy disjoint
     // regions instead of all aliasing offset 0 and reading the last write at
-    // draw time. Offsets reset to 0 each frame in `prepare_frame`.
+    // draw time. Offsets reset to 0 each frame in `begin_frame`.
     color_vbo: wgpu::Buffer,
     color_ibo: wgpu::Buffer,
     color_vbo_capacity: u64,
     color_ibo_capacity: u64,
     color_vbo_offset: u64,
     color_ibo_offset: u64,
+    // Replaced dynamic buffers remain alive for the renderer's lifetime. Wgpu
+    // work can outlive the frame in which it was submitted; geometric growth
+    // keeps this set small while avoiding backend-specific completion polling.
+    retired_buffers: Vec<wgpu::Buffer>,
 
     // Instanced icons: reuses the chrome unit-quad base mesh + a growing
-    // per-frame instance buffer (bump offset, reset in `prepare_frame`).
+    // per-frame instance buffer (bump offset, reset in `begin_frame`).
     icon_inst_buffer: wgpu::Buffer,
     icon_inst_capacity: u64,
     icon_inst_offset: u64,
 
     // Instanced chrome: a persistent unit-quad base mesh + a growing per-frame
-    // instance buffer (bump offset like the others, reset in `prepare_frame`).
+    // instance buffer (bump offset like the others, reset in `begin_frame`).
     chrome_base_vbo: wgpu::Buffer,
     chrome_base_ibo: wgpu::Buffer,
     chrome_inst_buffer: wgpu::Buffer,
@@ -265,13 +391,13 @@ pub struct UiRenderer {
     chrome_inst_offset: u64,
 
     // Instanced circles: reuses the chrome unit-quad base mesh + a growing
-    // per-frame instance buffer (bump offset, reset in `prepare_frame`).
+    // per-frame instance buffer (bump offset, reset in `begin_frame`).
     circle_inst_buffer: wgpu::Buffer,
     circle_inst_capacity: u64,
     circle_inst_offset: u64,
 
     // Instanced nine-slice: reuses the chrome unit-quad base mesh + a growing
-    // per-frame instance buffer (bump offset, reset in `prepare_frame`).
+    // per-frame instance buffer (bump offset, reset in `begin_frame`).
     nine_inst_buffer: wgpu::Buffer,
     nine_inst_capacity: u64,
     nine_inst_offset: u64,
@@ -293,6 +419,8 @@ pub struct UiRenderer {
     // text-measure cache → per-frame reshaping). Fed the rendered list's id in
     // `render`/`render_layers`; warns once if it's always a brand-new list.
     stale_list: StaleListDetector,
+    pressure: RenderPressureDetector,
+    frame_stats: RenderStats,
 }
 
 impl UiRenderer {
@@ -309,37 +437,15 @@ impl UiRenderer {
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
 
-        // Uniforms (bind group 0)
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ui uniform buffer"),
-            contents: bytemuck::cast_slice(&[Uniforms {
-                view_proj: ortho_matrix(1.0, 1.0),
-            }]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        // Uniforms (bind group 0), one slot per pass — see `uniform_arena` for why.
+        let uniform = UniformArena::new(
+            device,
+            "ui uniform buffer",
+            UNIFORM_SIZE,
+            wgpu::ShaderStages::VERTEX,
+        );
 
-        let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ui uniform bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ui uniform bg"),
-            layout: &uniform_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
+        let uniform_bgl = uniform.layout();
 
         // Atlas + texture
         let atlas = SpriteAtlas::new();
@@ -599,13 +705,10 @@ impl UiRenderer {
             mapped_at_creation: false,
         });
 
-        let mut text_renderer = TextRenderer::with_font_system(device, queue, format, font_system);
-        // Generate the printable-ASCII MSDF set up front so the first frame that
-        // shows text doesn't hitch on per-glyph generation.
-        text_renderer.prewarm_ascii(device, queue);
-        // Same for the curated Phosphor icon set.
-        #[cfg(feature = "phosphor-icons")]
-        text_renderer.prewarm_icons(device, queue);
+        // Glyphs are generated lazily from the first frame's actual working set.
+        // Eagerly rasterizing every ASCII and Phosphor glyph here made renderer
+        // construction needlessly CPU-heavy for small or usually-hidden UIs.
+        let text_renderer = TextRenderer::with_font_system(device, queue, format, font_system);
 
         let current_atlas_size = atlas.width();
 
@@ -639,8 +742,9 @@ impl UiRenderer {
             chrome_pipeline,
             circle_pipeline,
             nine_slice_pipeline,
-            uniform_buffer,
-            uniform_bind_group,
+            uniform,
+            pass_uniform_offset: 0,
+            frame_boundary_required: false,
             atlas,
             texture,
             texture_bind_group_layout: texture_bgl,
@@ -656,6 +760,7 @@ impl UiRenderer {
             color_ibo_capacity,
             color_vbo_offset: 0,
             color_ibo_offset: 0,
+            retired_buffers: Vec::new(),
             icon_inst_buffer,
             icon_inst_capacity,
             icon_inst_offset: 0,
@@ -675,6 +780,8 @@ impl UiRenderer {
             text_renderer,
             warned_missing: RefCell::new(HashSet::new()),
             stale_list: StaleListDetector::default(),
+            pressure: RenderPressureDetector::default(),
+            frame_stats: RenderStats::default(),
         }
     }
 
@@ -702,6 +809,23 @@ impl UiRenderer {
     /// Look up a sprite id by name.
     pub fn sprite_id(&self, name: &str) -> Option<SpriteId> {
         self.atlas.id_for(name)
+    }
+
+    /// Pre-generate MSDF tiles for icon glyphs from an application-registered
+    /// icon font, so the first frame that shows them doesn't hitch on generation.
+    ///
+    /// This is opt-in for both the built-in Phosphor font and fonts added via
+    /// [`register_icon_font`](crate::render::register_icon_font). Pass only the
+    /// glyphs an application expects to need; all others remain lazily generated.
+    #[cfg(feature = "phosphor-icons")]
+    pub fn prewarm_icons(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        glyphs: &[crate::render::IconGlyph],
+    ) {
+        self.text_renderer
+            .prewarm_icon_glyphs(device, queue, glyphs);
     }
 
     /// True if `key` resolves to a sprite already present in the atlas — a
@@ -841,9 +965,22 @@ impl UiRenderer {
         self.nine_slice_names.get(name).copied()
     }
 
-    /// Notify the text sub-renderer of viewport changes.
-    pub fn resize(&mut self, _queue: &wgpu::Queue, width: u32, height: u32) {
-        self.text_renderer.resize(width, height);
+    /// Notify the text sub-renderer of viewport changes. `scale_factor` is the
+    /// logical → physical ratio (pass `1.0` when unknown).
+    ///
+    /// This is the *public* resize hook for callers that change the viewport
+    /// outside a frame; the per-pass resize (which reserves the text pipeline's
+    /// uniform slot) happens inside `render`/`render_layers`.
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+    ) {
+        self.text_renderer
+            .resize(device, queue, width, height, scale_factor);
     }
 
     /// Force-upload pending atlas changes to the GPU. Called automatically by
@@ -921,6 +1058,52 @@ impl UiRenderer {
         );
     }
 
+    /// Open a frame: everything rendered until the next `begin_frame` is expected to
+    /// reach the GPU through a single `Queue::submit`.
+    ///
+    /// **Call this exactly once per frame**, before the first render call whose passes
+    /// are submitted together (the widget stack and a modal drawn into one encoder are
+    /// one frame; a second encoder submitted separately is another). It resets the
+    /// per-frame GPU bump arenas — colour, chrome, circle, icon, nine-slice, text and
+    /// uniform — and the frame's [`RenderStats`].
+    ///
+    /// The boundary is what keeps the passes from destroying each other.
+    /// `Queue::write_buffer` does not take effect when it is called: it is staged and
+    /// executed at the start of the next `submit`, *before* any recorded pass runs. Two
+    /// passes in one submission therefore read whichever bytes were written last — the
+    /// last pass's — unless each pass owns a distinct byte range. Those ranges only
+    /// exist within a frame, so a renderer that is not told where the frame starts
+    /// cannot separate the passes.
+    ///
+    /// Forgetting the call is not silent: the arenas keep growing, so the buffers
+    /// reallocate every frame, which trips the sustained-render-pressure warning, and a
+    /// single frame crossing [`ARENA_SANITY_CAP`] logs a dedicated message.
+    pub fn begin_frame(&mut self) {
+        // Judge the *previous* frame here rather than at the end of a render call: the
+        // counters describe a whole frame, and a frame can contain several calls.
+        let previous = self.frame_stats;
+        if self.pressure.observe(previous) {
+            log::warn!(
+                "wgpu-gameui: sustained render pressure for {}+ frames: {}. Inspect the returned RenderStats or attach it to DebugReport::with_render_stats().",
+                RenderPressureDetector::WARN_AFTER,
+                previous.warnings().join("; ")
+            );
+        }
+        self.frame_stats = RenderStats::default();
+        self.frame_boundary_required = false;
+        self.color_vbo_offset = 0;
+        self.color_ibo_offset = 0;
+        self.icon_inst_offset = 0;
+        self.chrome_inst_offset = 0;
+        self.circle_inst_offset = 0;
+        self.nine_inst_offset = 0;
+        self.uniform.reset();
+        self.text_renderer.begin_frame();
+        if let Some(blur) = self.blur.as_mut() {
+            blur.begin_frame();
+        }
+    }
+
     /// Render the entire DrawList in one call.
     /// Render a single `DrawList`.
     ///
@@ -931,6 +1114,7 @@ impl UiRenderer {
     /// by `scale_factor` when building its projection, so geometry stays the same
     /// logical size while text rasterizes against the higher-resolution
     /// framebuffer (the MSDF path sharpens automatically). Pass `1.0` to disable.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -940,19 +1124,25 @@ impl UiRenderer {
         viewport: (u32, u32),
         scale_factor: f32,
         draw_list: &DrawList,
-    ) {
+    ) -> RenderStats {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_render").entered();
+        if !self.can_render_this_frame("render") {
+            return self.frame_stats;
+        }
         if self.stale_list.observe(draw_list.id()) {
             Self::warn_stale_list("render", "DrawList");
         }
-        self.prepare_frame(device, queue, viewport, scale_factor);
+        self.prepare_pass(device, queue, viewport, scale_factor);
         self.render_one(device, queue, encoder, view, draw_list);
+        self.check_frame_arena();
+        self.frame_stats
     }
 
     /// Render a `LayerStack`: base list first, then each layer in push order.
     /// Each layer goes through the full 4-pass pipeline so a higher-z layer's
     /// quads correctly overlap a lower-z layer's text/icons.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_layers(
         &mut self,
         device: &wgpu::Device,
@@ -962,20 +1152,25 @@ impl UiRenderer {
         viewport: (u32, u32),
         scale_factor: f32,
         layers: &LayerStack,
-    ) {
+    ) -> RenderStats {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_render_layers").entered();
+        if !self.can_render_this_frame("render_layers") {
+            return self.frame_stats;
+        }
         // Key the footgun detector on the BASE list only: modal/popup/tooltip
         // layers are legitimately transient (built per push), so their ids would
         // be false positives.
         if self.stale_list.observe(layers.base_id()) {
             Self::warn_stale_list("render_layers", "LayerStack");
         }
-        self.prepare_frame(device, queue, viewport, scale_factor);
+        self.prepare_pass(device, queue, viewport, scale_factor);
         self.render_one(device, queue, encoder, view, layers.base());
         for layer in layers.layers() {
             self.render_one(device, queue, encoder, view, &layer.list);
         }
+        self.check_frame_arena();
+        self.frame_stats
     }
 
     /// Emit the once-per-renderer warning that the caller is feeding a
@@ -1007,7 +1202,8 @@ impl UiRenderer {
     /// target's **physical** size and `scale_factor` the logical→physical ratio,
     /// matching [`render`](Self::render). A degenerate region is a no-op.
     ///
-    /// Typical frame: render scene → `blur_backdrop(region)` → `render(panels)`.
+    /// Typical frame: render scene → `blur_backdrop(region)` → `render(panels)`,
+    /// all into one encoder under one [`begin_frame`](Self::begin_frame).
     #[allow(clippy::too_many_arguments)]
     pub fn blur_backdrop(
         &mut self,
@@ -1021,7 +1217,11 @@ impl UiRenderer {
         scale_factor: f32,
         params: &BlurParams,
     ) {
-        let scale = if scale_factor > 0.0 { scale_factor } else { 1.0 };
+        let scale = if scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
         let region_phys = [
             region.x * scale,
             region.y * scale,
@@ -1047,7 +1247,13 @@ impl UiRenderer {
         );
     }
 
-    fn prepare_frame(
+    /// Per-pass setup: give this pass its own ortho slot, point the text renderer at
+    /// the pass's viewport, and upload any pending atlas change.
+    ///
+    /// Deliberately resets nothing — the arenas span the whole frame
+    /// ([`begin_frame`](Self::begin_frame)), which is what keeps the passes of one
+    /// submission from overwriting each other.
+    fn prepare_pass(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -1055,7 +1261,7 @@ impl UiRenderer {
         scale_factor: f32,
     ) {
         #[cfg(feature = "tracy")]
-        let _span = tracing::info_span!("gameui_prepare_frame").entered();
+        let _span = tracing::info_span!("gameui_prepare_pass").entered();
         // The framebuffer is `viewport` physical pixels, but the UI is laid out
         // in logical pixels. Project logical → NDC by dividing the physical size
         // by the scale factor: a logical point still maps to the same NDC, while
@@ -1070,17 +1276,64 @@ impl UiRenderer {
         let uniforms = Uniforms {
             view_proj: ortho_matrix(logical_w, logical_h),
         };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
-        self.text_renderer.resize(viewport.0, viewport.1);
-        // Reset the per-frame bump cursors so this frame's draws start at 0.
-        self.color_vbo_offset = 0;
-        self.color_ibo_offset = 0;
-        self.icon_inst_offset = 0;
-        self.chrome_inst_offset = 0;
-        self.circle_inst_offset = 0;
-        self.nine_inst_offset = 0;
-        self.text_renderer.begin_frame();
+        let (slot, grew) = self.uniform.allocate(device);
+        if grew {
+            self.frame_stats.buffer_reallocations += 1;
+        }
+        queue.write_buffer(
+            self.uniform.buffer(),
+            slot,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+        self.frame_stats.buffer_write_calls += 1;
+        self.frame_stats.buffer_bytes_uploaded += UNIFORM_SIZE;
+        self.pass_uniform_offset = slot as u32;
+        self.text_renderer
+            .resize(device, queue, viewport.0, viewport.1, scale);
         self.flush_atlas(device, queue);
+        self.check_frame_arena();
+    }
+
+    /// Sum of every per-frame arena cursor — how many bytes of GPU scratch the
+    /// current frame (or, if [`begin_frame`](Self::begin_frame) was never called, a
+    /// growing pile of frames) is holding.
+    fn frame_arena_bytes(&self) -> u64 {
+        self.color_vbo_offset
+            + self.color_ibo_offset
+            + self.icon_inst_offset
+            + self.chrome_inst_offset
+            + self.circle_inst_offset
+            + self.nine_inst_offset
+            + self.uniform.bytes_used()
+            + self.text_renderer.frame_arena_bytes()
+    }
+
+    /// Return whether a new render call may consume this submission's arenas.
+    /// Once the cap has been crossed, later calls are refused until `begin_frame`
+    /// resets the cursors; this protects applications that forgot the explicit
+    /// frame boundary from a late, fatal wgpu max-buffer validation error.
+    fn can_render_this_frame(&mut self, method: &str) -> bool {
+        if !self.frame_boundary_required {
+            return true;
+        }
+        log::error!(
+            "wgpu-gameui: refusing `UiRenderer::{method}` because its per-frame GPU arenas exceeded {} MiB without a `UiRenderer::begin_frame()` reset. Call `begin_frame()` exactly once before encoding each submission.",
+            ARENA_SANITY_CAP / (1024 * 1024)
+        );
+        false
+    }
+
+    /// Arm the missed-frame gate as soon as the current submission exceeds the
+    /// sanity cap. The offending render still completed safely; later calls are
+    /// refused before another geometric growth allocation is attempted.
+    fn check_frame_arena(&mut self) {
+        if !frame_arena_within_cap(self.frame_arena_bytes()) {
+            self.frame_boundary_required = true;
+            log::error!(
+                "wgpu-gameui: this submission has bumped more than {} MiB through per-frame GPU arenas. `UiRenderer::begin_frame()` was probably not called before it; rendering is now blocked until that method resets the arenas, preventing an oversized GPU-buffer allocation.",
+                ARENA_SANITY_CAP / (1024 * 1024)
+            );
+        }
     }
 
     fn render_one(
@@ -1094,69 +1347,113 @@ impl UiRenderer {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_render_one").entered();
 
-        // Layering, bottom→top: nine-slice backgrounds, colored quads (panels,
-        // rounded-rect fills, sliders, custom shapes), icons, text. Each
-        // requires its own pass because consecutive layers swap pipelines or
-        // change vertex formats.
-
-        // ---------- 1. Nine-slices (instanced) ----------
-        {
-            #[cfg(feature = "tracy")]
-            let _s = tracing::info_span!("gameui_nine_slices").entered();
-            let instances = self.build_nine_slice_instances(&draw_list.nine_slices);
-            if !instances.is_empty() {
-                self.draw_nine_slices(device, queue, encoder, view, &instances);
-            }
-        }
-
-        // ---------- 2. Colored quads (+ instanced chrome) ----------
-        {
-            #[cfg(feature = "tracy")]
-            let _s = tracing::info_span!("gameui_color_quads").entered();
-            if draw_list.color_cmds.is_empty() {
-                // No chrome instances recorded: original single-draw fast path.
-                if !draw_list.vertices.is_empty() && !draw_list.indices.is_empty() {
-                    self.draw_color(
-                        device,
-                        queue,
-                        encoder,
-                        view,
-                        &draw_list.vertices,
-                        &draw_list.indices,
-                    );
+        self.frame_stats.draw_lists += 1;
+        self.frame_stats.primitives += draw_list.prim_counts().total();
+        self.frame_stats.paint_runs += draw_list.paint_commands().len();
+        for cmd in draw_list.paint_commands() {
+            match cmd {
+                PaintCmd::Soup { .. } | PaintCmd::Chrome { .. } | PaintCmd::Circle { .. } => {
+                    self.frame_stats.color_runs += 1;
                 }
-            } else {
-                self.draw_color_interleaved(device, queue, encoder, view, draw_list);
+                PaintCmd::Text { .. } => self.frame_stats.text_runs += 1,
+                PaintCmd::NineSlice { .. } | PaintCmd::Icon { .. } => {
+                    self.frame_stats.icon_runs += 1;
+                }
+                #[cfg(feature = "phosphor-icons")]
+                PaintCmd::IconMsdf { .. } => self.frame_stats.icon_runs += 1,
             }
         }
+        self.frame_stats.draw_calls += draw_list.paint_commands().len();
 
-        // ---------- 3. Icons (instanced) ----------
-        {
-            #[cfg(feature = "tracy")]
-            let _s = tracing::info_span!("gameui_icons").entered();
-            let instances = self.build_icon_instances(&draw_list.icons);
-            if !instances.is_empty() {
-                self.draw_icons(device, queue, encoder, view, &instances);
+        // Compatibility for callers which fill the public payload arrays directly.
+        // Normal enqueue APIs always populate the ordered stream.
+        if draw_list.paint_cmds.is_empty() {
+            let nine = self.build_nine_slice_instances(&draw_list.nine_slices);
+            if !nine.is_empty() {
+                self.draw_nine_slices(device, queue, encoder, view, &nine);
             }
-        }
-
-        // ---------- 3b. MSDF vector icons (Phosphor) ----------
-        // After sprite icons, before text — icons sit under text just like sprite
-        // icons do. Shares the text renderer's MSDF pipeline/uniform/vbo.
-        #[cfg(feature = "phosphor-icons")]
-        {
-            #[cfg(feature = "tracy")]
-            let _s = tracing::info_span!("gameui_icons_msdf").entered();
+            if !draw_list.vertices.is_empty() && !draw_list.indices.is_empty() {
+                self.draw_color(
+                    device,
+                    queue,
+                    encoder,
+                    view,
+                    &draw_list.vertices,
+                    &draw_list.indices,
+                );
+            }
+            let icons = self.build_icon_instances(&draw_list.icons);
+            if !icons.is_empty() {
+                self.draw_icons(device, queue, encoder, view, &icons);
+            }
+            #[cfg(feature = "phosphor-icons")]
             self.text_renderer
                 .render_icons(device, queue, encoder, view, &draw_list.icons_msdf);
-        }
-
-        // ---------- 4. Text ----------
-        {
-            #[cfg(feature = "tracy")]
-            let _s = tracing::info_span!("gameui_text").entered();
             self.text_renderer
                 .render(device, queue, encoder, view, &draw_list.texts);
+            return;
+        }
+
+        // Ordered text/icon runs must all use one stable atlas extent. Resolve the
+        // complete frame's glyph working set before any run bakes UVs or captures
+        // an atlas bind group; later runs can then render independently without
+        // invalidating earlier encoded passes.
+        self.text_renderer
+            .prepare_texts(device, queue, &draw_list.texts);
+        #[cfg(feature = "phosphor-icons")]
+        self.text_renderer
+            .prepare_icons(device, queue, &draw_list.icons_msdf);
+
+        let color_upload = self.upload_ordered_color(device, queue, draw_list);
+        for cmd in &draw_list.paint_cmds {
+            match cmd {
+                PaintCmd::Soup { .. } | PaintCmd::Chrome { .. } | PaintCmd::Circle { .. } => {
+                    self.draw_color_interleaved(encoder, view, cmd, color_upload);
+                }
+                PaintCmd::NineSlice { draws } => {
+                    let instances = self.build_nine_slice_instances(
+                        &draw_list.nine_slices[draws.start as usize..draws.end as usize],
+                    );
+                    if !instances.is_empty() {
+                        self.draw_nine_slices(device, queue, encoder, view, &instances);
+                    }
+                }
+                PaintCmd::Icon { draws } => {
+                    let instances = self.build_icon_instances(
+                        &draw_list.icons[draws.start as usize..draws.end as usize],
+                    );
+                    if !instances.is_empty() {
+                        self.draw_icons(device, queue, encoder, view, &instances);
+                    }
+                }
+                #[cfg(feature = "phosphor-icons")]
+                PaintCmd::IconMsdf { draws } => self.text_renderer.render_icons(
+                    device,
+                    queue,
+                    encoder,
+                    view,
+                    &draw_list.icons_msdf[draws.start as usize..draws.end as usize],
+                ),
+                PaintCmd::Text { draws } => self.text_renderer.render(
+                    device,
+                    queue,
+                    encoder,
+                    view,
+                    &draw_list.texts[draws.start as usize..draws.end as usize],
+                ),
+            }
+        }
+        // Public arrays can still be appended directly after normal API calls.
+        let committed = draw_list.soup_committed_indices as usize;
+        if draw_list.indices.len() > committed {
+            self.draw_color(
+                device,
+                queue,
+                encoder,
+                view,
+                &draw_list.vertices,
+                &draw_list.indices[committed..],
+            );
         }
     }
 
@@ -1183,7 +1480,26 @@ impl UiRenderer {
             let uv = apply_crop_uv(region.uv(aw, ah), icon.src);
             let clip = icon.clip.map(|c| [c.x, c.y, c.width, c.height]);
 
-            out.push(build_icon_instance(icon.corners, uv, icon.tint, clip));
+            // One-tile UV span for the tile path: the sprite's own atlas span
+            // divided by the tile count requested along each axis (`icon.src`
+            // u1/v1 are those counts). Computed from the *region* — not the
+            // mapped `uv`, which spans tile_count tiles after apply_crop_uv.
+            let tile_span = match (icon.wrap, icon.src) {
+                (true, Some([_, _, tu, tv])) if tu > 0.0 && tv > 0.0 => {
+                    let full = region.uv(aw, ah);
+                    [(full[2] - full[0]) / tu, (full[3] - full[1]) / tv]
+                }
+                _ => [0.0, 0.0],
+            };
+
+            out.push(build_icon_instance(
+                icon.corners,
+                uv,
+                icon.tint,
+                clip,
+                icon.wrap,
+                tile_span,
+            ));
         }
 
         out
@@ -1245,24 +1561,30 @@ impl UiRenderer {
         let v_off = self.color_vbo_offset;
         let needed_v = v_off + (verts * std::mem::size_of::<Vertex>()) as u64;
         if needed_v > self.color_vbo_capacity {
+            self.frame_stats.buffer_reallocations += 1;
             self.color_vbo_capacity = needed_v.next_power_of_two();
-            self.color_vbo = device.create_buffer(&wgpu::BufferDescriptor {
+            let replacement = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ui color vbo"),
                 size: self.color_vbo_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.retired_buffers
+                .push(std::mem::replace(&mut self.color_vbo, replacement));
         }
         let i_off = self.color_ibo_offset;
         let needed_i = i_off + (indices * std::mem::size_of::<u32>()) as u64;
         if needed_i > self.color_ibo_capacity {
+            self.frame_stats.buffer_reallocations += 1;
             self.color_ibo_capacity = needed_i.next_power_of_two();
-            self.color_ibo = device.create_buffer(&wgpu::BufferDescriptor {
+            let replacement = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ui color ibo"),
                 size: self.color_ibo_capacity,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.retired_buffers
+                .push(std::mem::replace(&mut self.color_ibo, replacement));
         }
         (v_off, i_off)
     }
@@ -1274,13 +1596,16 @@ impl UiRenderer {
         let off = self.icon_inst_offset;
         let needed = off + (count * std::mem::size_of::<IconInstance>()) as u64;
         if needed > self.icon_inst_capacity {
+            self.frame_stats.buffer_reallocations += 1;
             self.icon_inst_capacity = needed.next_power_of_two();
-            self.icon_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            let replacement = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ui icon inst buffer"),
                 size: self.icon_inst_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.retired_buffers
+                .push(std::mem::replace(&mut self.icon_inst_buffer, replacement));
         }
         off
     }
@@ -1297,8 +1622,8 @@ impl UiRenderer {
         let (v_off, i_off) = self.ensure_color_capacity(device, verts.len(), indices.len());
         queue.write_buffer(&self.color_vbo, v_off, bytemuck::cast_slice(verts));
         queue.write_buffer(&self.color_ibo, i_off, bytemuck::cast_slice(indices));
-        self.color_vbo_offset = v_off + (verts.len() * std::mem::size_of::<Vertex>()) as u64;
-        self.color_ibo_offset = i_off + (indices.len() * std::mem::size_of::<u32>()) as u64;
+        self.color_vbo_offset = v_off + std::mem::size_of_val(verts) as u64;
+        self.color_ibo_offset = i_off + std::mem::size_of_val(indices) as u64;
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui color pass"),
@@ -1317,7 +1642,7 @@ impl UiRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.color_pipeline);
-        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(0, self.uniform.bind_group(), &[self.pass_uniform_offset]);
         // Index 0 maps to the first vertex of this pass's slice (base_vertex 0
         // + the sliced vertex buffer), so per-pass indices stay 0-based.
         pass.set_vertex_buffer(0, self.color_vbo.slice(v_off..));
@@ -1332,13 +1657,16 @@ impl UiRenderer {
         let off = self.chrome_inst_offset;
         let needed = off + (count * std::mem::size_of::<ChromeInstance>()) as u64;
         if needed > self.chrome_inst_capacity {
+            self.frame_stats.buffer_reallocations += 1;
             self.chrome_inst_capacity = needed.next_power_of_two();
-            self.chrome_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            let replacement = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ui chrome inst buffer"),
                 size: self.chrome_inst_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.retired_buffers
+                .push(std::mem::replace(&mut self.chrome_inst_buffer, replacement));
         }
         off
     }
@@ -1348,74 +1676,104 @@ impl UiRenderer {
         let off = self.circle_inst_offset;
         let needed = off + (count * std::mem::size_of::<CircleInstance>()) as u64;
         if needed > self.circle_inst_capacity {
+            self.frame_stats.buffer_reallocations += 1;
             self.circle_inst_capacity = needed.next_power_of_two();
-            self.circle_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            let replacement = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ui circle inst buffer"),
                 size: self.circle_inst_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.retired_buffers
+                .push(std::mem::replace(&mut self.circle_inst_buffer, replacement));
         }
         off
     }
 
-    /// Render the colored stage as an ordered interleave of soup index runs and
-    /// instanced chrome / circle runs (see [`ColorCmd`]). Soup + instances are
-    /// each uploaded once at their frame bump offsets, then a single render pass
-    /// issues the draws in submission order so layering is preserved.
-    fn draw_color_interleaved(
+    /// Upload each ordered color payload once. Previously this happened once per
+    /// `PaintCmd`, repeatedly rewriting and bump-allocating the complete soup and
+    /// instance arrays; enough alternating runs eventually overflowed the dynamic
+    /// buffers and corrupted soup draws into screen-sized triangles.
+    fn upload_ordered_color(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        view: &wgpu::TextureView,
         draw_list: &DrawList,
-    ) {
-        let verts = &draw_list.vertices;
-        let indices = &draw_list.indices;
-        let instances = &draw_list.chrome_instances;
-        let circles = &draw_list.circle_instances;
-
-        // Upload the whole soup once. Soup indices are absolute, so binding the
-        // full sliced vbo/ibo with base_vertex 0 lets each `Soup` sub-range draw
-        // its slice directly.
-        let (v_off, i_off) = if !indices.is_empty() {
-            let (v_off, i_off) = self.ensure_color_capacity(device, verts.len(), indices.len());
-            queue.write_buffer(&self.color_vbo, v_off, bytemuck::cast_slice(verts));
-            queue.write_buffer(&self.color_ibo, i_off, bytemuck::cast_slice(indices));
-            self.color_vbo_offset = v_off + (verts.len() * std::mem::size_of::<Vertex>()) as u64;
-            self.color_ibo_offset = i_off + (indices.len() * std::mem::size_of::<u32>()) as u64;
-            (v_off, i_off)
-        } else {
+    ) -> OrderedColorUpload {
+        let (vertex_offset, index_offset) = if draw_list.indices.is_empty() {
             (0, 0)
+        } else {
+            let offsets = self.ensure_color_capacity(
+                device,
+                draw_list.vertices.len(),
+                draw_list.indices.len(),
+            );
+            queue.write_buffer(
+                &self.color_vbo,
+                offsets.0,
+                bytemuck::cast_slice(&draw_list.vertices),
+            );
+            queue.write_buffer(
+                &self.color_ibo,
+                offsets.1,
+                bytemuck::cast_slice(&draw_list.indices),
+            );
+            self.frame_stats.buffer_write_calls += 2;
+            self.frame_stats.buffer_bytes_uploaded += (std::mem::size_of_val(&*draw_list.vertices)
+                + std::mem::size_of_val(&*draw_list.indices))
+                as u64;
+            self.color_vbo_offset = offsets.0 + std::mem::size_of_val(&*draw_list.vertices) as u64;
+            self.color_ibo_offset = offsets.1 + std::mem::size_of_val(&*draw_list.indices) as u64;
+            offsets
         };
-
-        // Upload all chrome instances once.
-        let inst_off = if !instances.is_empty() {
-            let off = self.ensure_chrome_capacity(device, instances.len());
+        let chrome_offset = if draw_list.chrome_instances.is_empty() {
+            0
+        } else {
+            let offset = self.ensure_chrome_capacity(device, draw_list.chrome_instances.len());
             queue.write_buffer(
                 &self.chrome_inst_buffer,
-                off,
-                bytemuck::cast_slice(instances),
+                offset,
+                bytemuck::cast_slice(&draw_list.chrome_instances),
             );
-            self.chrome_inst_offset =
-                off + (instances.len() * std::mem::size_of::<ChromeInstance>()) as u64;
-            off
-        } else {
-            0
+            self.frame_stats.buffer_write_calls += 1;
+            self.frame_stats.buffer_bytes_uploaded +=
+                std::mem::size_of_val(&*draw_list.chrome_instances) as u64;
+            self.chrome_inst_offset = offset
+                + (draw_list.chrome_instances.len() * std::mem::size_of::<ChromeInstance>()) as u64;
+            offset
         };
-
-        // Upload all circle instances once.
-        let circle_off = if !circles.is_empty() {
-            let off = self.ensure_circle_capacity(device, circles.len());
-            queue.write_buffer(&self.circle_inst_buffer, off, bytemuck::cast_slice(circles));
-            self.circle_inst_offset =
-                off + (circles.len() * std::mem::size_of::<CircleInstance>()) as u64;
-            off
-        } else {
+        let circle_offset = if draw_list.circle_instances.is_empty() {
             0
+        } else {
+            let offset = self.ensure_circle_capacity(device, draw_list.circle_instances.len());
+            queue.write_buffer(
+                &self.circle_inst_buffer,
+                offset,
+                bytemuck::cast_slice(&draw_list.circle_instances),
+            );
+            self.frame_stats.buffer_write_calls += 1;
+            self.frame_stats.buffer_bytes_uploaded +=
+                std::mem::size_of_val(&*draw_list.circle_instances) as u64;
+            self.circle_inst_offset = offset
+                + (draw_list.circle_instances.len() * std::mem::size_of::<CircleInstance>()) as u64;
+            offset
         };
+        OrderedColorUpload {
+            vertex_offset,
+            index_offset,
+            chrome_offset,
+            circle_offset,
+        }
+    }
 
+    /// Draw one ordered color run from the payload uploaded once above.
+    fn draw_color_interleaved(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        cmd: &PaintCmd,
+        upload: OrderedColorUpload,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui color+chrome pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1432,47 +1790,36 @@ impl UiRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(0, self.uniform.bind_group(), &[self.pass_uniform_offset]);
 
         // Draw a soup index sub-range with the color pipeline.
         let draw_soup = |pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>| {
             pass.set_pipeline(&self.color_pipeline);
-            pass.set_vertex_buffer(0, self.color_vbo.slice(v_off..));
-            pass.set_index_buffer(self.color_ibo.slice(i_off..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, self.color_vbo.slice(upload.vertex_offset..));
+            pass.set_index_buffer(
+                self.color_ibo.slice(upload.index_offset..),
+                wgpu::IndexFormat::Uint32,
+            );
             pass.draw_indexed(range, 0, 0..1);
         };
 
-        for cmd in &draw_list.color_cmds {
-            match cmd {
-                ColorCmd::Soup { indices } => draw_soup(&mut pass, indices.clone()),
-                ColorCmd::Chrome { instances } => {
-                    pass.set_pipeline(&self.chrome_pipeline);
-                    pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
-                    pass.set_vertex_buffer(1, self.chrome_inst_buffer.slice(inst_off..));
-                    pass.set_index_buffer(
-                        self.chrome_base_ibo.slice(..),
-                        wgpu::IndexFormat::Uint16,
-                    );
-                    pass.draw_indexed(0..CHROME_BASE_INDICES.len() as u32, 0, instances.clone());
-                }
-                ColorCmd::Circle { instances } => {
-                    pass.set_pipeline(&self.circle_pipeline);
-                    pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
-                    pass.set_vertex_buffer(1, self.circle_inst_buffer.slice(circle_off..));
-                    pass.set_index_buffer(
-                        self.chrome_base_ibo.slice(..),
-                        wgpu::IndexFormat::Uint16,
-                    );
-                    pass.draw_indexed(0..CHROME_BASE_INDICES.len() as u32, 0, instances.clone());
-                }
+        match cmd {
+            PaintCmd::Soup { indices } => draw_soup(&mut pass, indices.clone()),
+            PaintCmd::Chrome { instances } => {
+                pass.set_pipeline(&self.chrome_pipeline);
+                pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
+                pass.set_vertex_buffer(1, self.chrome_inst_buffer.slice(upload.chrome_offset..));
+                pass.set_index_buffer(self.chrome_base_ibo.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..CHROME_BASE_INDICES.len() as u32, 0, instances.clone());
             }
-        }
-
-        // Soup appended after the last recorded command is the trailing run.
-        let committed = draw_list.soup_committed_indices;
-        let total = indices.len() as u32;
-        if total > committed {
-            draw_soup(&mut pass, committed..total);
+            PaintCmd::Circle { instances } => {
+                pass.set_pipeline(&self.circle_pipeline);
+                pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
+                pass.set_vertex_buffer(1, self.circle_inst_buffer.slice(upload.circle_offset..));
+                pass.set_index_buffer(self.chrome_base_ibo.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..CHROME_BASE_INDICES.len() as u32, 0, instances.clone());
+            }
+            _ => unreachable!("non-color command passed to color renderer"),
         }
     }
 
@@ -1489,8 +1836,9 @@ impl UiRenderer {
     ) {
         let off = self.ensure_icon_capacity(device, instances.len());
         queue.write_buffer(&self.icon_inst_buffer, off, bytemuck::cast_slice(instances));
-        self.icon_inst_offset =
-            off + (instances.len() * std::mem::size_of::<IconInstance>()) as u64;
+        self.frame_stats.buffer_write_calls += 1;
+        self.frame_stats.buffer_bytes_uploaded += std::mem::size_of_val(instances) as u64;
+        self.icon_inst_offset = off + std::mem::size_of_val(instances) as u64;
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui icon pass"),
@@ -1509,7 +1857,7 @@ impl UiRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.icon_pipeline);
-        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(0, self.uniform.bind_group(), &[self.pass_uniform_offset]);
         pass.set_bind_group(1, &self.texture_bind_group, &[]);
         pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
         pass.set_vertex_buffer(1, self.icon_inst_buffer.slice(off..));
@@ -1528,13 +1876,16 @@ impl UiRenderer {
         let off = self.nine_inst_offset;
         let needed = off + (count * std::mem::size_of::<NineSliceInstance>()) as u64;
         if needed > self.nine_inst_capacity {
+            self.frame_stats.buffer_reallocations += 1;
             self.nine_inst_capacity = needed.next_power_of_two();
-            self.nine_inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            let replacement = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ui nine-slice inst buffer"),
                 size: self.nine_inst_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.retired_buffers
+                .push(std::mem::replace(&mut self.nine_inst_buffer, replacement));
         }
         off
     }
@@ -1553,8 +1904,9 @@ impl UiRenderer {
     ) {
         let off = self.ensure_nine_capacity(device, instances.len());
         queue.write_buffer(&self.nine_inst_buffer, off, bytemuck::cast_slice(instances));
-        self.nine_inst_offset =
-            off + (instances.len() * std::mem::size_of::<NineSliceInstance>()) as u64;
+        self.frame_stats.buffer_write_calls += 1;
+        self.frame_stats.buffer_bytes_uploaded += std::mem::size_of_val(instances) as u64;
+        self.nine_inst_offset = off + std::mem::size_of_val(instances) as u64;
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui nine-slice pass"),
@@ -1573,7 +1925,7 @@ impl UiRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.nine_slice_pipeline);
-        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(0, self.uniform.bind_group(), &[self.pass_uniform_offset]);
         pass.set_bind_group(1, &self.texture_bind_group, &[]);
         pass.set_vertex_buffer(0, self.chrome_base_vbo.slice(..));
         pass.set_vertex_buffer(1, self.nine_inst_buffer.slice(off..));
@@ -1654,18 +2006,6 @@ fn create_atlas_texture(
     (texture, sampler, bgl, bg)
 }
 
-/* 
-pub(crate) fn ortho_matrix2(width: f32, height: f32, center_x: f32, center_y: f32) -> [[f32; 4]; 4] {
-    let ortho_matrix = glam::camera::lh::proj::directx::orthographic(0.0, width, height, 0.0, -1.0, 1.0);
-    let rotation_matrix = Mat4::from_rotation_z(90_f32.to_radians());
-    let center = Vec3::new(center_x, center_y , 0.0);
-    let translation_to_origin = Mat4::from_translation(-center);
-    let translation_back = Mat4::from_translation(center);
-    let model_transform = translation_back * rotation_matrix * translation_to_origin;
-    let final_matrix = ortho_matrix * model_transform;
-    final_matrix.to_cols_array_2d()
-}
-*/
 pub(crate) fn ortho_matrix(width: f32, height: f32) -> [[f32; 4]; 4] {
     // Top-left origin; positive Y down. Matches DrawList coordinate system.
     let (l, r, t, b) = (0.0, width, 0.0, height);
@@ -1706,6 +2046,8 @@ fn build_icon_instance(
     uv: [f32; 4], // u0, v0, u1, v1
     tint: [f32; 4],
     clip: Option<[f32; 4]>,
+    wrap: bool,
+    tile_span: [f32; 2], // one-tile UV span (atlas units); [0,0] unless wrapping
 ) -> IconInstance {
     let (clip_rect, clip_enabled) = match clip {
         Some(r) => (r, 1.0),
@@ -1721,7 +2063,14 @@ fn build_icon_instance(
         uv_rect: uv,
         tint,
         clip: clip_rect,
-        flags: [clip_enabled, 0.0, 0.0, 0.0],
+        // flags[1] = tile-wrap: the fragment shader folds `uv` modulo the
+        // one-tile span in flags[2..4] so one instance tiles any dest.
+        flags: [
+            clip_enabled,
+            u8::from(wrap) as f32,
+            tile_span[0],
+            tile_span[1],
+        ],
     }
 }
 
@@ -1795,6 +2144,12 @@ mod tests {
         approx4(apply_crop_uv(full, None), full);
     }
 
+    #[test]
+    fn frame_arena_cap_accepts_limit_and_rejects_overflow() {
+        assert!(frame_arena_within_cap(ARENA_SANITY_CAP));
+        assert!(!frame_arena_within_cap(ARENA_SANITY_CAP + 1));
+    }
+
     // ---- StaleListDetector ----
 
     #[test]
@@ -1811,13 +2166,12 @@ mod tests {
     fn stale_detector_fresh_list_each_frame_warns_once() {
         // The footgun: a brand-new id every frame (LayerStack::new() in the loop).
         let mut d = StaleListDetector::default();
-        let mut id = 1u64;
         let mut warnings = 0;
-        for _ in 0..(StaleListDetector::WARN_AFTER * 2) {
+        for id in 1u64..=(StaleListDetector::WARN_AFTER * 2) as u64 {
             if d.observe(id) {
                 warnings += 1;
             }
-            id += 1; // never repeats — every frame is a fresh list
+            // never repeats — every frame is a fresh list
         }
         assert_eq!(warnings, 1, "must warn exactly once, not spam every frame");
     }
@@ -1840,7 +2194,10 @@ mod tests {
         let mut d = StaleListDetector::default();
         for i in 0..(StaleListDetector::WARN_AFTER * 4) {
             let id = if i % 2 == 0 { 7 } else { 9 };
-            assert!(!d.observe(id), "alternating persistent stacks must not warn");
+            assert!(
+                !d.observe(id),
+                "alternating persistent stacks must not warn"
+            );
         }
     }
 
@@ -1856,6 +2213,37 @@ mod tests {
             }
             assert!(!d.observe(id), "occasional rebuilds must not warn");
         }
+    }
+
+    #[test]
+    fn render_stats_warns_about_fragmentation_not_merely_size() {
+        let fragmented = RenderStats {
+            primitives: 160,
+            paint_runs: 140,
+            ..RenderStats::default()
+        };
+        assert_eq!(fragmented.warnings().len(), 1);
+        let large_batched = RenderStats {
+            primitives: 10_000,
+            paint_runs: 20,
+            ..RenderStats::default()
+        };
+        assert!(large_batched.warnings().is_empty());
+    }
+
+    #[test]
+    fn pressure_detector_requires_sustained_bad_frames_and_warns_once() {
+        let bad = RenderStats {
+            primitives: 160,
+            paint_runs: 140,
+            ..RenderStats::default()
+        };
+        let mut detector = RenderPressureDetector::default();
+        for _ in 1..RenderPressureDetector::WARN_AFTER {
+            assert!(!detector.observe(bad));
+        }
+        assert!(detector.observe(bad));
+        assert!(!detector.observe(bad));
     }
 
     // ---- DrawList / LayerStack identity (backs the detector) ----
@@ -1917,7 +2305,7 @@ mod tests {
 
     #[test]
     fn dpi_scale_is_logical_size_invariant() {
-        // prepare_frame builds ortho from (physical / scale). Two (physical,
+        // prepare_pass builds ortho from (physical / scale). Two (physical,
         // scale) pairs with the SAME logical size must project a logical point
         // identically — the scale factor only changes which framebuffer the
         // identical logical UI rasterizes onto.
@@ -1953,6 +2341,8 @@ mod tests {
             [0.1, 0.2, 0.3, 0.4],
             [1.0, 0.5, 0.25, 1.0],
             Some([1.0, 2.0, 3.0, 4.0]),
+            false,
+            [0.0, 0.0],
         );
         assert_eq!(inst.c_tl_tr, [10.0, 20.0, 110.0, 20.0]);
         assert_eq!(inst.c_br_bl, [110.0, 70.0, 10.0, 70.0]);
@@ -1965,7 +2355,14 @@ mod tests {
     #[test]
     fn icon_instance_clip_none_disables() {
         let corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        let inst = build_icon_instance(corners, [0.0, 0.0, 1.0, 1.0], [1.0; 4], None);
+        let inst = build_icon_instance(
+            corners,
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0; 4],
+            None,
+            false,
+            [0.0, 0.0],
+        );
         assert_eq!(inst.flags[0], 0.0); // clip disabled
         assert_eq!(inst.clip, [0.0; 4]);
     }

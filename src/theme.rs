@@ -9,6 +9,11 @@ pub struct Theme {
     // Colors
     /// Window/screen backdrop fill behind all UI.
     pub background: [f32; 4],
+    /// Fullscreen dim behind a modal/menu/pause overlay (see
+    /// [`StyleKey::Scrim`](crate::StyleKey::Scrim)). Drawn over the scene (or
+    /// the game world showing through a `LayerStack` base) and under the
+    /// overlay's contents by [`draw_scrim`](crate::draw_scrim).
+    pub scrim: [f32; 4],
     /// Panel/container surface fill.
     pub panel: [f32; 4],
     /// Border stroke around panels/containers.
@@ -86,12 +91,105 @@ pub struct Theme {
     pub button_height: f32,
     /// Default text-input height, in pixels.
     pub input_height: f32,
+    /// Height of one menubar strip or menu-item row, in pixels. Read by
+    /// [`MenuBar`](crate::MenuBar) via
+    /// [`StyleKey::MenuRowHeight`](crate::StyleKey::MenuRowHeight).
+    pub menu_row_height: f32,
+    /// Floor for a menu column's width, in pixels — wide enough that a column of
+    /// short labels still reads as a menu rather than a strip of text.
+    pub menu_item_min_width: f32,
+    /// Gap between a menu item's label and its accelerator hint, in pixels.
+    pub menu_accel_gap: f32,
+
+    /// Side length of one toolbar tool button, in pixels. Read by
+    /// [`Toolbar`](crate::Toolbar) via
+    /// [`StyleKey::ToolbarButtonSize`](crate::StyleKey::ToolbarButtonSize).
+    pub toolbar_button_size: f32,
+    /// Edge padding inside the toolbar strip, in pixels.
+    pub toolbar_padding: f32,
+    /// Height of a dock panel's tab header row, in pixels.
+    pub dock_tab_height: f32,
+    /// Width of the resize splitter between a dock panel and the viewport.
+    pub dock_splitter_width: f32,
 
     /// Hover/press transition duration in seconds. `0.0` disables animation
     /// (colors switch instantly). Read by widgets via
     /// [`StyleKey::AnimationDuration`](crate::StyleKey::AnimationDuration) so a
     /// [`StyleOverlay`](crate::StyleOverlay) can retune or disable it per subtree.
     pub animation_duration: f32,
+
+    // --- 4a material tokens -----------------------------------------------
+    //
+    // The default design language paints every control from the same small
+    // vocabulary: a *face* (vertical gradient, white sheen over the base tone —
+    // or the accent/danger faces for stateful tones) resting on a dark *plinth*,
+    // a 1px near-black border edge, and a 1px inset highlight under the top
+    // edge. Pressing is geometric: the face drops by `travel` px onto the
+    // plinth. Sunken surfaces (input wells, tracks) invert the model: dark fill,
+    // inset shadow under the top edge, a faint light line beneath the bottom.
+    //
+    // All gradient colors are premultiplied-**style** white/black overlays:
+    // faces carry their own alpha, so they composite correctly over any base.
+    /// Plinth fill visible beneath/beside a raised face (the "shadow" a pressed
+    /// face drops onto). Near-black translucent by default.
+    pub plinth: [f32; 4],
+    /// How far a face drops when pressed, in pixels — the plinth's visible
+    /// travel. Doubles as the raised/sunken offset of face decorations.
+    pub travel: f32,
+    /// Depth in pixels of the inset "sunken" shadow that fades down from a
+    /// well's top edge (the design's `inset 0 2px 4px` band).
+    pub inner_shadow_depth: f32,
+    /// Raised face gradient top (idle). White at low alpha.
+    pub face_top: [f32; 4],
+    /// Raised face gradient top (hovered).
+    pub face_top_hover: [f32; 4],
+    /// Raised face gradient top (pressed).
+    pub face_top_pressed: [f32; 4],
+    /// Raised face gradient bottom (idle).
+    pub face_bottom: [f32; 4],
+    /// Raised face gradient bottom (hovered).
+    pub face_bottom_hover: [f32; 4],
+    /// Raised face gradient bottom (pressed).
+    pub face_bottom_pressed: [f32; 4],
+    /// 1px highlight line under a raised face's top edge (idle).
+    pub edge_highlight: [f32; 4],
+    /// 1px highlight line under a raised face's top edge (hovered).
+    pub edge_highlight_hover: [f32; 4],
+    /// 1px highlight line under a raised face's top edge (pressed).
+    pub edge_highlight_pressed: [f32; 4],
+    /// Inset shadow gradient for sunken surfaces (wells, tracks): strongest at
+    /// the top edge, fading down.
+    pub inner_shadow: [f32; 4],
+    /// 1px light line beneath a sunken surface's bottom edge.
+    pub edge_shadow: [f32; 4],
+    /// Accent-face gradient top (idle) — for primary/stateful controls.
+    pub accent_face_top: [f32; 4],
+    /// Accent-face gradient top (hovered).
+    pub accent_face_top_hover: [f32; 4],
+    /// Accent-face gradient top (pressed).
+    pub accent_face_top_pressed: [f32; 4],
+    /// Accent-face gradient bottom (idle).
+    pub accent_face_bottom: [f32; 4],
+    /// Accent-face gradient bottom (hovered).
+    pub accent_face_bottom_hover: [f32; 4],
+    /// Accent-face gradient bottom (pressed).
+    pub accent_face_bottom_pressed: [f32; 4],
+    /// Text/icon color drawn on top of accent faces.
+    pub on_accent: [f32; 4],
+    /// Danger-face gradient top (idle) — destructive actions.
+    pub danger_face_top: [f32; 4],
+    /// Danger-face gradient top (hovered).
+    pub danger_face_top_hover: [f32; 4],
+    /// Danger-face gradient top (pressed).
+    pub danger_face_top_pressed: [f32; 4],
+    /// Danger-face gradient bottom (idle).
+    pub danger_face_bottom: [f32; 4],
+    /// Danger-face gradient bottom (hovered).
+    pub danger_face_bottom_hover: [f32; 4],
+    /// Danger-face gradient bottom (pressed).
+    pub danger_face_bottom_pressed: [f32; 4],
+    /// Text/icon color drawn on top of danger faces.
+    pub on_danger: [f32; 4],
 
     /// UI-wide default font. `None` resolves to the default sans-serif (the
     /// bundled Noto Sans when the `bundled-font` feature is on, else the system
@@ -110,52 +208,117 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
+        // Sizing values the menu metrics are derived from. Naming them keeps the
+        // derivation visible instead of duplicating literals: a theme that
+        // retunes `padding`/`font_size` for DPI gets proportional menu rows.
+        let padding = 4.0;
+        let spacing = 6.0;
+        let font_size = 13.0;
         Self {
-            // Dark, polished color scheme
-            background: [0.08, 0.08, 0.12, 1.0],
-            panel: [0.12, 0.12, 0.18, 0.95],
-            panel_border: [0.25, 0.25, 0.35, 1.0],
-            button: [0.18, 0.18, 0.25, 1.0],
-            button_hover: [0.22, 0.22, 0.32, 1.0],
-            button_pressed: [0.15, 0.15, 0.22, 1.0],
-            button_border: [0.3, 0.3, 0.4, 1.0],
-            input_background: [0.06, 0.06, 0.10, 1.0],
-            input_border: [0.25, 0.25, 0.35, 1.0],
-            input_focus_border: [0.4, 0.5, 0.8, 1.0],
-            text: [0.9, 0.9, 0.95, 1.0],
-            text_dim: [0.7, 0.7, 0.8, 1.0],
-            text_highlight: [0.6, 0.8, 1.0, 1.0],
-            accent: [0.3, 0.5, 0.9, 1.0],
-            // Severity palette (mirrors Severity::accent() so the resolver-free
-            // default and the themed default agree).
-            info: [0.22, 0.55, 0.95, 1.0],
-            success: [0.26, 0.72, 0.42, 1.0],
-            warning: [0.95, 0.70, 0.20, 1.0],
-            error: [0.9, 0.3, 0.3, 1.0],
-            focus_ring: [0.45, 0.62, 1.0, 1.0],
+            // The "4a" design language: near-black neutral surfaces, controls
+            // painted as a subtle white-sheen gradient face resting on a dark
+            // plinth, accent (teal, oklch hue 200) reserved for state.
+            // Backdrop gradient stop from the design body (#10171c→#060809);
+            // apps wanting the exact ramp blend these behind the UI.
+            background: [0.0627, 0.0902, 0.1098, 1.0], // #10171c
+            // Pause/menu screens dim the world by half. Black keeps the dim
+            // neutral; apps wanting a color cast retune it per theme.
+            scrim: [0.0, 0.0, 0.0, 0.55],
+            // Raised surface = the design's rgba(16,19,22,0.72) sheet over the
+            // backdrop.
+            panel: [0.0863, 0.098, 0.1137, 0.95], // #16191d
+            panel_border: [0.0, 0.0, 0.0, 0.55],
+            // Resting face fill. The widgets paint raised controls as a gradient
+            // from `ButtonHover`-strength sheen down to this tone; see
+            // `ButtonTop`/`ButtonPressed` and the widget material helper.
+            button: [0.1216, 0.1412, 0.1608, 1.0], // #1f2429
+            button_hover: [0.1294, 0.149, 0.1686, 1.0], // #21262b
+            button_pressed: [0.0784, 0.0941, 0.1098, 1.0], // #14181c
+            button_border: [0.0, 0.0, 0.0, 0.5],
+            input_background: [0.0, 0.0, 0.0, 0.42],
+            input_border: [0.0, 0.0, 0.0, 0.6],
+            input_focus_border: [0.2423, 0.7509, 0.7767, 1.0], // oklch(0.74 0.11 200)
+            // Design body text #eef2f5.
+            text: [0.9333, 0.949, 0.9608, 1.0],
+            text_dim: [0.6784, 0.7137, 0.7451, 1.0], // #adb6bd
+            // The design's "held/active" face tone #f4f7fa — the brightest
+            // neutral, used for active tab/tool labels.
+            text_highlight: [0.9569, 0.9686, 0.9804, 1.0],
+            // Accent = teal oklch(0.74 0.11 200), state only (selection, focus,
+            // toggle-on fills), never for resting chrome.
+            accent: [0.2423, 0.7509, 0.7767, 1.0],
+            // Severity palette in the design hues (info sky, success green,
+            // warning amber, error red — oklch-derived sRGB).
+            info: [0.3692, 0.6736, 0.92, 1.0],
+            success: [0.3799, 0.7093, 0.3977, 1.0],
+            warning: [0.9084, 0.6684, 0.3042, 1.0],
+            error: [0.8413, 0.2796, 0.2724, 1.0],
+            focus_ring: [0.2423, 0.7509, 0.7767, 1.0],
 
-            // Tab colors
-            tab_inactive: [0.15, 0.15, 0.20, 1.0],
-            tab_active: [0.20, 0.20, 0.28, 1.0],
-            tab_hover: [0.18, 0.18, 0.25, 1.0],
-            tab_border: [0.30, 0.30, 0.40, 1.0],
+            // Tab colors — the design's document/in-set tabs: inactive reads as
+            // a sunken well, active as a raised face, border is the black edge.
+            tab_inactive: [0.0, 0.0, 0.0, 0.22],
+            tab_active: [0.1294, 0.149, 0.1686, 1.0],
+            tab_hover: [1.0, 1.0, 1.0, 0.07],
+            tab_border: [0.0, 0.0, 0.0, 0.45],
 
             // Progress bar colors
-            progress_background: [0.10, 0.10, 0.15, 1.0],
-            progress_fill: [0.3, 0.7, 0.4, 1.0], // Green for good
-            progress_fill_low: [0.8, 0.3, 0.3, 1.0], // Red for critical
-            progress_fill_medium: [0.8, 0.7, 0.2, 1.0], // Yellow for medium
+            progress_background: [0.0, 0.0, 0.0, 0.55],
+            // Progress/slider fills are the accent gradient.
+            progress_fill: [0.2423, 0.7509, 0.7767, 1.0],
+            progress_fill_low: [0.8413, 0.2796, 0.2724, 1.0],
+            progress_fill_medium: [0.9084, 0.6684, 0.3042, 1.0],
 
-            // Sizing
-            padding: 16.0,
-            spacing: 12.0,
-            border_radius: 6.0,
+            // Sizing — the design is compact: 13px text, 24px control rows,
+            // 2px "plinth travel" press motion, radius 1.
+            padding,
+            spacing,
+            border_radius: 1.0,
             border_width: 1.0,
-            font_size: 16.0,
-            font_size_title: 28.0,
-            button_height: 44.0,
-            input_height: 40.0,
+            font_size,
+            font_size_title: 15.0,
+            button_height: 24.0,
+            input_height: 24.0,
+            // Menus: a row is one text line plus the standard inset; a column is
+            // floored at ten characters wide so short labels still read as menu.
+            menu_row_height: font_size + padding * 2.0 + 6.0,
+            menu_item_min_width: font_size * 10.0,
+            menu_accel_gap: 14.0,
+            toolbar_button_size: 24.0,
+            toolbar_padding: 2.0,
+            dock_tab_height: 24.0,
+            dock_splitter_width: 6.0,
             animation_duration: 0.12,
+
+            // 4a material tokens (see the field docs above).
+            plinth: [0.0, 0.0, 0.0, 0.6],
+            travel: 2.0,
+            inner_shadow_depth: 6.0,
+            face_top: [1.0, 1.0, 1.0, 0.16],
+            face_top_hover: [1.0, 1.0, 1.0, 0.22],
+            face_top_pressed: [1.0, 1.0, 1.0, 0.09],
+            face_bottom: [1.0, 1.0, 1.0, 0.06],
+            face_bottom_hover: [1.0, 1.0, 1.0, 0.10],
+            face_bottom_pressed: [1.0, 1.0, 1.0, 0.035],
+            edge_highlight: [1.0, 1.0, 1.0, 0.18],
+            edge_highlight_hover: [1.0, 1.0, 1.0, 0.26],
+            edge_highlight_pressed: [1.0, 1.0, 1.0, 0.07],
+            inner_shadow: [0.0, 0.0, 0.0, 0.6],
+            edge_shadow: [1.0, 1.0, 1.0, 0.07],
+            accent_face_top: [0.4211, 0.8464, 0.8689, 1.0],
+            accent_face_top_hover: [0.5211, 0.8911, 0.9106, 1.0],
+            accent_face_top_pressed: [0.2518, 0.6942, 0.7171, 1.0],
+            accent_face_bottom: [0.0, 0.6817, 0.7111, 1.0],
+            accent_face_bottom_hover: [0.0772, 0.732, 0.7611, 1.0],
+            accent_face_bottom_pressed: [0.0, 0.5774, 0.6039, 1.0],
+            on_accent: [0.0157, 0.0902, 0.1137, 1.0], // #04171d
+            danger_face_top: [0.7841, 0.2609, 0.2536, 1.0],
+            danger_face_top_hover: [0.8692, 0.306, 0.2953, 1.0],
+            danger_face_top_pressed: [0.6884, 0.1648, 0.1749, 1.0],
+            danger_face_bottom: [0.6612, 0.1341, 0.1522, 1.0],
+            danger_face_bottom_hover: [0.7304, 0.1668, 0.1811, 1.0],
+            danger_face_bottom_pressed: [0.6071, 0.0579, 0.1056, 1.0],
+            on_danger: [0.9922, 0.9176, 0.9176, 1.0], // #fdeaea
 
             font: None,
             custom: CustomStyles::default(),
@@ -172,6 +335,32 @@ mod tests {
         let theme = Theme::default();
         assert!(theme.text("hi", 0.0, 0.0).font.is_none());
         assert!(theme.title("hi", 0.0, 0.0).font.is_none());
+    }
+
+    #[test]
+    fn default_typography_leaves_room_for_application_content() {
+        let theme = Theme::default();
+        // The 4a design is a compact 13px UI: a 15px title still scales visibly
+        // above body text without doubling the row heights around it.
+        assert_eq!(theme.font_size, 13.0);
+        assert_eq!(theme.font_size_title, 15.0);
+        assert!(theme.font_size_title > theme.font_size);
+    }
+
+    /// The menu metrics are derived from the base sizing values, not duplicated
+    /// literals: retuning `padding`/`font_size`/`spacing` in the default moves
+    /// them together.
+    #[test]
+    fn menu_metrics_follow_the_base_sizing_values() {
+        let theme = Theme::default();
+        assert_eq!(
+            theme.menu_row_height,
+            theme.font_size + theme.padding * 2.0 + 6.0,
+            "a menu row is one text line, the standard inset, and 3px breathing room per side"
+        );
+        assert_eq!(theme.menu_item_min_width, theme.font_size * 10.0);
+        assert_eq!(theme.menu_accel_gap, 14.0);
+        assert_eq!(theme.menu_row_height, 27.0);
     }
 
     #[test]
@@ -195,7 +384,11 @@ mod tests {
     fn get_set_match_typed_field_accessor() {
         let mut theme = Theme::default();
         theme.set(StyleKey::Accent, StyleValue::Color([0.1, 0.2, 0.3, 1.0]));
-        assert_eq!(theme.accent, [0.1, 0.2, 0.3, 1.0], "set writes the typed field");
+        assert_eq!(
+            theme.accent,
+            [0.1, 0.2, 0.3, 1.0],
+            "set writes the typed field"
+        );
         theme.button = [0.4, 0.5, 0.6, 1.0];
         assert_eq!(
             theme.get(StyleKey::Button).unwrap().as_color().unwrap(),
@@ -225,7 +418,11 @@ mod tests {
         let theme = Theme::default();
         assert_eq!(theme.animation_duration, 0.12);
         assert_eq!(
-            theme.get(StyleKey::AnimationDuration).unwrap().as_scalar().unwrap(),
+            theme
+                .get(StyleKey::AnimationDuration)
+                .unwrap()
+                .as_scalar()
+                .unwrap(),
             0.12
         );
     }
@@ -255,6 +452,7 @@ impl Theme {
         let v = match key {
             // Colors
             Background => StyleValue::Color(self.background),
+            Scrim => StyleValue::Color(self.scrim),
             Panel => StyleValue::Color(self.panel),
             PanelBorder => StyleValue::Color(self.panel_border),
             Button => StyleValue::Color(self.button),
@@ -281,6 +479,33 @@ impl Theme {
             ProgressFill => StyleValue::Color(self.progress_fill),
             ProgressFillLow => StyleValue::Color(self.progress_fill_low),
             ProgressFillMedium => StyleValue::Color(self.progress_fill_medium),
+            // 4a materials
+            Plinth => StyleValue::Color(self.plinth),
+            FaceTop => StyleValue::Color(self.face_top),
+            FaceTopHover => StyleValue::Color(self.face_top_hover),
+            FaceTopPressed => StyleValue::Color(self.face_top_pressed),
+            FaceBottom => StyleValue::Color(self.face_bottom),
+            FaceBottomHover => StyleValue::Color(self.face_bottom_hover),
+            FaceBottomPressed => StyleValue::Color(self.face_bottom_pressed),
+            EdgeHighlight => StyleValue::Color(self.edge_highlight),
+            EdgeHighlightHover => StyleValue::Color(self.edge_highlight_hover),
+            EdgeHighlightPressed => StyleValue::Color(self.edge_highlight_pressed),
+            InnerShadow => StyleValue::Color(self.inner_shadow),
+            EdgeShadow => StyleValue::Color(self.edge_shadow),
+            AccentFaceTop => StyleValue::Color(self.accent_face_top),
+            AccentFaceTopHover => StyleValue::Color(self.accent_face_top_hover),
+            AccentFaceTopPressed => StyleValue::Color(self.accent_face_top_pressed),
+            AccentFaceBottom => StyleValue::Color(self.accent_face_bottom),
+            AccentFaceBottomHover => StyleValue::Color(self.accent_face_bottom_hover),
+            AccentFaceBottomPressed => StyleValue::Color(self.accent_face_bottom_pressed),
+            OnAccent => StyleValue::Color(self.on_accent),
+            DangerFaceTop => StyleValue::Color(self.danger_face_top),
+            DangerFaceTopHover => StyleValue::Color(self.danger_face_top_hover),
+            DangerFaceTopPressed => StyleValue::Color(self.danger_face_top_pressed),
+            DangerFaceBottom => StyleValue::Color(self.danger_face_bottom),
+            DangerFaceBottomHover => StyleValue::Color(self.danger_face_bottom_hover),
+            DangerFaceBottomPressed => StyleValue::Color(self.danger_face_bottom_pressed),
+            OnDanger => StyleValue::Color(self.on_danger),
             // Scalars
             Padding => StyleValue::Scalar(self.padding),
             Spacing => StyleValue::Scalar(self.spacing),
@@ -291,6 +516,15 @@ impl Theme {
             ButtonHeight => StyleValue::Scalar(self.button_height),
             InputHeight => StyleValue::Scalar(self.input_height),
             AnimationDuration => StyleValue::Scalar(self.animation_duration),
+            MenuRowHeight => StyleValue::Scalar(self.menu_row_height),
+            MenuItemMinWidth => StyleValue::Scalar(self.menu_item_min_width),
+            MenuAccelGap => StyleValue::Scalar(self.menu_accel_gap),
+            ToolbarButtonSize => StyleValue::Scalar(self.toolbar_button_size),
+            ToolbarPadding => StyleValue::Scalar(self.toolbar_padding),
+            DockTabHeight => StyleValue::Scalar(self.dock_tab_height),
+            DockSplitterWidth => StyleValue::Scalar(self.dock_splitter_width),
+            Travel => StyleValue::Scalar(self.travel),
+            InnerShadowDepth => StyleValue::Scalar(self.inner_shadow_depth),
             // Custom namespace
             Custom(id) => return self.custom.get(&id).copied(),
         };
@@ -310,6 +544,7 @@ impl Theme {
         }
         match (key, value) {
             (Background, StyleValue::Color(c)) => self.background = c,
+            (Scrim, StyleValue::Color(c)) => self.scrim = c,
             (Panel, StyleValue::Color(c)) => self.panel = c,
             (PanelBorder, StyleValue::Color(c)) => self.panel_border = c,
             (Button, StyleValue::Color(c)) => self.button = c,
@@ -336,6 +571,33 @@ impl Theme {
             (ProgressFill, StyleValue::Color(c)) => self.progress_fill = c,
             (ProgressFillLow, StyleValue::Color(c)) => self.progress_fill_low = c,
             (ProgressFillMedium, StyleValue::Color(c)) => self.progress_fill_medium = c,
+            // 4a materials
+            (Plinth, StyleValue::Color(c)) => self.plinth = c,
+            (FaceTop, StyleValue::Color(c)) => self.face_top = c,
+            (FaceTopHover, StyleValue::Color(c)) => self.face_top_hover = c,
+            (FaceTopPressed, StyleValue::Color(c)) => self.face_top_pressed = c,
+            (FaceBottom, StyleValue::Color(c)) => self.face_bottom = c,
+            (FaceBottomHover, StyleValue::Color(c)) => self.face_bottom_hover = c,
+            (FaceBottomPressed, StyleValue::Color(c)) => self.face_bottom_pressed = c,
+            (EdgeHighlight, StyleValue::Color(c)) => self.edge_highlight = c,
+            (EdgeHighlightHover, StyleValue::Color(c)) => self.edge_highlight_hover = c,
+            (EdgeHighlightPressed, StyleValue::Color(c)) => self.edge_highlight_pressed = c,
+            (InnerShadow, StyleValue::Color(c)) => self.inner_shadow = c,
+            (EdgeShadow, StyleValue::Color(c)) => self.edge_shadow = c,
+            (AccentFaceTop, StyleValue::Color(c)) => self.accent_face_top = c,
+            (AccentFaceTopHover, StyleValue::Color(c)) => self.accent_face_top_hover = c,
+            (AccentFaceTopPressed, StyleValue::Color(c)) => self.accent_face_top_pressed = c,
+            (AccentFaceBottom, StyleValue::Color(c)) => self.accent_face_bottom = c,
+            (AccentFaceBottomHover, StyleValue::Color(c)) => self.accent_face_bottom_hover = c,
+            (AccentFaceBottomPressed, StyleValue::Color(c)) => self.accent_face_bottom_pressed = c,
+            (OnAccent, StyleValue::Color(c)) => self.on_accent = c,
+            (DangerFaceTop, StyleValue::Color(c)) => self.danger_face_top = c,
+            (DangerFaceTopHover, StyleValue::Color(c)) => self.danger_face_top_hover = c,
+            (DangerFaceTopPressed, StyleValue::Color(c)) => self.danger_face_top_pressed = c,
+            (DangerFaceBottom, StyleValue::Color(c)) => self.danger_face_bottom = c,
+            (DangerFaceBottomHover, StyleValue::Color(c)) => self.danger_face_bottom_hover = c,
+            (DangerFaceBottomPressed, StyleValue::Color(c)) => self.danger_face_bottom_pressed = c,
+            (OnDanger, StyleValue::Color(c)) => self.on_danger = c,
             (Padding, StyleValue::Scalar(s)) => self.padding = s,
             (Spacing, StyleValue::Scalar(s)) => self.spacing = s,
             (BorderRadius, StyleValue::Scalar(s)) => self.border_radius = s,
@@ -345,6 +607,15 @@ impl Theme {
             (ButtonHeight, StyleValue::Scalar(s)) => self.button_height = s,
             (InputHeight, StyleValue::Scalar(s)) => self.input_height = s,
             (AnimationDuration, StyleValue::Scalar(s)) => self.animation_duration = s,
+            (MenuRowHeight, StyleValue::Scalar(s)) => self.menu_row_height = s,
+            (MenuItemMinWidth, StyleValue::Scalar(s)) => self.menu_item_min_width = s,
+            (MenuAccelGap, StyleValue::Scalar(s)) => self.menu_accel_gap = s,
+            (ToolbarButtonSize, StyleValue::Scalar(s)) => self.toolbar_button_size = s,
+            (ToolbarPadding, StyleValue::Scalar(s)) => self.toolbar_padding = s,
+            (DockTabHeight, StyleValue::Scalar(s)) => self.dock_tab_height = s,
+            (DockSplitterWidth, StyleValue::Scalar(s)) => self.dock_splitter_width = s,
+            (Travel, StyleValue::Scalar(s)) => self.travel = s,
+            (InnerShadowDepth, StyleValue::Scalar(s)) => self.inner_shadow_depth = s,
             (k, v) => debug_assert!(
                 false,
                 "Theme::set shape mismatch for {k:?}: built-in key got {v:?}"

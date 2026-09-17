@@ -54,10 +54,10 @@ impl Severity {
     /// path resolves through [`style_key`](Self::style_key) so themes/overlays win.
     pub fn accent(self) -> [f32; 4] {
         match self {
-            Severity::Info => [0.22, 0.55, 0.95, 1.0],
-            Severity::Success => [0.26, 0.72, 0.42, 1.0],
-            Severity::Warning => [0.95, 0.70, 0.20, 1.0],
-            Severity::Error => [0.9, 0.3, 0.3, 1.0],
+            Severity::Info => [0.3692, 0.6736, 0.92, 1.0],
+            Severity::Success => [0.3799, 0.7093, 0.3977, 1.0],
+            Severity::Warning => [0.9084, 0.6684, 0.3042, 1.0],
+            Severity::Error => [0.8413, 0.2796, 0.2724, 1.0],
         }
     }
 
@@ -153,12 +153,24 @@ impl<'a> Banner<'a> {
 
     /// Draw the banner filling `rect`.
     pub fn draw(&self, rect: Rect, list: &mut DrawList, style: &StyleResolver) {
+        // Named by `title` (author-written) and never by `message`, which can be
+        // arbitrarily long — scope names are not truncated.
+        list.push_debug_scope_rect(
+            crate::widgets::scope_name("Banner", self.title.unwrap_or_default()),
+            rect,
+        );
         let pad = style.scalar(StyleKey::Padding);
         let font_size = style.scalar(StyleKey::FontSize);
         let accent = self.severity.resolved_accent(style);
 
         // Tinted background + left accent bar.
-        list.quad(rect.x, rect.y, rect.width, rect.height, self.severity.resolved_background(style));
+        list.quad(
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            self.severity.resolved_background(style),
+        );
         list.quad(rect.x, rect.y, BAR_W, rect.height, accent);
 
         let text_x = Self::text_x(rect, pad);
@@ -189,6 +201,7 @@ impl<'a> Banner<'a> {
             )
             .with_max_width(inner_w);
         list.text(block);
+        list.pop_debug_scope();
     }
 }
 
@@ -236,7 +249,10 @@ mod tests {
         Banner::success("Saved").draw(Rect::new(0.0, 0.0, 200.0, 40.0), &mut list, &s);
         // The accent bar is the second chrome instance; its color follows the overlay.
         let bar = list.chrome_instances[1];
-        assert_eq!(bar.bg, custom, "accent bar resolves through the style system");
+        assert_eq!(
+            bar.bg, custom,
+            "accent bar resolves through the style system"
+        );
     }
 
     #[test]
@@ -287,9 +303,11 @@ mod tests {
     fn draw_emits_bar_background_and_text() {
         let s = style();
         let mut list = DrawList::new();
-        Banner::error("Disk full")
-            .with_title("Error")
-            .draw(Rect::new(0.0, 0.0, 300.0, 60.0), &mut list, &s);
+        Banner::error("Disk full").with_title("Error").draw(
+            Rect::new(0.0, 0.0, 300.0, 60.0),
+            &mut list,
+            &s,
+        );
         // background + accent bar → 2 chrome instances; title + message → 2 texts.
         assert_eq!(list.chrome_instances.len(), 2);
         assert_eq!(list.texts.len(), 2);

@@ -43,7 +43,7 @@ struct VsIn {
     @location(9) model_col_0: vec4<f32>,
     @location(10) model_col_1: vec4<f32>,
     @location(11) model_col_2: vec4<f32>,
-    @location(12) model_col_3: vec4<f32>,
+    @location(12) model_col_3: vec4<f32>,    
 };
 
 struct VsOut {
@@ -61,6 +61,7 @@ struct VsOut {
     @location(10) model_col_1: vec4<f32>,
     @location(11) model_col_2: vec4<f32>,
     @location(12) model_col_3: vec4<f32>,
+
 };
 
 @vertex

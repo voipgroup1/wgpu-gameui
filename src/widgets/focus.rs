@@ -170,6 +170,18 @@ impl FocusState {
         self.focused = Some(id);
     }
 
+    /// Mark this frame's click as claimed without changing which widget is
+    /// focused.
+    ///
+    /// For widgets that own a pointer gesture without being focus targets — an
+    /// open dropdown's option list, a menu row. [`request`](Self::request) also
+    /// claims the click, but it steals focus, which is wrong for a menu item
+    /// that acts on the focused control (Copy/Cut must leave the text field
+    /// focused).
+    pub fn claim_click(&mut self) {
+        self.click_claimed = true;
+    }
+
     /// Programmatically clear focus.
     pub fn blur(&mut self) {
         self.focused = None;
@@ -339,6 +351,49 @@ mod tests {
         f.request(9); // the focused widget itself was clicked
         f.end_frame(None);
         assert!(f.is_focused(9));
+    }
+
+    #[test]
+    fn claim_click_keeps_focus_without_stealing_it() {
+        // A menu item or dropdown row owns the click but must not become the
+        // focused widget: the item acts on whatever was focused before.
+        let mut f = FocusState::new();
+        f.focus(9);
+        f.begin_frame(&input(false, false, false, true));
+        f.claim_click();
+        f.end_frame(None);
+        assert!(
+            f.is_focused(9),
+            "a claimed click must not blur the focused widget"
+        );
+    }
+
+    #[test]
+    fn claim_click_does_not_focus_anything_on_its_own() {
+        let mut f = FocusState::new();
+        f.begin_frame(&input(false, false, false, false));
+        f.claim_click();
+        f.end_frame(None);
+        assert_eq!(f.focused(), None, "claiming a click focuses nothing");
+    }
+
+    #[test]
+    fn focus_claim_is_per_frame() {
+        // The claim is an edge: it must not suppress a later click's blur.
+        let mut f = FocusState::new();
+        f.focus(9);
+        f.begin_frame(&input(false, false, false, true));
+        f.claim_click();
+        f.end_frame(None);
+        assert!(f.is_focused(9));
+
+        f.begin_frame(&input(false, false, false, true));
+        f.end_frame(None); // no claim this frame
+        assert_eq!(
+            f.focused(),
+            None,
+            "an unclaimed click on the next frame blurs"
+        );
     }
 
     #[test]

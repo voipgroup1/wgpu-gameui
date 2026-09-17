@@ -184,6 +184,56 @@ pub fn map_gamepad(input: &mut InputState, pad: &GamepadNav) {
     input.nav.prev |= pad.left_shoulder;
 }
 
+/// Compose with any other [`NavMap`] (typically [`KeyboardNav`] plus a gamepad
+/// map) so the **directional** intents (`nav.up`/`nav.down`/`nav.left`/`nav.right`)
+/// also move focus around the Tab ring — next/prev like Tab and Shift+Tab —
+/// **before** widgets see them.
+///
+/// The default binding deliberately leaves arrows alone: a focused
+/// [`Slider`](crate::Slider) or caret-bearing text field must receive them, and
+/// which widget gets them is the focused widget's call. Turn this on only for
+/// screens where the focusables are plain directional targets — a main menu, a
+/// title screen, a gamepad-only settings row — where no focusable wants the
+/// arrows for anything else. `confirm` still activates the focused button
+/// ([`KeyboardNav`] maps Enter/Space/A into it), so a menu needs no further
+/// wiring.
+///
+/// ```ignore
+/// let nav = ArrowFocusNav::over((KeyboardNav, &pad_map)); // or a closure
+/// Frame::new(&mut state, &mut input, &theme, &nav).run_layers(&mut layers, |ui| { ... });
+/// ```
+///
+/// Left/up mean *previous*, right/down mean *next* — reading order for rows and
+/// columns of buttons alike. The intents are consumed (cleared) so an
+/// up/down-driven widget (a focused slider) can't also see them: when such a
+/// widget holds focus while this map is active it must be excluded from the ring
+/// or given a different input path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ArrowFocusNav<M>(pub M);
+
+impl<M: NavMap> ArrowFocusNav<M> {
+    /// Wrap an inner map.
+    pub fn over(inner: M) -> Self {
+        Self(inner)
+    }
+}
+
+impl<M: NavMap> NavMap for ArrowFocusNav<M> {
+    fn apply(&self, input: &mut InputState) {
+        self.0.apply(input);
+        if input.nav.up || input.nav.left {
+            input.nav.prev = true;
+        }
+        if input.nav.down || input.nav.right {
+            input.nav.next = true;
+        }
+        input.nav.up = false;
+        input.nav.down = false;
+        input.nav.left = false;
+        input.nav.right = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +418,83 @@ mod tests {
         combined.apply(&mut input);
         assert!(input.nav.left); // keyboard
         assert!(input.nav.up); // gamepad d-pad
+    }
+
+    #[test]
+    fn arrow_focus_turns_directional_into_ring_movement() {
+        let inner = |i: &mut InputState| map_keyboard(i);
+        let mut down = InputState {
+            key_down: true,
+            ..Default::default()
+        };
+        ArrowFocusNav::over(inner).apply(&mut down);
+        assert!(down.nav.next, "down/right mean next");
+        assert!(!down.nav.down, "the intent is consumed");
+        assert!(!down.nav.prev);
+
+        let mut up = InputState {
+            key_up: true,
+            ..Default::default()
+        };
+        ArrowFocusNav::over(inner).apply(&mut up);
+        assert!(up.nav.prev, "up/left mean previous");
+        assert!(!up.nav.up);
+        assert!(!up.nav.next);
+    }
+
+    #[test]
+    fn arrow_focus_left_and_right_also_move_the_ring() {
+        let mut input = InputState::default();
+        input.nav.right = true; // caller-set intent (ManualNav maps nothing)
+        ArrowFocusNav::over(ManualNav).apply(&mut input);
+        assert!(input.nav.next && !input.nav.prev);
+
+        let mut input = InputState::default();
+        input.nav.left = true;
+        ArrowFocusNav::over(ManualNav).apply(&mut input);
+        assert!(input.nav.prev && !input.nav.next);
+    }
+
+    #[test]
+    fn arrow_focus_preserves_confirm_cancel_and_composes_with_gamepad() {
+        let combined = |i: &mut InputState| {
+            map_keyboard(i);
+            map_gamepad(
+                i,
+                &GamepadNav {
+                    south: true,
+                    ..Default::default()
+                },
+            );
+        };
+        let mut input = InputState {
+            key_down: true,
+            enter_pressed: true,
+            key_escape: true,
+            ..Default::default()
+        };
+        ArrowFocusNav::over(combined).apply(&mut input);
+        assert!(input.nav.next);
+        assert!(input.nav.confirm, "confirm/cancel pass through untouched");
+        assert!(input.nav.cancel);
+        assert!(
+            !input.nav.down,
+            "consumed so a focused widget can't double-act"
+        );
+    }
+
+    #[test]
+    fn arrow_focus_with_no_directional_intents_is_a_pass_through() {
+        let mut input = InputState::default();
+        input.nav.confirm = true; // caller-set intent
+        ArrowFocusNav::over(ManualNav).apply(&mut input);
+        assert!(
+            input.nav
+                == NavInput {
+                    confirm: true,
+                    ..Default::default()
+                },
+            "no directional intents: nothing is touched or consumed"
+        );
     }
 }

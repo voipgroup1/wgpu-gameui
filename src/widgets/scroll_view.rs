@@ -80,6 +80,38 @@ impl ScrollState {
         self.offset[1] = self.offset[1].clamp(0.0, self.max_offset(1, viewport[1]));
     }
 
+    /// Move one axis by the minimum amount needed to reveal `[start, end]`.
+    ///
+    /// Oversized ranges align their leading edge. Non-finite coordinates,
+    /// invalid axes, and non-positive/non-finite viewport sizes are ignored.
+    pub fn scroll_range_into_view(
+        &mut self,
+        axis: usize,
+        start: f32,
+        end: f32,
+        viewport_size: f32,
+    ) {
+        if axis > 1
+            || !start.is_finite()
+            || !end.is_finite()
+            || !viewport_size.is_finite()
+            || viewport_size <= 0.0
+        {
+            return;
+        }
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        if end - start > viewport_size || start < self.offset[axis] {
+            self.offset[axis] = start;
+        } else if end > self.offset[axis] + viewport_size {
+            self.offset[axis] = end - viewport_size;
+        }
+        self.offset[axis] = self.offset[axis].clamp(0.0, self.max_offset(axis, viewport_size));
+    }
+
     /// Reset offset to (0, 0).
     pub fn reset(&mut self) {
         self.offset = [0.0, 0.0];
@@ -114,6 +146,9 @@ pub struct ScrollBegin {
     h_visible: bool,
     inner_w: f32,
     inner_h: f32,
+    /// Debug-scope depth before `begin` opened the `ScrollView` scope, so `end`
+    /// can close back to it even if the caller's content closure leaked a scope.
+    scope_depth: usize,
 }
 
 impl ScrollView {
@@ -121,7 +156,9 @@ impl ScrollView {
     pub fn new(viewport: Rect) -> Self {
         Self {
             viewport,
-            bar_thickness: 6.0,
+            // The docked 4a scrollbar is a 13px control: two 13px stepper
+            // keys bookend a sunken track and a face-plate scrubber.
+            bar_thickness: 13.0,
             min_thumb: 16.0,
             wheel_speed: 20.0,
             enable_vertical: true,
@@ -242,7 +279,8 @@ impl ScrollView {
             } else {
                 match axis {
                     ScrollAxis::Vertical => {
-                        let track_h = inner_h;
+                        let step = self.bar_thickness.min(inner_h * 0.5);
+                        let track_h = (inner_h - 2.0 * step).max(0.0);
                         let thumb_h = thumb_extent(track_h, state.content_size[1], self.min_thumb);
                         let drag_range = (track_h - thumb_h).max(1.0);
                         let max_off = state.max_offset(1, inner_h);
@@ -251,7 +289,8 @@ impl ScrollView {
                             .clamp(0.0, max_off);
                     }
                     ScrollAxis::Horizontal => {
-                        let track_w = inner_w;
+                        let step = self.bar_thickness.min(inner_w * 0.5);
+                        let track_w = (inner_w - 2.0 * step).max(0.0);
                         let thumb_w = thumb_extent(track_w, state.content_size[0], self.min_thumb);
                         let drag_range = (track_w - thumb_w).max(1.0);
                         let max_off = state.max_offset(0, inner_w);
@@ -263,8 +302,18 @@ impl ScrollView {
             }
         }
 
+        // Opened *before* the clip and transform below, deliberately: the scope
+        // records the clip in force at push time and applies the active
+        // transform to its declared rect, so pushing it after would declare the
+        // viewport shifted by -offset and record the inner clip as its own —
+        // which would then wrongly excuse a genuinely mislaid scrollbar.
+        let scope_depth = list.debug_scope_depth();
+        list.push_debug_scope_rect("ScrollView", self.viewport);
+
         // Set up clip + transform for the content the caller is about to draw.
-        list.push_clip(inner);
+        // A viewport, not a boundary: rows either side of `inner` are supposed
+        // to be clipped away, so the debug report must not call that a defect.
+        list.push_clip_viewport(inner);
         list.push_transform();
         list.translate(-state.offset[0], -state.offset[1]);
 
@@ -274,6 +323,7 @@ impl ScrollView {
             h_visible,
             inner_w,
             inner_h,
+            scope_depth,
         }
     }
 
@@ -315,6 +365,11 @@ impl ScrollView {
                 style.color(StyleKey::InputBackground),
             );
         }
+
+        // `truncate_debug_scopes` rather than a bare pop: arbitrary caller code
+        // ran between `begin` and here, and a closure that leaked a scope would
+        // otherwise make this pop close the wrong one.
+        list.truncate_debug_scopes(begun.scope_depth);
     }
 
     fn draw_v_bar(
@@ -329,27 +384,50 @@ impl ScrollView {
         let track_y = self.viewport.y;
         let track_h = inner_h;
         let track = Rect::new(track_x, track_y, self.bar_thickness, track_h);
-        let radius = self.bar_thickness * 0.5;
 
-        // Track
-        list.rounded_rect(track, radius, style.color(StyleKey::InputBackground));
-
-        let thumb_h = thumb_extent(track_h, state.content_size[1], self.min_thumb);
+        // Sunken channel with a pair of docked 13px scrubber steppers. The
+        // buttons are visual controls for now; the caller can still drag the
+        // face-plate scrubber across the reserved middle travel.
+        list.chrome_rect(
+            track,
+            0.0,
+            1.0,
+            style.color(StyleKey::InputBackground),
+            style.color(StyleKey::PanelBorder),
+        );
+        super::material::draw_inset_shadow(
+            list,
+            style,
+            track,
+            style.scalar(StyleKey::InnerShadowDepth),
+            1.0,
+        );
+        let step = self.bar_thickness.min(track_h * 0.5);
+        let track_travel = (track_h - 2.0 * step).max(0.0);
+        let thumb_h = thumb_extent(track_travel, state.content_size[1], self.min_thumb);
         let max_off = state.max_offset(1, inner_h).max(1e-6);
         let t = (state.offset[1] / max_off).clamp(0.0, 1.0);
-        let thumb_y = track_y + (track_h - thumb_h) * t;
-        let thumb = Rect::new(track_x, thumb_y, self.bar_thickness, thumb_h);
+        let thumb_y = track_y + step + (track_travel - thumb_h) * t;
+        let thumb = Rect::new(
+            track_x + 1.0,
+            thumb_y,
+            (self.bar_thickness - 2.0).max(1.0),
+            thumb_h,
+        );
+        let stepper_top = Rect::new(track_x, track_y, self.bar_thickness, step);
+        let stepper_bottom = Rect::new(track_x, track_y + track_h - step, self.bar_thickness, step);
+        let idle = super::material::Material::new(super::material::Tone::Default);
+        super::material::draw(list, style, stepper_top, &idle);
+        super::material::draw(list, style, stepper_bottom, &idle);
+        draw_stepper_caret(list, style, stepper_top, StepperDirection::Up);
+        draw_stepper_caret(list, style, stepper_bottom, StepperDirection::Down);
 
         let hovered = thumb.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
         let active = state.drag_axis == Some(ScrollAxis::Vertical);
-        let color = if active {
-            style.color(StyleKey::Accent)
-        } else if hovered {
-            style.color(StyleKey::ButtonHover)
-        } else {
-            style.color(StyleKey::ButtonBorder)
-        };
-        list.rounded_rect(thumb, radius, color);
+        let m = super::material::Material::new(super::material::Tone::Default)
+            .hovered(hovered || active)
+            .pressed(active);
+        super::material::draw(list, style, thumb, &m);
 
         if hovered && input.mouse_clicked && state.drag_axis.is_none() {
             state.drag_axis = Some(ScrollAxis::Vertical);
@@ -370,32 +448,103 @@ impl ScrollView {
         let track_y = self.viewport.y + self.viewport.height - self.bar_thickness;
         let track_w = inner_w;
         let track = Rect::new(track_x, track_y, track_w, self.bar_thickness);
-        let radius = self.bar_thickness * 0.5;
 
-        list.rounded_rect(track, radius, style.color(StyleKey::InputBackground));
-
-        let thumb_w = thumb_extent(track_w, state.content_size[0], self.min_thumb);
+        list.chrome_rect(
+            track,
+            0.0,
+            1.0,
+            style.color(StyleKey::InputBackground),
+            style.color(StyleKey::PanelBorder),
+        );
+        super::material::draw_inset_shadow(
+            list,
+            style,
+            track,
+            style.scalar(StyleKey::InnerShadowDepth),
+            1.0,
+        );
+        let step = self.bar_thickness.min(track_w * 0.5);
+        let track_travel = (track_w - 2.0 * step).max(0.0);
+        let thumb_w = thumb_extent(track_travel, state.content_size[0], self.min_thumb);
         let max_off = state.max_offset(0, inner_w).max(1e-6);
         let t = (state.offset[0] / max_off).clamp(0.0, 1.0);
-        let thumb_x = track_x + (track_w - thumb_w) * t;
-        let thumb = Rect::new(thumb_x, track_y, thumb_w, self.bar_thickness);
+        let thumb_x = track_x + step + (track_travel - thumb_w) * t;
+        let thumb = Rect::new(
+            thumb_x,
+            track_y + 1.0,
+            thumb_w,
+            (self.bar_thickness - 2.0).max(1.0),
+        );
+        let stepper_left = Rect::new(track_x, track_y, step, self.bar_thickness);
+        let stepper_right = Rect::new(track_x + track_w - step, track_y, step, self.bar_thickness);
+        let idle = super::material::Material::new(super::material::Tone::Default);
+        super::material::draw(list, style, stepper_left, &idle);
+        super::material::draw(list, style, stepper_right, &idle);
+        draw_stepper_caret(list, style, stepper_left, StepperDirection::Left);
+        draw_stepper_caret(list, style, stepper_right, StepperDirection::Right);
 
         let hovered = thumb.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
         let active = state.drag_axis == Some(ScrollAxis::Horizontal);
-        let color = if active {
-            style.color(StyleKey::Accent)
-        } else if hovered {
-            style.color(StyleKey::ButtonHover)
-        } else {
-            style.color(StyleKey::ButtonBorder)
-        };
-        list.rounded_rect(thumb, radius, color);
+        let m = super::material::Material::new(super::material::Tone::Default)
+            .hovered(hovered || active)
+            .pressed(active);
+        super::material::draw(list, style, thumb, &m);
 
         if hovered && input.mouse_clicked && state.drag_axis.is_none() {
             state.drag_axis = Some(ScrollAxis::Horizontal);
             state.drag_start_mouse = input.mouse_x;
             state.drag_start_offset = state.offset[0];
         }
+    }
+}
+
+/// Direction for a scrollbar stepper caret.
+#[derive(Clone, Copy)]
+enum StepperDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Paint the reference design's compact 6px triangular arrow in a stepper key.
+/// The glyph is geometry rather than font text, so it remains centered and crisp
+/// in the 13px square at every font configuration.
+fn draw_stepper_caret(
+    list: &mut DrawList,
+    style: &StyleResolver,
+    rect: Rect,
+    direction: StepperDirection,
+) {
+    let cx = rect.x + rect.width * 0.5;
+    let cy = rect.y + rect.height * 0.5;
+    let half = (rect.width.min(rect.height) * 0.23).min(3.0);
+    let color = style.color(StyleKey::TextDim);
+    match direction {
+        StepperDirection::Up => list.triangle(
+            (cx, cy - half),
+            (cx - half, cy + half),
+            (cx + half, cy + half),
+            color,
+        ),
+        StepperDirection::Down => list.triangle(
+            (cx - half, cy - half),
+            (cx + half, cy - half),
+            (cx, cy + half),
+            color,
+        ),
+        StepperDirection::Left => list.triangle(
+            (cx - half, cy),
+            (cx + half, cy - half),
+            (cx + half, cy + half),
+            color,
+        ),
+        StepperDirection::Right => list.triangle(
+            (cx - half, cy - half),
+            (cx + half, cy),
+            (cx - half, cy + half),
+            color,
+        ),
     }
 }
 
@@ -446,6 +595,48 @@ mod tests {
         };
         assert!(!s.overflows(0, 100.0));
         assert!(!s.overflows(1, 100.0));
+    }
+
+    #[test]
+    fn scroll_range_into_view_moves_only_when_needed() {
+        let mut s = ScrollState {
+            offset: [0.0, 100.0],
+            content_size: [100.0, 500.0],
+            ..ScrollState::default()
+        };
+
+        s.scroll_range_into_view(1, 120.0, 140.0, 100.0);
+        assert_eq!(s.offset[1], 100.0, "an already-visible range must not move");
+
+        s.scroll_range_into_view(1, 40.0, 60.0, 100.0);
+        assert_eq!(s.offset[1], 40.0, "a range above aligns its leading edge");
+
+        s.scroll_range_into_view(1, 180.0, 200.0, 100.0);
+        assert_eq!(
+            s.offset[1], 100.0,
+            "a range below moves by the minimum amount"
+        );
+    }
+
+    #[test]
+    fn scroll_range_into_view_clamps_and_handles_oversized_ranges() {
+        let mut s = ScrollState {
+            offset: [0.0, 300.0],
+            content_size: [100.0, 500.0],
+            ..ScrollState::default()
+        };
+
+        s.scroll_range_into_view(1, -20.0, 10.0, 100.0);
+        assert_eq!(s.offset[1], 0.0);
+
+        s.scroll_range_into_view(1, 480.0, 500.0, 100.0);
+        assert_eq!(s.offset[1], 400.0);
+
+        s.scroll_range_into_view(1, 150.0, 300.0, 100.0);
+        assert_eq!(
+            s.offset[1], 150.0,
+            "oversized ranges align their leading edge"
+        );
     }
 
     #[test]
@@ -533,6 +724,30 @@ mod tests {
     }
 
     #[test]
+    fn docked_steppers_paint_compact_caret_triangles() {
+        let mut state = ScrollState {
+            content_size: [100.0, 1000.0],
+            ..ScrollState::default()
+        };
+        let mut list = DrawList::new();
+        let theme = theme();
+        let mut input = input_at(-1.0, -1.0);
+        ScrollView::new(Rect::new(0.0, 0.0, 100.0, 200.0)).draw(
+            &mut state,
+            &mut list,
+            &StyleResolver::new(&theme),
+            &mut input,
+            |_, _| {},
+        );
+        // Two triangles per visible vertical scrollbar; their 3 vertices live
+        // in the soup buffer, independent of chrome instance batching.
+        assert!(
+            list.vertices.len() >= 6,
+            "stepper caret triangles are emitted"
+        );
+    }
+
+    #[test]
     fn thumb_extent_proportional_to_visible_fraction() {
         // 200px viewport over 1000px content -> 20% -> 40px thumb (above min).
         assert!((thumb_extent(200.0, 1000.0, 16.0) - 40.0).abs() < 1e-3);
@@ -552,30 +767,43 @@ mod tests {
         let theme = theme();
         let viewport = Rect::new(0.0, 0.0, 200.0, 200.0);
 
-        // Bar thickness default 6, so vertical track lives at x=194..200.
-        // Initial thumb sits at top: y=0..40 (200/1000 = 20% of 200 = 40).
-        // Click on the thumb to start a drag.
+        // The default docked bar is 13px, so its vertical channel is x=187..200.
+        // Stepper keys consume y=0..13 and y=187..200; the initial scrubber
+        // starts at y=13. Click inside it to start a drag.
         let mut input = InputState {
-            mouse_x: 197.0,
-            mouse_y: 10.0,
+            mouse_x: 193.0,
+            mouse_y: 20.0,
             mouse_down: true,
             mouse_clicked: true,
             ..InputState::default()
         };
-        ScrollView::new(viewport).draw(&mut state, &mut list, &StyleResolver::new(&theme), &mut input, |_, _| {});
+        ScrollView::new(viewport).draw(
+            &mut state,
+            &mut list,
+            &StyleResolver::new(&theme),
+            &mut input,
+            |_, _| {},
+        );
         assert!(state.drag_axis.is_some());
 
         // Now drag down by 80 pixels with mouse held.
         list.clear();
         input.mouse_clicked = false;
-        input.mouse_y = 90.0;
-        ScrollView::new(viewport).draw(&mut state, &mut list, &StyleResolver::new(&theme), &mut input, |_, _| {});
+        input.mouse_y = 100.0;
+        ScrollView::new(viewport).draw(
+            &mut state,
+            &mut list,
+            &StyleResolver::new(&theme),
+            &mut input,
+            |_, _| {},
+        );
 
-        // Thumb travel = 200 - 40 = 160px.  Content travel = 1000 - 200 = 800px.
-        // 80px of mouse drag -> 80 * (800/160) = 400px content offset.
+        // The inner viewport is 187px after reserving the docked bar. Its
+        // 161px channel has a ~30px thumb, so 80px maps to ~445px content
+        // travel (the exact value comes from the same geometry used to paint).
         assert!(
-            (state.offset[1] - 400.0).abs() < 1.0,
-            "offset {} expected ~400",
+            (state.offset[1] - 445.30).abs() < 1.0,
+            "offset {} expected ~445",
             state.offset[1]
         );
     }
@@ -739,12 +967,16 @@ mod tests {
         let mut input = input_at(-10.0, -10.0);
 
         let viewport = Rect::new(0.0, 0.0, 100.0, 100.0);
-        ScrollView::new(viewport).draw(&mut state, &mut list, &StyleResolver::new(&theme), &mut input, |_, _| {});
+        ScrollView::new(viewport).draw(
+            &mut state,
+            &mut list,
+            &StyleResolver::new(&theme),
+            &mut input,
+            |_, _| {},
+        );
 
-        // The corner quad should sit at (viewport.x + width - bar, y + height - bar)
-        // = (100 - 6, 100 - 6) = (94, 94). `quad` now records a chrome instance
-        // whose rect top-left is exactly that position.
-        let bar = 6.0_f32;
+        // The corner quad sits at the 13px docked scrollbar intersection.
+        let bar = 13.0_f32;
         let cx = viewport.x + viewport.width - bar;
         let cy = viewport.y + viewport.height - bar;
         let found = list

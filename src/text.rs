@@ -20,28 +20,21 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
-
 use nalgebra::{Matrix4, Vector3};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::Affine2;
 use crate::layout::Rect;
 #[cfg(feature = "phosphor-icons")]
-use crate::render::{
-    DEFAULT_PX_RANGE, PHOSPHOR_FONT_ID, PhosphorIcon, phosphor_font_data, phosphor_glyph_id,
-};
-use crate::render::{GlyphTile, MsdfGlyphAtlas, ortho_matrix};
+use crate::render::{DEFAULT_PX_RANGE, IconGlyph, PhosphorIcon, icon_font_snapshot};
+use crate::render::{GlyphTile, MsdfGlyphAtlas, UniformArena, ortho_matrix};
 #[cfg(feature = "phosphor-icons")]
 use crate::widgets::IconMsdf;
 
-use glyphon::cosmic_text::{Align as CosmicAlign, Wrap, fontdb};
-use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, Weight};
-
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-struct UniformsForText {
-    view_proj: [[f32; 4]; 4],
-}
+use glyphon::cosmic_text::{
+    Align as CosmicAlign, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style,
+    Weight, Wrap, fontdb,
+};
 
 const MSDF_SHADER: &str = include_str!("render/ui_msdf.wgsl");
 
@@ -50,6 +43,9 @@ const MSDF_SHADER: &str = include_str!("render/ui_msdf.wgsl");
 /// for crisp scale-up headroom, at a modest atlas cost for the small curated set.
 #[cfg(feature = "phosphor-icons")]
 const ICON_REF_PX: f32 = 64.0;
+
+/// Size of the ortho uniform this renderer writes — one dynamic-offset arena slot.
+const UNIFORM_SIZE: u64 = std::mem::size_of::<[[f32; 4]; 4]>() as u64;
 
 /// Shared handle to a glyphon `FontSystem`.
 ///
@@ -275,6 +271,7 @@ struct MsdfVertex {
     model_col_1: [f32; 4],
     model_col_2: [f32; 4],
     model_col_3: [f32; 4],
+
 }
 
 const MSDF_VERTEX_ATTRIBS: [wgpu::VertexAttribute; 13] = wgpu::vertex_attr_array![
@@ -312,9 +309,13 @@ pub struct TextRenderer {
     #[cfg(feature = "phosphor-icons")]
     icon_gpu: MsdfTextureGpu,
 
-    // Ortho projection (owned, sized from `resize`).
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
+    // Ortho projection (owned, sized from `resize`), one slot per pass: the
+    // projection is per pass and `Queue::write_buffer` lands at submit, so passes
+    // sharing a slot would all draw with the last pass's matrix. `begin_frame`
+    // resets the arena; see `render::uniform_arena`.
+    uniform: UniformArena,
+    /// The slot `resize` handed this pass. Bound as the dynamic offset.
+    uniform_offset: u64,
 
     pipeline: wgpu::RenderPipeline,
 
@@ -326,6 +327,11 @@ pub struct TextRenderer {
     /// aliasing offset 0 and reading the last-written data at draw time. Reset
     /// to 0 by [`begin_frame`](Self::begin_frame) each frame.
     vbo_offset: u64,
+    /// Replaced buffers retained for the renderer's lifetime. Ordered painting
+    /// can grow the VBO while encoded or submitted passes still reference its
+    /// predecessor. Growth is geometric, so this remains a small bounded set and
+    /// avoids backend-specific completion polling before releasing resources.
+    retired_vbos: Vec<wgpu::Buffer>,
 
     /// Stable per-font keys for the atlas, assigned on first sighting. Decouples
     /// the atlas from cosmic-text's `fontdb::ID`.
@@ -364,35 +370,16 @@ impl TextRenderer {
         let atlas = MsdfGlyphAtlas::new();
 
         // Uniform (group 0): ortho projection, matching the main UI pipelines.
-        let uniform_buffer = wgpu::util::DeviceExt::create_buffer_init(
+        // One arena slot per pass, for the same reason as the vertex buffer below:
+        // several passes share one submit, and a shared slot would let a later
+        // pass's matrix reach the GPU first.
+        let uniform = UniformArena::new(
             device,
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("msdf text uniform"),
-                contents: bytemuck::cast_slice(&[UniformsForText{ view_proj : ortho_matrix(1.0, 1.0)}]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            },
+            "msdf text uniform",
+            UNIFORM_SIZE,
+            wgpu::ShaderStages::VERTEX,
         );
-        let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("msdf uniform bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("msdf uniform bg"),
-            layout: &uniform_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
+        let uniform_bgl = uniform.layout();
 
         // Atlas texture (group 1): linear filtering, linear (non-sRGB) format.
         // The layout is shared by the text and icon atlas mirrors and the pipeline.
@@ -463,12 +450,13 @@ impl TextRenderer {
             icon_atlas,
             #[cfg(feature = "phosphor-icons")]
             icon_gpu,
-            uniform_buffer,
-            uniform_bind_group,
+            uniform,
+            uniform_offset: 0,
             pipeline,
             vbo,
             vbo_capacity,
             vbo_offset: 0,
+            retired_vbos: Vec::new(),
             font_keys: HashMap::new(),
             next_font_key: 0,
             shape_cache: HashMap::new(),
@@ -486,18 +474,61 @@ impl TextRenderer {
         Arc::clone(&self.font_system)
     }
 
-    /// Update the viewport size used to build the ortho projection. Both
-    /// dimensions are clamped to a minimum of 1.
-    pub fn resize(&mut self, width: u32, height: u32) {
-        self.width = width.max(1);
-        self.height = height.max(1);
+    /// Update the viewport size used to build the ortho projection, and give this
+    /// pass its own uniform slot.
+    ///
+    /// `width`/`height` are the **physical** render-target pixels; `scale_factor`
+    /// is the logical → physical ratio (e.g. 2.0 on Retina). The ortho matrix is
+    /// built from the *logical* dimensions (`physical / scale`) so text lands at
+    /// the same coordinates as the geometry pipeline, which also projects in
+    /// logical space.
+    ///
+    /// Call this once per pass, before that pass's [`render`](Self::render) /
+    /// [`render_icons`](Self::render_icons): the projection is per pass, because two
+    /// passes submitted together can target differently sized views and a shared
+    /// uniform slot would hand both of them the last matrix written (see
+    /// [`uniform_arena`](crate::render::uniform_arena)). `begin_frame` — called once
+    /// per frame by [`UiRenderer::begin_frame`](crate::UiRenderer::begin_frame) —
+    /// releases the slots for reuse.
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+    ) {
+        let scale = if scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
+        // Store the logical dimensions — ortho_matrix needs these, not physical.
+        self.width = ((width as f32 / scale) as u32).max(1);
+        self.height = ((height as f32 / scale) as u32).max(1);
+        let (slot, _grew) = self.uniform.allocate(device);
+        queue.write_buffer(
+            self.uniform.buffer(),
+            slot,
+            bytemuck::cast_slice(&[ortho_matrix(self.width as f32, self.height as f32)]),
+        );
+        self.uniform_offset = slot;
     }
 
-    /// Reset the per-frame vertex-buffer cursor. Call once at the start of each
-    /// frame (before any [`render`](Self::render) pass) so the bump offset that
-    /// keeps multiple text passes from aliasing starts fresh.
+    /// Reset this frame's bump cursors — the vertex buffer and the uniform slots.
+    /// Called once per frame (from [`UiRenderer::begin_frame`](crate::UiRenderer::begin_frame)),
+    /// *not* once per pass: passes within one submission must keep their own regions,
+    /// and only the frame boundary makes those regions reusable.
     pub fn begin_frame(&mut self) {
         self.vbo_offset = 0;
+        self.uniform.reset();
+        self.uniform_offset = 0;
+    }
+
+    /// Bytes of per-frame GPU scratch this renderer is holding: vertex data plus
+    /// uniform slots. Part of `UiRenderer`'s frame-arena accounting.
+    pub(crate) fn frame_arena_bytes(&self) -> u64 {
+        self.vbo_offset + self.uniform.bytes_used()
     }
 
     /// Drop the cross-frame shaped-text cache, forcing every block to re-shape on
@@ -526,6 +557,7 @@ impl TextRenderer {
             Style::Normal,
             WrapMode::default(),
             false,
+            0.0,
         )
     }
 
@@ -552,7 +584,7 @@ impl TextRenderer {
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
                 let font_key = self.font_key(glyph.font_id);
-                if let Some(font) = fs.get_font(glyph.font_id,Weight::default()) {
+                if let Some(font) = fs.get_font(glyph.font_id, Weight::default()) {
                     self.atlas.glyph(font_key, glyph.glyph_id, font.data());
                 }
             }
@@ -566,15 +598,73 @@ impl TextRenderer {
     }
 
     /// Pre-generate every curated [`PhosphorIcon`] into the icon atlas so the
-    /// first frame that shows an icon doesn't hitch. Call once after construction
-    /// (the renderer does this in `UiRenderer::new`).
+    /// first frame that shows an icon doesn't hitch. This is intentionally opt-in;
+    /// renderer construction otherwise generates icon glyphs lazily.
     #[cfg(feature = "phosphor-icons")]
     pub fn prewarm_icons(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let data = phosphor_font_data();
-        for &icon in PhosphorIcon::ALL {
-            if let Some(gid) = phosphor_glyph_id(icon) {
-                self.icon_atlas.glyph(PHOSPHOR_FONT_ID, gid, data);
-            }
+        let glyphs: Vec<IconGlyph> = PhosphorIcon::ALL.iter().filter_map(|i| i.glyph()).collect();
+        self.prewarm_icon_glyphs(device, queue, &glyphs);
+    }
+
+    /// Pre-generate an explicit set of icon glyphs — the route for an
+    /// application font registered with
+    /// [`register_icon_font`](crate::render::register_icon_font), whose glyph set
+    /// the library can't enumerate for itself.
+    ///
+    /// Unresolvable glyphs (unregistered font, or a font id past the end of the
+    /// registry) are skipped rather than panicking.
+    #[cfg(feature = "phosphor-icons")]
+    pub fn prewarm_icon_glyphs(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        glyphs: &[IconGlyph],
+    ) {
+        let fonts = icon_font_snapshot();
+        for g in glyphs {
+            let Some(data) = fonts.get(g.font.index() as usize) else {
+                continue;
+            };
+            self.icon_atlas
+                .glyph(g.font.index() as u64, g.glyph_id, data);
+        }
+        self.icon_gpu
+            .upload(device, queue, &self.atlas_bgl, &mut self.icon_atlas);
+    }
+
+    /// Resolve every glyph needed by an ordered paint stream before encoding its
+    /// first text pass. Text runs are rendered separately to preserve submission
+    /// order; without this preflight, a later run can grow the atlas after earlier
+    /// passes have baked UVs against its old dimensions.
+    pub(crate) fn prepare_texts(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texts: &[TextBlock],
+    ) {
+        if texts.is_empty() {
+            return;
+        }
+        let _ = self.build_vertices(texts);
+        self.upload_atlas(device, queue);
+    }
+
+    /// Resolve every icon glyph needed by an ordered paint stream before its first
+    /// icon pass, for the same atlas-stability reason as [`prepare_texts`](Self::prepare_texts).
+    #[cfg(feature = "phosphor-icons")]
+    pub(crate) fn prepare_icons(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        icons: &[IconMsdf],
+    ) {
+        let fonts = icon_font_snapshot();
+        for icon in icons {
+            let Some(data) = fonts.get(icon.glyph.font.index() as usize) else {
+                continue;
+            };
+            self.icon_atlas
+                .glyph(icon.glyph.font.index() as u64, icon.glyph.glyph_id, data);
         }
         self.icon_gpu
             .upload(device, queue, &self.atlas_bgl, &mut self.icon_atlas);
@@ -601,19 +691,20 @@ impl TextRenderer {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_icon_render").entered();
 
-        // Keep the ortho uniform in sync with the current viewport (text may not
-        // have run this frame, so don't rely on its write).
-        queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[ortho_matrix(self.width as f32, self.height as f32)]),
-        );
-
-        let data = phosphor_font_data();
+        // One lock acquisition for the whole batch; the bytes are `'static`, so
+        // MSDF generation below runs with the registry unlocked.
+        let fonts = icon_font_snapshot();
         let px_range = self.icon_atlas.px_range();
         let mut verts: Vec<MsdfVertex> = Vec::with_capacity(icons.len() * 6);
         for icon in icons {
-            let Some(tile) = self.icon_atlas.glyph(PHOSPHOR_FONT_ID, icon.glyph_id, data) else {
+            // An icon from an unregistered font simply doesn't draw.
+            let Some(data) = fonts.get(icon.glyph.font.index() as usize) else {
+                continue;
+            };
+            let Some(tile) =
+                self.icon_atlas
+                    .glyph(icon.glyph.font.index() as u64, icon.glyph.glyph_id, data)
+            else {
                 continue;
             };
             push_icon_quad(
@@ -643,12 +734,12 @@ impl TextRenderer {
             label: Some("msdf icon pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
-                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
@@ -656,7 +747,7 @@ impl TextRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(0, self.uniform.bind_group(), &[self.uniform_offset as u32]);
         pass.set_bind_group(1, &self.icon_gpu.bind_group, &[]);
         pass.set_vertex_buffer(0, self.vbo.slice(offset..));
         pass.draw(0..verts.len() as u32, 0..1);
@@ -688,19 +779,7 @@ impl TextRenderer {
                 continue;
             }
 
-            let key: ShapeKey = (
-                block.font_size.to_bits(),
-                block.line_height.to_bits(),
-                block.max_width.to_bits(),
-                family_hash(block.font.as_ref()),
-                block.align,
-                block.ellipsize,
-                block.weight.0,
-                style_disc(block.style),
-                block.wrap,
-                block.direction,
-                block.vertical,
-            );
+            let key = shape_key(block);
 
             // Fast path: a cached layout for this exact key + content. No
             // FontSystem lock, no shaping — every cached glyph is already in the
@@ -749,6 +828,7 @@ impl TextRenderer {
                     family,
                     block.weight,
                     block.style,
+                    block.letter_spacing,
                 );
                 &truncated
             } else {
@@ -779,11 +859,11 @@ impl TextRenderer {
             if block.vertical || block.ellipsize {
                 // Vertical: each line is one cluster, no wrapping; shrink-to-content
                 // so manual centering (below) governs horizontal placement.
-                buffer.set_wrap( Wrap::None);
-                buffer.set_size( None, None);
+                buffer.set_wrap(Wrap::None);
+                buffer.set_size(None, None);
             } else {
-                buffer.set_wrap( block.wrap.into());
-                buffer.set_size( Some(block.max_width), None);
+                buffer.set_wrap(block.wrap.into());
+                buffer.set_size(Some(block.max_width), None);
             }
             buffer.set_text(
                 //&mut fs,
@@ -792,6 +872,7 @@ impl TextRenderer {
                     .family(family)
                     .weight(block.weight)
                     .style(block.style)
+                    .letter_spacing(block.letter_spacing)
                     .color(block.color),
                 Shaping::Advanced,
                 None,
@@ -801,7 +882,9 @@ impl TextRenderer {
             // mode never sets a cosmic align — it centers each row manually within
             // the column width (below), which is deterministic and font-agnostic
             // regardless of the shrink-to-content buffer width.
-            if !block.vertical && let Some(align) = cosmic_align(block.align) {
+            if !block.vertical
+                && let Some(align) = cosmic_align(block.align)
+            {
                 for line in buffer.lines.iter_mut() {
                     line.set_align(Some(align));
                 }
@@ -840,7 +923,10 @@ impl TextRenderer {
             // line's start byte in the *shaped* (newline-joined) string by scanning
             // for `\n` — mirroring `text_visual_layout`. Subtracting `line_i` below
             // removes the inserted separators to recover the caller's content byte.
-            let line_starts: Vec<usize> = if block.vertical {
+            // Horizontal needs the same table: cosmic-text's `glyph.start` is
+            // relative to the glyph's buffer line there too, and style ranges
+            // address the whole block content.
+            let line_starts: Vec<usize> = {
                 let mut starts = vec![0usize];
                 for (i, b) in shaped_text.bytes().enumerate() {
                     if b == b'\n' {
@@ -848,15 +934,12 @@ impl TextRenderer {
                     }
                 }
                 starts
-            } else {
-                Vec::new()
             };
 
             // Collect the relative layout. Whitespace / outline-less glyphs yield
             // no tile (atlas returns `None`) and are skipped — so every stored
             // glyph is guaranteed present in the atlas on later frames.
             let mut shaped: Vec<ShapedGlyph> = Vec::new();
-
             for run in buffer.layout_runs() {
                 let line_off_x = if block.vertical {
                     column_off_x + (column_w - run.line_w) / 2.0
@@ -873,7 +956,7 @@ impl TextRenderer {
                         &mut self.next_font_key,
                         glyph.font_id,
                     );
-                    let Some(font) = fs.get_font(glyph.font_id, Weight::default()) else {
+                    let Some(font) = fs.get_font(glyph.font_id,Weight::default()) else {
                         continue;
                     };
                     if self
@@ -884,14 +967,17 @@ impl TextRenderer {
                         continue; // whitespace / outline-less
                     }
                     // Map the per-buffer-line glyph offset back to the caller's
-                    // content. Horizontal: undo the direction-prefix shift.
-                    // Vertical: add the shaped line's start byte, then subtract the
-                    // `line_i` inserted `'\n'` separators that precede this cluster.
+                    // content. cosmic-text reports `glyph.start` relative to the
+                    // glyph's own buffer line (see `text_caret_layout`), so the
+                    // shaped line's start byte must be re-added in *both* modes.
+                    // The direction prefix sits once at the head of the shaped
+                    // string (never inside later lines), so it is removed exactly
+                    // once from the absolute byte — not from the line base.
+                    let line_base = line_starts.get(run.line_i).copied().unwrap_or(0);
                     let byte_start = if block.vertical {
-                        let line_base = line_starts.get(run.line_i).copied().unwrap_or(0);
                         (line_base + glyph.start).saturating_sub(run.line_i)
                     } else {
-                        glyph.start.saturating_sub(prefix_len)
+                        (line_base + glyph.start).saturating_sub(prefix_len)
                     };
                     shaped.push(ShapedGlyph {
                         font_id: glyph.font_id,
@@ -1039,13 +1125,6 @@ impl TextRenderer {
         #[cfg(feature = "tracy")]
         let _span = tracing::info_span!("gameui_text_render").entered();
 
-        // Keep the ortho uniform in sync with the current viewport.
-        queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[UniformsForText{view_proj:ortho_matrix(self.width as f32, self.height as f32)}]),
-        );
-
         let verts = self.build_vertices(texts);
         // Glyph generation may have dirtied / grown the atlas — upload before drawing.
         self.upload_atlas(device, queue);
@@ -1079,7 +1158,7 @@ impl TextRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        pass.set_bind_group(0, self.uniform.bind_group(), &[self.uniform_offset as u32]);
         pass.set_bind_group(1, &self.glyph_gpu.bind_group, &[]);
         pass.set_vertex_buffer(0, self.vbo.slice(offset..));
         pass.draw(0..verts.len() as u32, 0..1);
@@ -1094,12 +1173,14 @@ impl TextRenderer {
         let needed = offset + bytes;
         if needed > self.vbo_capacity {
             self.vbo_capacity = needed.next_power_of_two();
-            self.vbo = device.create_buffer(&wgpu::BufferDescriptor {
+            let replacement = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("msdf text vbo"),
                 size: self.vbo_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            self.retired_vbos
+                .push(std::mem::replace(&mut self.vbo, replacement));
         }
         offset
     }
@@ -1158,6 +1239,7 @@ type ShapeKey = (
     u32,
     u32,
     u32,
+    u32,
     u64,
     TextAlign,
     bool,
@@ -1167,6 +1249,23 @@ type ShapeKey = (
     TextDirection,
     bool,
 );
+
+fn shape_key(block: &TextBlock) -> ShapeKey {
+    (
+        block.font_size.to_bits(),
+        block.line_height.to_bits(),
+        block.max_width.to_bits(),
+        block.letter_spacing.to_bits(),
+        family_hash(block.font.as_ref()),
+        block.align,
+        block.ellipsize,
+        block.weight.0,
+        style_disc(block.style),
+        block.wrap,
+        block.direction,
+        block.vertical,
+    )
+}
 
 /// Lay a string out for **vertical (stacked) text** by putting each grapheme
 /// cluster on its own line, so cosmic-text — which has no writing-mode API and
@@ -1234,6 +1333,16 @@ pub fn resolve_span_color(byte_start: u32, spans: &[TextSpan]) -> Option<[f32; 4
     None
 }
 
+/// Resolve a glyph colour from sorted byte-range styles in logarithmic time.
+pub fn resolve_range_color(byte_start: u32, ranges: &[TextStyleRange]) -> Option<[f32; 4]> {
+    let byte = byte_start as usize;
+    let candidate = ranges.partition_point(|range| range.range.start <= byte);
+    candidate.checked_sub(1).and_then(|index| {
+        let range = &ranges[index];
+        (byte < range.range.end).then_some(range.color).flatten()
+    })
+}
+
 /// Turn a block's cached relative glyph layout into `GlyphPlacement`s, applying
 /// the block's position, color, clip and effects. Shared by the cache-hit and
 /// cache-miss paths so both produce identical output. Takes the atlas / font-key
@@ -1275,11 +1384,21 @@ fn append_placements(
         let Some(tile) = atlas.glyph(font_key, g.glyph_id, &[]) else {
             continue; // present on every later frame; defensive only
         };
-        // Per-span colour override: only evaluated when spans are present.
-        let fill = if spans.is_empty() {
-            block_fill
-        } else {
+        // Byte ranges are searched logarithmically, avoiding the old
+        // glyphs-times-tokens scan. Legacy owned spans remain supported.
+        let fill = if !block.style_ranges.is_empty() {
+            resolve_range_color(g.byte_start, &block.style_ranges)
+                .map(|mut color| {
+                    for (channel, tint) in color.iter_mut().zip(block.style_range_tint) {
+                        *channel = (*channel * tint).clamp(0.0, 1.0);
+                    }
+                    color
+                })
+                .unwrap_or(block_fill)
+        } else if !spans.is_empty() {
             resolve_span_color(g.byte_start, spans).unwrap_or(block_fill)
+        } else {
+            block_fill
         };
         out.push(GlyphPlacement {
             tile,
@@ -1291,7 +1410,7 @@ fn append_placements(
             outline,
             shadow,
             glow,
-            current_transform
+            current_transform,
         });
     }
 }
@@ -1362,12 +1481,6 @@ fn push_glyph_quad(
         Some(c) => (c, 1.0),
         None => ([0.0; 4], 0.0),
     };
-
-    //let rotation_matrix = Mat4::from_rotation_z(current_transform.angle);
-    //let center = Vec3::new(current_transform.tx,current_transform.ty , 0.0);
-    //let translation_to_origin = Mat4::from_translation(-center);
-    //let translation_back = Mat4::from_translation(center);
-    //let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
     let center = Vector3::new(current_transform.tx,current_transform.ty , 0.0);
     let rotation_matrix = Matrix4::new_rotation(Vector3::z() * current_transform.angle);
     let translation_to_origin = Matrix4::new_translation(&-center);
@@ -1375,6 +1488,7 @@ fn push_glyph_quad(
     let model_transform = translation_back * rotation_matrix * translation_to_origin;
 
     let raw_slice =  model_transform.as_slice();
+
     let v = |x: f32, y: f32, u: f32, vv: f32| MsdfVertex {
         position: [x, y],
         uv: [u, vv],
@@ -1389,7 +1503,6 @@ fn push_glyph_quad(
         model_col_1:[raw_slice[4],raw_slice[5],raw_slice[6],raw_slice[7]],
         model_col_2:[raw_slice[8],raw_slice[9],raw_slice[10],raw_slice[11]],
         model_col_3:[raw_slice[12],raw_slice[13],raw_slice[14],raw_slice[15]],
-
     };
 
     // TL, TR, BR / TL, BR, BL
@@ -1468,11 +1581,6 @@ fn push_icon_quad(
     let br = t.transform_point([x1, y1]);
     let bl = t.transform_point([x0, y1]);
 
-    //let rotation_matrix = Mat4::from_rotation_z(icon.transform.angle);
-    //let center = Vec3::new(icon.transform.tx,icon.transform.ty , 0.0);
-    //let translation_to_origin = Mat4::from_translation(-center);
-    //let translation_back = Mat4::from_translation(center);
-    //let model_transform = (translation_back * rotation_matrix * translation_to_origin).to_cols_array_2d();
     let center = Vector3::new(icon.transform.tx,icon.transform.ty , 0.0);
     let rotation_matrix = Matrix4::new_rotation(Vector3::z() * icon.transform.angle);
     let translation_to_origin = Matrix4::new_translation(&-center);
@@ -1543,6 +1651,10 @@ struct MsdfTextureGpu {
     #[allow(dead_code)]
     sampler: wgpu::Sampler,
     bind_group: wgpu::BindGroup,
+    /// Atlas resources replaced while encoding the current frame. A newly seen
+    /// glyph may grow the atlas between ordered text runs; earlier render passes
+    /// still reference the previous bind group and texture until submission.
+    retired: Vec<(wgpu::Texture, wgpu::Sampler, wgpu::BindGroup)>,
     /// Atlas width last uploaded to the GPU. Starts at 0 so the first `upload`
     /// always writes pixels (the texture is created empty).
     current_size: u32,
@@ -1556,6 +1668,7 @@ impl MsdfTextureGpu {
             texture,
             sampler,
             bind_group,
+            retired: Vec::new(),
             current_size: 0,
         }
     }
@@ -1572,9 +1685,11 @@ impl MsdfTextureGpu {
         if atlas.width() != self.current_size {
             let (texture, sampler, _bgl, bind_group) =
                 create_msdf_texture_with_bgl(device, bgl, atlas.width(), atlas.height());
-            self.texture = texture;
-            self.sampler = sampler;
-            self.bind_group = bind_group;
+            let old_texture = std::mem::replace(&mut self.texture, texture);
+            let old_sampler = std::mem::replace(&mut self.sampler, sampler);
+            let old_bind_group = std::mem::replace(&mut self.bind_group, bind_group);
+            self.retired
+                .push((old_texture, old_sampler, old_bind_group));
             self.current_size = atlas.width();
             let _ = atlas.take_dirty();
             self.write_pixels(queue, atlas);
@@ -1798,9 +1913,10 @@ pub fn has_lowercase(text: &str) -> bool {
 /// stale metrics.
 ///
 /// Cache key for [`TextMeasurer`]: quantized
-/// `(font_size_bits, max_width_bits, family_hash, weight, style_disc, wrap, vertical)`.
-/// `vertical` keeps the two orientations of the same string from colliding.
-type MeasureKey = (u32, Option<u32>, u64, u16, u8, WrapMode, bool);
+/// `(font_size_bits, max_width_bits, letter_spacing_bits, family_hash, weight,
+/// style_disc, wrap, vertical)`. `vertical` keeps the two orientations of the
+/// same string from colliding.
+type MeasureKey = (u32, Option<u32>, u32, u64, u16, u8, WrapMode, bool);
 
 /// Text measurement front-end: shapes through cosmic-text to report `(width,
 /// height)` for layout, caching results per metrics/font key and the optical
@@ -1814,6 +1930,10 @@ pub struct TextMeasurer {
     /// weights/styles have different advances so all must be part of the key.
     cache: HashMap<MeasureKey, HashMap<String, (f32, f32)>>,
     cache_entries: usize,
+    /// Ink bands ([`TextMeasurer::measure_block_ink`]), keyed identically to
+    /// `cache`. Separate because it is populated only by layout inspection, so
+    /// the common path never pays for it.
+    ink_cache: HashMap<MeasureKey, HashMap<String, Option<(f32, f32)>>>,
     /// Per-font vertical metrics for optical centring, keyed by
     /// `(family_hash, weight, style_disc)`. Sampled once per font (a one-glyph
     /// shaping pass + a ttf-parser metric read), then reused every frame.
@@ -1830,6 +1950,7 @@ impl TextMeasurer {
             font_system: shared_font_system(),
             cache: HashMap::new(),
             cache_entries: 0,
+            ink_cache: HashMap::new(),
             vmetrics: HashMap::new(),
         }
     }
@@ -1841,6 +1962,7 @@ impl TextMeasurer {
             font_system,
             cache: HashMap::new(),
             cache_entries: 0,
+            ink_cache: HashMap::new(),
             vmetrics: HashMap::new(),
         }
     }
@@ -1857,6 +1979,7 @@ impl TextMeasurer {
     pub fn clear_cache(&mut self) {
         self.cache.clear();
         self.cache_entries = 0;
+        self.ink_cache.clear();
         self.vmetrics.clear();
     }
 
@@ -1931,6 +2054,7 @@ impl TextMeasurer {
     /// `(font, weight, style, wrap)` combination is a distinct cache entry — a
     /// measurement under this path matches a [`TextBlock`] rendered with the same
     /// font/weight/style/wrap.
+    #[allow(clippy::too_many_arguments)]
     pub fn measure_styled(
         &mut self,
         text: &str,
@@ -1941,7 +2065,36 @@ impl TextMeasurer {
         style: Style,
         wrap: WrapMode,
     ) -> (f32, f32) {
-        self.measure_keyed(text, font_size, max_width, font, weight, style, wrap, false)
+        self.measure_styled_with_letter_spacing(
+            text, font_size, max_width, font, weight, style, wrap, 0.0,
+        )
+    }
+
+    /// Like [`measure_styled`](Self::measure_styled), with additional spacing in
+    /// pixels applied by cosmic-text between shaped glyphs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn measure_styled_with_letter_spacing(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: Option<f32>,
+        font: Option<&FontHandle>,
+        weight: Weight,
+        style: Style,
+        wrap: WrapMode,
+        letter_spacing: f32,
+    ) -> (f32, f32) {
+        self.measure_keyed(
+            text,
+            font_size,
+            max_width,
+            font,
+            weight,
+            style,
+            wrap,
+            false,
+            letter_spacing,
+        )
     }
 
     /// Measure `text` laid out as **vertical (stacked) text** — one grapheme
@@ -1959,7 +2112,106 @@ impl TextMeasurer {
             Style::Normal,
             WrapMode::default(),
             true,
+            0.0,
         )
+    }
+
+    /// Measure a [`TextBlock`] **exactly as it will be laid out**, honouring its
+    /// font, weight, style, wrap policy, `max_width`, and `vertical` flag.
+    ///
+    /// The narrower `measure*` methods above each hard-code some of those
+    /// (`measure_styled` cannot do vertical text; everything below it assumes
+    /// the default font at `Weight::NORMAL`/`Style::Normal`), so measuring a
+    /// bold, italic, custom-font, or stacked block through them reports the
+    /// wrong size. Prefer this when you have the block itself — as debug
+    /// tooling and layout inspection do.
+    ///
+    /// An [`ellipsize`](TextBlock::ellipsize) block is measured **unwrapped on
+    /// one line**: the width the content *wants* before truncation. Compare it
+    /// against `max_width` to tell whether the ellipsis actually engaged.
+    pub fn measure_block(&mut self, block: &TextBlock) -> (f32, f32) {
+        let max_width = if block.ellipsize || block.vertical {
+            None
+        } else {
+            Some(block.max_width)
+        };
+        self.measure_keyed(
+            &block.content,
+            block.font_size,
+            max_width,
+            block.font.as_ref(),
+            block.weight,
+            block.style,
+            block.wrap,
+            block.vertical,
+            block.letter_spacing,
+        )
+    }
+
+    /// The band of real glyph **ink** a block paints, as `(top, bottom)` offsets
+    /// below the block's top edge ([`TextBlock::y`]). `None` when the block inks
+    /// nothing — empty or whitespace-only content.
+    ///
+    /// [`measure_block`](Self::measure_block) reports the *slot*: advance width
+    /// by line-box height, which is what layout reserves. This reports what
+    /// actually lands on screen, and the two differ by design. A line box always
+    /// carries leading above the ascent and below the descent, and
+    /// `DrawList::vcentered_text_y` slides that whole slot upward so the glyphs'
+    /// optical centre — not the slot's — sits on the row centre. Comparing the
+    /// slot against the row therefore reports a correctly centred label as
+    /// overflowing by a pixel or two; comparing the ink does not.
+    ///
+    /// Intended for layout inspection (see [`crate::debug`]), which is why the
+    /// result is cached separately and never computed on the drawing path.
+    pub fn measure_block_ink(&mut self, block: &TextBlock) -> Option<(f32, f32)> {
+        let max_width = if block.ellipsize || block.vertical {
+            None
+        } else {
+            Some(block.max_width)
+        };
+        let key = (
+            block.font_size.to_bits(),
+            max_width.map(f32::to_bits),
+            block.letter_spacing.to_bits(),
+            family_hash(block.font.as_ref()),
+            block.weight.0,
+            style_disc(block.style),
+            block.wrap,
+            block.vertical,
+        );
+
+        if let Some(inner) = self.ink_cache.get(&key)
+            && let Some(&band) = inner.get(block.content.as_str())
+        {
+            return band;
+        }
+
+        let band = {
+            let mut fs = self.font_system.lock().expect("FontSystem poisoned");
+            ink_band_with_font_system(
+                &mut fs,
+                &block.content,
+                block.font_size,
+                max_width,
+                block.font.as_ref().map(|h| h.family()),
+                block.weight,
+                block.style,
+                block.wrap,
+                block.vertical,
+                block.letter_spacing,
+            )
+        };
+
+        if self.cache_entries >= MEASURE_CACHE_CAP {
+            self.clear_cache();
+        }
+        self.ink_cache
+            .entry(key)
+            .or_default()
+            .insert(block.content.clone(), band);
+        self.cache_entries += 1;
+
+        band
     }
 
     /// Shared cache-keyed measurement backing [`measure_styled`] (horizontal) and
@@ -1976,10 +2228,12 @@ impl TextMeasurer {
         style: Style,
         wrap: WrapMode,
         vertical: bool,
+        letter_spacing: f32,
     ) -> (f32, f32) {
         let key = (
             font_size.to_bits(),
             max_width.map(f32::to_bits),
+            letter_spacing.to_bits(),
             family_hash(font),
             weight.0,
             style_disc(style),
@@ -2005,6 +2259,7 @@ impl TextMeasurer {
                 style,
                 wrap,
                 vertical,
+                letter_spacing,
             )
         };
 
@@ -2060,6 +2315,137 @@ fn cosmic_align(align: TextAlign) -> Option<CosmicAlign> {
     }
 }
 
+/// Shape a string into a `Buffer` under the same policy the measurement path
+/// uses, so everything derived from it (advance box, ink band) describes one
+/// identical layout rather than two that merely resemble each other.
+#[allow(clippy::too_many_arguments)]
+fn shape_for_measure(
+    font_system: &mut FontSystem,
+    text: &str,
+    font_size: f32,
+    max_width: Option<f32>,
+    family_name: Option<&str>,
+    weight: Weight,
+    style: Style,
+    wrap: WrapMode,
+    vertical: bool,
+    letter_spacing: f32,
+) -> Buffer {
+    let line_height = font_size * LINE_HEIGHT_RATIO;
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
+
+    // Vertical (stacked) mode: lay out one grapheme cluster per line with no
+    // wrapping, mirroring `build_vertices`.
+    let stacked;
+    let shaped_text: &str = if vertical {
+        stacked = vertical_stack_string(text);
+        buffer.set_wrap(Wrap::None);
+        buffer.set_size(None, None);
+        &stacked
+    } else {
+        let shape_width = max_width.unwrap_or(f32::MAX / 4.0);
+        buffer.set_wrap(wrap.into());
+        buffer.set_size(Some(shape_width), None);
+        text
+    };
+    buffer.set_text(
+        //font_system,
+        shaped_text,
+        &Attrs::new()
+            .family(family)
+            .weight(weight)
+            .style(style)
+            .letter_spacing(letter_spacing),
+        Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+}
+
+/// The vertical band of real glyph **ink**, as offsets below the block's top
+/// edge, or `None` when the string inks nothing (empty or whitespace-only).
+///
+/// This is deliberately *not* the line box. A line box is a typographic slot
+/// that always has leading above the ascent and below the descent, and
+/// `DrawList::vcentered_text_y` shifts that whole slot upward on purpose so the
+/// glyphs' optical centre — not the slot's centre — lands on the row's centre.
+/// A correctly centred label therefore has a line box poking out of its row by
+/// a pixel or two, which is exactly the false alarm layout inspection must not
+/// raise. Measuring the ink itself is what makes "did this text paint outside
+/// its box?" answerable.
+///
+/// Per glyph the band is `baseline − y_max` … `baseline − y_min` of the glyph's
+/// outline bounding box, scaled from font units. Whitespace and other
+/// outline-less glyphs have no bounding box and contribute nothing, matching the
+/// renderer, which skips exactly those.
+#[allow(clippy::too_many_arguments)]
+fn ink_band_with_font_system(
+    font_system: &mut FontSystem,
+    text: &str,
+    font_size: f32,
+    max_width: Option<f32>,
+    family_name: Option<&str>,
+    weight: Weight,
+    style: Style,
+    wrap: WrapMode,
+    vertical: bool,
+    letter_spacing: f32,
+) -> Option<(f32, f32)> {
+    let buffer = shape_for_measure(
+        font_system,
+        text,
+        font_size,
+        max_width,
+        family_name,
+        weight,
+        style,
+        wrap,
+        vertical,
+        letter_spacing,
+    );
+
+    // Group by face first: parsing a face is far more expensive than reading a
+    // glyph box out of one, and a label is almost always a single face.
+    let mut by_font: HashMap<fontdb::ID, Vec<(u16, f32, f32)>> = HashMap::new();
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            // Same baseline expression `build_vertices` uses to place the quad.
+            let baseline = run.line_y + glyph.y - glyph.font_size * glyph.y_offset;
+            by_font.entry(glyph.font_id).or_default().push((
+                glyph.glyph_id,
+                baseline,
+                glyph.font_size,
+            ));
+        }
+    }
+
+    let mut top = f32::INFINITY;
+    let mut bottom = f32::NEG_INFINITY;
+    for (font_id, glyphs) in by_font {
+        let Some(font) = font_system.get_font(font_id,Weight::default()) else {
+            continue;
+        };
+        let Ok(face) = ttf_parser::Face::parse(font.data(), 0) else {
+            continue;
+        };
+        let upem = face.units_per_em() as f32;
+        if upem <= 0.0 {
+            continue;
+        }
+        for (gid, baseline, size) in glyphs {
+            let Some(bb) = face.glyph_bounding_box(ttf_parser::GlyphId(gid)) else {
+                continue; // whitespace / outline-less
+            };
+            top = top.min(baseline - bb.y_max as f32 / upem * size);
+            bottom = bottom.max(baseline - bb.y_min as f32 / upem * size);
+        }
+    }
+
+    (top <= bottom).then_some((top, bottom))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn measure_with_font_system(
     font_system: &mut FontSystem,
@@ -2071,34 +2457,21 @@ fn measure_with_font_system(
     style: Style,
     wrap: WrapMode,
     vertical: bool,
+    letter_spacing: f32,
 ) -> (f32, f32) {
     let line_height = font_size * LINE_HEIGHT_RATIO;
-    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
-
-    // Vertical (stacked) mode: lay out one grapheme cluster per line with no
-    // wrapping, mirroring `build_vertices`. The same `max(line_w)` / sum-of-
-    // `line_height` loop below then yields the column width × stacked height.
-    let stacked;
-    let shaped_text: &str = if vertical {
-        stacked = vertical_stack_string(text);
-        buffer.set_wrap(Wrap::None);
-        buffer.set_size(None, None);
-        &stacked
-    } else {
-        let shape_width = max_width.unwrap_or(f32::MAX / 4.0);
-        buffer.set_wrap( wrap.into());
-        buffer.set_size( Some(shape_width), None);
-        text
-    };
-    buffer.set_text(
-        //font_system,
-        shaped_text,
-        &Attrs::new().family(family).weight(weight).style(style),
-        Shaping::Advanced,
-        None,
+    let buffer = shape_for_measure(
+        font_system,
+        text,
+        font_size,
+        max_width,
+        family_name,
+        weight,
+        style,
+        wrap,
+        vertical,
+        letter_spacing,
     );
-    buffer.shape_until_scroll(font_system, false);
 
     let mut width = 0.0f32;
     let mut height = 0.0f32;
@@ -2137,7 +2510,7 @@ fn resolve_vmetrics(
         "H",
         &Attrs::new().family(family).weight(weight).style(style),
         Shaping::Advanced,
-        None
+        None,
     );
     buffer.shape_until_scroll(font_system, false);
 
@@ -2170,7 +2543,7 @@ fn resolve_vmetrics(
     // above that baseline. Falls back to the roman baseline + cap-band centre when
     // no CJK face/glyph is available, so setups without a CJK font are unchanged.
     let mut cjk_buffer = Buffer::new(font_system, Metrics::new(ref_px, line_height));
-    cjk_buffer.set_size(Some(f32::MAX / 4.0), None);
+    cjk_buffer.set_size( Some(f32::MAX / 4.0), None);
     cjk_buffer.set_text(
         //font_system,
         CJK_PROBE,
@@ -2186,7 +2559,7 @@ fn resolve_vmetrics(
         cjk_font_id = run.glyphs.first().map(|g| g.font_id);
     }
     let cjk_face_center = cjk_font_id
-        .and_then(|id| font_system.get_font(id,Weight::default()))
+        .and_then(|id| font_system.get_font(id, Weight::default()))
         .and_then(|f| face_cjk_center(f.data()));
     let (cjk_baseline_ratio, cjk_center_ratio) = match (cjk_line_y, cjk_face_center) {
         (Some(line_y), Some(center)) => (line_y / ref_px, center),
@@ -2288,7 +2661,7 @@ pub fn text_cursor_positions(
     }
 
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_size(Some(max_width), None);
+    buffer.set_size( Some(max_width), None);
     let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
     buffer.set_text(
         //font_system,
@@ -2307,7 +2680,7 @@ pub fn text_cursor_positions(
 
     for run in buffer.layout_runs() {
         for glyph in run.glyphs.iter() {
-            let start_idx = glyph.start as usize;
+            let start_idx = glyph.start;
             // Only record the first time we see each byte index.
             if start_idx > positions.last().map(|(i, _)| *i).unwrap_or(0) {
                 positions.push((start_idx, glyph.x));
@@ -2317,7 +2690,7 @@ pub fn text_cursor_positions(
         let line_end_x = run.line_w;
         // Find the last byte index of this run.
         if let Some(last_glyph) = run.glyphs.last() {
-            let end_idx = last_glyph.end as usize;
+            let end_idx = last_glyph.end;
             if end_idx > positions.last().map(|(i, _)| *i).unwrap_or(0) {
                 positions.push((end_idx, line_end_x));
             }
@@ -2424,8 +2797,8 @@ pub fn text_caret_layout(
     }
 
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_wrap( wrap.into());
-    buffer.set_size( Some(max_width), None);
+    buffer.set_wrap(wrap.into());
+    buffer.set_size(Some(max_width), None);
     let family = family_name.map(Family::Name).unwrap_or(Family::SansSerif);
     buffer.set_text(
         //font_system,
@@ -2454,8 +2827,8 @@ pub fn text_caret_layout(
         let first_real = run
             .glyphs
             .iter()
-            .find(|g| line_base + g.start as usize >= prefix_len);
-        let line_start_byte = to_orig(line_base + first_real.map(|g| g.start as usize).unwrap_or(0));
+            .find(|g| line_base + g.start >= prefix_len);
+        let line_start_byte = to_orig(line_base + first_real.map(|g| g.start).unwrap_or(0));
         out.push(CaretPos {
             byte: line_start_byte,
             x: 0.0,
@@ -2465,7 +2838,7 @@ pub fn text_caret_layout(
         });
 
         for g in run.glyphs.iter() {
-            let abs = line_base + g.start as usize;
+            let abs = line_base + g.start;
             if abs < prefix_len {
                 continue; // the direction mark — not a caret stop
             }
@@ -2485,7 +2858,7 @@ pub fn text_caret_layout(
         // Run-end caret (x = line width). For a hard newline this is the byte of
         // the '\n'; for a soft wrap it duplicates the next line's start byte.
         if let Some(last) = run.glyphs.last() {
-            let end_b = to_orig(line_base + last.end as usize);
+            let end_b = to_orig(line_base + last.end);
             if out.last().map(|p| p.byte) != Some(end_b) {
                 out.push(CaretPos {
                     byte: end_b,
@@ -2698,12 +3071,12 @@ pub fn text_visual_layout(
         let lt = run.line_top;
         let lh = run.line_height;
         for g in run.glyphs.iter() {
-            let abs = line_base + g.start as usize;
+            let abs = line_base + g.start;
             if abs < prefix_len {
                 continue; // the zero-width direction mark
             }
             let a = to_orig(abs);
-            let b = to_orig(line_base + g.end as usize);
+            let b = to_orig(line_base + g.end);
             out.push(VisualGlyph {
                 byte_start: a.min(b),
                 byte_end: a.max(b),
@@ -2748,11 +3121,21 @@ pub fn selection_rects(glyphs: &[VisualGlyph], sel_start: usize, sel_end: usize)
             if s <= cur.1 + EPS {
                 cur.1 = cur.1.max(e);
             } else {
-                out.push(SelRect { x: cur.0, y: lt, w: cur.1 - cur.0, h: lh });
+                out.push(SelRect {
+                    x: cur.0,
+                    y: lt,
+                    w: cur.1 - cur.0,
+                    h: lh,
+                });
                 cur = (s, e);
             }
         }
-        out.push(SelRect { x: cur.0, y: lt, w: cur.1 - cur.0, h: lh });
+        out.push(SelRect {
+            x: cur.0,
+            y: lt,
+            w: cur.1 - cur.0,
+            h: lh,
+        });
     }
     out
 }
@@ -2789,10 +3172,7 @@ pub fn visual_caret_neighbor(glyphs: &[VisualGlyph], cursor_byte: usize, dir: i3
             .filter(|s| s.byte == cursor_byte)
             .max_by(|a, b| a.x.total_cmp(&b.x))
     };
-    let Some(&CaretStop {
-        x: cur_x, line, ..
-    }) = cur
-    else {
+    let Some(&CaretStop { x: cur_x, line, .. }) = cur else {
         return cursor_byte;
     };
     const EPS: f32 = 0.01;
@@ -2936,18 +3316,25 @@ fn ellipsize_to_width(
     family: Family,
     weight: Weight,
     style: Style,
+    letter_spacing: f32,
 ) -> String {
     if content.is_empty() || !max_width.is_finite() || max_width <= 0.0 {
         return content.to_string();
     }
     let metrics = Metrics::new(font_size, line_height);
-    let attrs = || Attrs::new().family(family).weight(weight).style(style);
+    let attrs = || {
+        Attrs::new()
+            .family(family)
+            .weight(weight)
+            .style(style)
+            .letter_spacing(letter_spacing)
+    };
 
     // Shape the full content on a single line.
     let mut buffer = Buffer::new(fs, metrics);
-    buffer.set_wrap( Wrap::None);
-    buffer.set_size( None, None);
-    buffer.set_text( content, &attrs(), Shaping::Advanced, None,);
+    buffer.set_wrap(Wrap::None);
+    buffer.set_size(None, None);
+    buffer.set_text(content, &attrs(), Shaping::Advanced, None);
     buffer.shape_until_scroll(fs, false);
 
     let full_w = buffer
@@ -2962,7 +3349,7 @@ fn ellipsize_to_width(
     let mut ell = Buffer::new(fs, metrics);
     ell.set_wrap(Wrap::None);
     ell.set_size(None, None);
-    ell.set_text("…", &attrs(), Shaping::Advanced,None,);
+    ell.set_text("…", &attrs(), Shaping::Advanced,None);
     ell.shape_until_scroll(fs, false);
     let ellipsis_w = ell.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
 
@@ -3011,6 +3398,19 @@ impl From<[f32; 4]> for Underline {
     fn from(c: [f32; 4]) -> Self {
         Underline::Color(c)
     }
+}
+
+/// A colour/underline override over a half-open byte range of a [`TextBlock`]'s
+/// existing [`TextBlock::content`]. Ranges avoid copying text into one `String`
+/// per token and should be sorted, non-overlapping, and on UTF-8 boundaries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextStyleRange {
+    /// Half-open byte range in [`TextBlock::content`].
+    pub range: std::ops::Range<usize>,
+    /// Per-range fill colour, or `None` to inherit the block colour.
+    pub color: Option<[f32; 4]>,
+    /// Underline style for this range.
+    pub underline: Underline,
 }
 
 /// A run of text within a [`TextBlock`] with optional per-span colour and
@@ -3100,6 +3500,8 @@ pub struct TextBlock {
     pub line_height: f32,
     /// Layout box width in pixels; wrapping and alignment are relative to this.
     pub max_width: f32,
+    /// Additional spacing between glyphs in pixels (default `0.0`).
+    pub letter_spacing: f32,
     /// Global fill colour (overridden per-run by coloured [`spans`](Self::spans)).
     pub color: Color,
     /// Optional clip rectangle; glyphs outside it are not drawn.
@@ -3135,6 +3537,12 @@ pub struct TextBlock {
     /// draw time and need not be set by the caller. All spans must share the
     /// block's global font attributes (see [`TextSpan`]).
     pub spans: Vec<TextSpan>,
+    /// Sorted byte-range style overrides over `content`. Unlike `spans`, these
+    /// retain the original content and allocate no string per styled token.
+    pub style_ranges: std::sync::Arc<Vec<TextStyleRange>>,
+    /// Draw-list tint applied lazily to range colours during glyph placement.
+    /// Keeping it separate preserves shared range storage under tinted scopes.
+    pub style_range_tint: [f32; 4],
     /// Line-wrapping policy when the content exceeds `max_width` (default
     /// [`WrapMode::WordOrGlyph`], matching the historical implicit behaviour).
     /// Ignored in `ellipsize` mode, which always lays out on a single line.
@@ -3149,7 +3557,6 @@ pub struct TextBlock {
     /// horizontally within [`max_width`](Self::with_max_width) (`Start`/`Left`,
     /// `Center`, `End`/`Right`). See [`with_vertical`](Self::with_vertical).
     pub vertical: bool,
-
     pub current_transform: Affine2,
 }
 
@@ -3164,6 +3571,7 @@ impl TextBlock {
             font_size: 16.0,
             line_height: 20.0,
             max_width: 800.0,
+            letter_spacing: 0.0,
             color: Color::rgb(255, 255, 255),
             clip: None,
             outline: None,
@@ -3176,6 +3584,8 @@ impl TextBlock {
             weight: Weight::NORMAL,
             style: Style::Normal,
             spans: Vec::new(),
+            style_ranges: std::sync::Arc::new(Vec::new()),
+            style_range_tint: [1.0; 4],
             wrap: WrapMode::default(),
             vertical: false,
             current_transform: Affine2::IDENTITY,
@@ -3193,6 +3603,12 @@ impl TextBlock {
     /// Set the layout box width (px) that wrapping and alignment are relative to.
     pub fn with_max_width(mut self, width: f32) -> Self {
         self.max_width = width;
+        self
+    }
+
+    /// Set additional spacing between glyphs in pixels.
+    pub fn with_letter_spacing(mut self, letter_spacing: f32) -> Self {
+        self.letter_spacing = letter_spacing;
         self
     }
 
@@ -3342,6 +3758,24 @@ impl TextBlock {
     /// must share the block's global font attributes).
     pub fn with_spans(mut self, spans: Vec<TextSpan>) -> Self {
         self.spans = spans;
+        self.style_ranges = std::sync::Arc::new(Vec::new());
+        self
+    }
+
+    /// Apply sorted byte-range styles without replacing or copying `content`.
+    /// Invalid/out-of-order ranges are ignored defensively by colour resolution;
+    /// callers should produce non-overlapping ranges on UTF-8 boundaries.
+    pub fn with_style_ranges(mut self, ranges: Vec<TextStyleRange>) -> Self {
+        self.style_ranges = std::sync::Arc::new(ranges);
+        self.spans.clear();
+        self
+    }
+
+    /// Apply shared sorted byte-range styles. Cloning the `Arc` is constant time,
+    /// making this suitable for retained editor caches submitted every frame.
+    pub fn with_shared_style_ranges(mut self, ranges: std::sync::Arc<Vec<TextStyleRange>>) -> Self {
+        self.style_ranges = ranges;
+        self.spans.clear();
         self
     }
 
@@ -3358,14 +3792,14 @@ impl TextBlock {
 mod tests {
     use super::{
         CaretPos, FontHandle, FontVMetrics, LINE_HEIGHT_RATIO, MsdfVertex, SelRect, TextAlign,
-        TextBlock, TextDirection, TextMeasurer, TextRenderer, TextSpan, VisualGlyph, WrapMode,
-        byte_at_point, byte_on_adjacent_line, caret_for_byte, color_to_rgba, cosmic_align,
-        direction_prefix, ellipsize_to_width, field_reach, has_cjk, has_lowercase, load_font_bytes,
-        measure_with_font_system, resolve_span_color, selection_rects, shared_font_system,
-        text_caret_layout, text_cursor_positions, text_visual_layout, Underline, vcentered_line_y,
-        vertical_stack_string, visual_caret_neighbor,
+        TextBlock, TextDirection, TextMeasurer, TextRenderer, TextSpan, TextStyleRange, Underline,
+        VisualGlyph, WrapMode, byte_at_point, byte_on_adjacent_line, caret_for_byte, color_to_rgba,
+        cosmic_align, direction_prefix, ellipsize_to_width, field_reach, has_cjk, has_lowercase,
+        load_font_bytes, measure_with_font_system, resolve_range_color, resolve_span_color,
+        selection_rects, shape_key, shared_font_system, text_caret_layout, text_cursor_positions,
+        text_visual_layout, vcentered_line_y, vertical_stack_string, visual_caret_neighbor,
     };
-    use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping, Style, Weight};
+    use glyphon::cosmic_text::{Attrs, Buffer, Color, Family, Metrics, Shaping, Style, Weight};
 
     // ---- TextSpan / resolve_span_color ----
 
@@ -3413,6 +3847,26 @@ mod tests {
     #[test]
     fn resolve_span_color_empty_spans_returns_none() {
         assert_eq!(resolve_span_color(0, &[]), None);
+    }
+
+    #[test]
+    fn resolve_range_color_binary_searches_sorted_ranges() {
+        let ranges = vec![
+            super::TextStyleRange {
+                range: 0..5,
+                color: Some(red()),
+                underline: Underline::None,
+            },
+            super::TextStyleRange {
+                range: 8..12,
+                color: Some(blue()),
+                underline: Underline::None,
+            },
+        ];
+        assert_eq!(resolve_range_color(4, &ranges), Some(red()));
+        assert_eq!(resolve_range_color(5, &ranges), None);
+        assert_eq!(resolve_range_color(9, &ranges), Some(blue()));
+        assert_eq!(resolve_range_color(12, &ranges), None);
     }
 
     #[test]
@@ -3699,7 +4153,16 @@ mod tests {
     fn caret_layout(text: &str, wrap: WrapMode, max_width: f32) -> Vec<CaretPos> {
         let fsh = shared_font_system();
         let mut fs = fsh.lock().unwrap();
-        text_caret_layout(&mut fs, text, 16.0, 20.0, max_width, wrap, None, TextDirection::Auto)
+        text_caret_layout(
+            &mut fs,
+            text,
+            16.0,
+            20.0,
+            max_width,
+            wrap,
+            None,
+            TextDirection::Auto,
+        )
     }
 
     #[test]
@@ -3870,6 +4333,33 @@ mod tests {
     }
 
     #[test]
+    fn positive_letter_spacing_changes_width_and_uses_distinct_cache_entry() {
+        let mut measurer = TextMeasurer::new();
+        let plain = TextBlock::new("Spacing", 0.0, 0.0).with_size(20.0);
+        let spaced = plain.clone().with_letter_spacing(3.0);
+        assert_ne!(shape_key(&plain), shape_key(&spaced));
+
+        let plain_size = measurer.measure_block(&plain);
+        assert_eq!(measurer.cache_entries, 1);
+        let spaced_size = measurer.measure_block(&spaced);
+        assert_eq!(
+            measurer.cache_entries, 2,
+            "spacing must distinguish cache keys"
+        );
+        assert!(
+            spaced_size.0 > plain_size.0,
+            "positive spacing should widen text: plain={}, spaced={}",
+            plain_size.0,
+            spaced_size.0
+        );
+        assert_eq!(measurer.measure_block(&plain), plain_size);
+        assert_eq!(
+            measurer.cache_entries, 2,
+            "repeat should hit plain cache entry"
+        );
+    }
+
+    #[test]
     fn clear_cache_forces_remeasure_without_changing_result() {
         let mut measurer = TextMeasurer::new();
         let before = measurer.measure("Persistent", 18.0, None);
@@ -3974,8 +4464,16 @@ mod tests {
     #[test]
     fn direction_and_align_defaults_and_builders() {
         let plain = TextBlock::new("x", 0.0, 0.0);
-        assert_eq!(plain.align, TextAlign::Start, "default align is reading-start");
-        assert_eq!(plain.direction, TextDirection::Auto, "default direction is auto");
+        assert_eq!(
+            plain.align,
+            TextAlign::Start,
+            "default align is reading-start"
+        );
+        assert_eq!(
+            plain.direction,
+            TextDirection::Auto,
+            "default direction is auto"
+        );
 
         let forced = TextBlock::new("x", 0.0, 0.0)
             .with_direction(TextDirection::Rtl)
@@ -3992,9 +4490,9 @@ mod tests {
         // prefix mechanism without a GPU.
         let fs = shared_font_system();
         let mut guard = fs.lock().unwrap();
-        let leftmost = |guard: &mut glyphon::FontSystem, prefix: &str| -> f32 {
+        let leftmost = |guard: &mut glyphon::cosmic_text::FontSystem, prefix: &str| -> f32 {
             let mut buffer = Buffer::new(guard, Metrics::new(16.0, 20.0));
-            buffer.set_size(Some(400.0), None);
+            buffer.set_size( Some(400.0), None);
             buffer.set_text(
                 //guard,
                 &format!("{prefix}short"),
@@ -4050,11 +4548,18 @@ mod tests {
         // Selecting logical [1,4) covers b (LTR, x 10..20) and ג (RTL, x 30..40),
         // skipping ד (x 20..30) which is outside the range → two disjoint rects.
         let rects = selection_rects(&bidi_line(), 1, 4);
-        assert_eq!(rects.len(), 2, "bidi-straddling selection is two visual spans");
+        assert_eq!(
+            rects.len(),
+            2,
+            "bidi-straddling selection is two visual spans"
+        );
         let mut xs: Vec<f32> = rects.iter().map(|r| r.x).collect();
         xs.sort_by(f32::total_cmp);
         assert!((xs[0] - 10.0).abs() < 0.6, "first span starts at b: {xs:?}");
-        assert!((xs[1] - 30.0).abs() < 0.6, "second span starts at ג: {xs:?}");
+        assert!(
+            (xs[1] - 30.0).abs() < 0.6,
+            "second span starts at ג: {xs:?}"
+        );
     }
 
     #[test]
@@ -4063,12 +4568,18 @@ mod tests {
         let rects = selection_rects(&bidi_line(), 0, 2);
         assert_eq!(rects.len(), 1);
         let r = rects[0];
-        assert!(r.x.abs() < 0.6 && (r.w - 20.0).abs() < 0.6, "merged ab span: {r:?}");
+        assert!(
+            r.x.abs() < 0.6 && (r.w - 20.0).abs() < 0.6,
+            "merged ab span: {r:?}"
+        );
     }
 
     #[test]
     fn selection_rects_empty_when_degenerate() {
-        assert!(selection_rects(&bidi_line(), 3, 3).is_empty(), "empty range");
+        assert!(
+            selection_rects(&bidi_line(), 3, 3).is_empty(),
+            "empty range"
+        );
         assert!(selection_rects(&[], 0, 5).is_empty(), "no glyphs");
     }
 
@@ -4156,7 +4667,12 @@ mod tests {
     // builds that compile only a subset of tests.
     #[allow(dead_code)]
     fn _selrect_is_constructible() -> SelRect {
-        SelRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }
+        SelRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        }
     }
 
     #[test]
@@ -4346,6 +4862,7 @@ mod tests {
             Family::SansSerif,
             Weight::NORMAL,
             Style::Normal,
+            0.0,
         );
         assert_eq!(out, "short");
     }
@@ -4365,6 +4882,7 @@ mod tests {
             Family::SansSerif,
             Weight::NORMAL,
             Style::Normal,
+            0.0,
         );
         assert_ne!(out, long, "overflowing text should be truncated");
         assert!(
@@ -4383,6 +4901,7 @@ mod tests {
             Style::Normal,
             WrapMode::default(),
             false,
+            0.0,
         );
         assert!(w <= max_width, "ellipsized width {w} must fit {max_width}");
     }
@@ -4401,6 +4920,7 @@ mod tests {
             Family::SansSerif,
             Weight::NORMAL,
             Style::Normal,
+            0.0,
         );
         assert_eq!(out, "…");
     }
@@ -4480,6 +5000,7 @@ mod tests {
             Style::Normal,
             WrapMode::default(),
             false,
+            0.0,
         );
         let final_x = pos.last().map(|(_, x)| *x).unwrap_or(0.0);
         // The final x-position should approximate the measured width.
@@ -4531,13 +5052,13 @@ mod tests {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: false,
-            apply_limit_buckets: false,
+            apply_limit_buckets: false
         })).ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("text-cache test device"),
                 ..Default::default()
-            }
+            },
         ))
         .ok()?;
         let fs = shared_font_system();
@@ -4680,8 +5201,16 @@ mod tests {
         // but `byte_start` is corrected back so per-span colour resolution is
         // unaffected. The set of emitted fills must match between Auto and Rtl.
         let spans = vec![
-            TextSpan { text: "AB".into(), color: Some(red()), underline: Underline::None },
-            TextSpan { text: "cd".into(), color: Some(blue()), underline: Underline::None },
+            TextSpan {
+                text: "AB".into(),
+                color: Some(red()),
+                underline: Underline::None,
+            },
+            TextSpan {
+                text: "cd".into(),
+                color: Some(blue()),
+                underline: Underline::None,
+            },
         ];
         let auto = label("ABcd", &font).with_spans(spans.clone());
         let rtl = label("ABcd", &font)
@@ -4749,6 +5278,129 @@ mod tests {
         let after = r.build_vertices(&blocks);
         assert_eq!(cache_total(&r), 1, "re-shaped and re-cached");
         assert_eq!(vbytes(&before), vbytes(&after), "re-shape is identical");
+    }
+
+    // ---- per-glyph byte mapping (style ranges / syntax highlighting) ----
+
+    /// A glyph's `byte_start` must address the **whole block content**, not its
+    /// buffer line. cosmic-text reports `glyph.start` relative to the original
+    /// text *line*, so the horizontal shaping path must rebase it by the line's
+    /// starting byte — exactly what `text_caret_layout`, `text_visual_layout`,
+    /// and the vertical shaping branch already do. Without the rebase, every
+    /// line after the first resolves style ranges against earlier lines' bytes
+    /// and syntax highlighting drifts off the text it describes.
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn style_ranges_map_to_the_correct_glyphs_across_lines() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        // Two lines; the second starts at byte 4 ("RED\n"). Only the first
+        // line's bytes carry a style range, so only "RED" may render red. The
+        // block colour is white — any red on line 2 is the bug.
+        let content = "RED\nBLUE";
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let block = label(content, &font)
+            .with_wrap(WrapMode::None)
+            .with_style_ranges(vec![TextStyleRange {
+                range: 0..3,
+                color: Some(red),
+                underline: Underline::None,
+            }]);
+        let verts = r.build_vertices(&[block]);
+
+        // Fills are the last back-to-front sweep, one 6-vert quad per glyph.
+        // With the line-rebase fix exactly "RED" (3 glyphs) is red; the bug
+        // mapped "BLUE"'s line-relative bytes (0..3) into the same range and
+        // turned B/L/U red too (6 red quads).
+        let red_quads: Vec<_> = verts.chunks_exact(6).filter(|q| q[0].fill == red).collect();
+        assert_eq!(
+            red_quads.len(),
+            3,
+            "only the 3 glyphs of the styled range may resolve to the range colour"
+        );
+        let first_line_bottom = 40.0 + 18.0 * super::LINE_HEIGHT_RATIO; // block.y + one line box
+        for quad in &red_quads {
+            let y = quad[0].position[1];
+            assert!(
+                y < first_line_bottom,
+                "red glyph quad at y={y} is below the first line — \
+                 style bytes leaked across lines"
+            );
+        }
+    }
+
+    /// Same mapping with an explicit base direction: the 3-byte zero-width LRM
+    /// sits once at the head of the shaped string. Line bases are computed over
+    /// the *shaped* text (mark included), and the prefix is subtracted once from
+    /// the absolute byte — so line 2's glyphs must land on caller bytes 8.. and
+    /// stay white; the styled range still colours only line 1's "RED".
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn style_ranges_stay_aligned_with_a_direction_prefix() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        let content = "RED\nBLUE";
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let block = label(content, &font)
+            .with_wrap(WrapMode::None)
+            .with_direction(TextDirection::Ltr)
+            .with_style_ranges(vec![TextStyleRange {
+                range: 0..3,
+                color: Some(red),
+                underline: Underline::None,
+            }]);
+        let verts = r.build_vertices(&[block]);
+        assert_eq!(
+            verts.chunks_exact(6).filter(|q| q[0].fill == red).count(),
+            3
+        );
+    }
+
+    /// Soft-wrap mapping: a narrow `max_width` splits "REDBLUE" into several
+    /// visual rows of the *same* buffer line. Every row's glyphs must keep
+    /// addressing their true content bytes — the styled "RED" prefix stays red
+    /// and the rest falls back to the block colour, never the reverse.
+    #[test]
+    #[ignore = "requires a GPU adapter (DISPLAY=:0)"]
+    fn style_ranges_survive_soft_wrapping() {
+        let Some((_d, _q, mut r, font)) = headless_renderer() else {
+            return;
+        };
+        // Wide-ish glyphs at 18px: force a wrap after ~3 glyphs.
+        let content = "REDBLUE";
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let block = label(content, &font)
+            .with_max_width(40.0)
+            .with_style_ranges(vec![TextStyleRange {
+                range: 0..3,
+                color: Some(red),
+                underline: Underline::None,
+            }]);
+        let verts = r.build_vertices(&[block]);
+        let quads: Vec<_> = verts.chunks_exact(6).collect();
+        assert!(quads.len() >= 7, "every letter produced a quad");
+        // The red ones are exactly the 3 "R E D" glyphs, and they sit on the
+        // top row (smallest y).
+        let mut reds: Vec<[f32; 2]> = quads
+            .iter()
+            .filter(|q| q[0].fill == red)
+            .map(|q| q[0].position)
+            .collect();
+        reds.sort_by(|a, b| a[1].total_cmp(&b[1]).then(a[0].total_cmp(&b[0])));
+        assert_eq!(reds.len(), 3);
+        let top_y = quads
+            .iter()
+            .map(|q| q[0].position[1])
+            .fold(f32::MAX, f32::min);
+        for p in &reds {
+            assert!(
+                (p[1] - top_y).abs() < 1.0,
+                "red quad at {:?} left the top row — wrap rows mis-resolve ranges",
+                p
+            );
+        }
     }
 
     // ---- optical vertical centring metrics ----
@@ -4844,6 +5496,111 @@ mod tests {
         assert_eq!(v.band_ratio(has_lowercase("OK")), v.cap_ratio);
     }
 
+    // ---- Ink band ----
+
+    #[test]
+    fn ink_band_sits_inside_the_line_box() {
+        let mut m = TextMeasurer::new();
+        let block = TextBlock::new("Medium", 0.0, 0.0).with_size(16.0);
+        let (_, line_h) = m.measure_block(&block);
+        let (top, bottom) = m.measure_block_ink(&block).expect("glyphs ink");
+        assert!(
+            top > 0.0 && bottom < line_h,
+            "ink {top}..{bottom} should sit strictly inside the {line_h}px line box"
+        );
+        // Leading above the ascent is what makes the line box taller than the
+        // ink, and it is exactly what `vcentered_text_y` compensates for.
+        assert!(
+            bottom - top < line_h,
+            "ink height {} should be under the line box {line_h}",
+            bottom - top
+        );
+    }
+
+    #[test]
+    fn a_descender_reaches_below_a_baseline_only_glyph() {
+        let mut m = TextMeasurer::new();
+        let no_desc = TextBlock::new("mow", 0.0, 0.0).with_size(16.0);
+        let desc = TextBlock::new("mop", 0.0, 0.0).with_size(16.0);
+        let (_, b_no) = m.measure_block_ink(&no_desc).expect("inks");
+        let (_, b_yes) = m.measure_block_ink(&desc).expect("inks");
+        assert!(
+            b_yes > b_no,
+            "the 'p' descender should extend the band: {b_no} vs {b_yes}"
+        );
+    }
+
+    #[test]
+    fn an_ascender_reaches_above_an_x_height_glyph() {
+        let mut m = TextMeasurer::new();
+        let low = TextBlock::new("nom", 0.0, 0.0).with_size(16.0);
+        let tall = TextBlock::new("nomd", 0.0, 0.0).with_size(16.0);
+        let (t_low, _) = m.measure_block_ink(&low).expect("inks");
+        let (t_tall, _) = m.measure_block_ink(&tall).expect("inks");
+        assert!(
+            t_tall < t_low,
+            "the 'd' ascender should raise the band top: {t_low} vs {t_tall}"
+        );
+    }
+
+    #[test]
+    fn text_without_outlines_inks_nothing() {
+        let mut m = TextMeasurer::new();
+        assert_eq!(
+            m.measure_block_ink(&TextBlock::new("", 0.0, 0.0).with_size(16.0)),
+            None
+        );
+        assert_eq!(
+            m.measure_block_ink(&TextBlock::new("   ", 0.0, 0.0).with_size(16.0)),
+            None,
+            "spaces have no outline, so there is no ink band to report"
+        );
+    }
+
+    #[test]
+    fn ink_band_scales_with_font_size() {
+        let mut m = TextMeasurer::new();
+        let small = m
+            .measure_block_ink(&TextBlock::new("Medium", 0.0, 0.0).with_size(10.0))
+            .expect("inks");
+        let large = m
+            .measure_block_ink(&TextBlock::new("Medium", 0.0, 0.0).with_size(20.0))
+            .expect("inks");
+        let ratio = (large.1 - large.0) / (small.1 - small.0);
+        assert!(
+            (ratio - 2.0).abs() < 0.05,
+            "doubling the font size should double the ink height (got {ratio}x)"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_block_inks_across_every_line() {
+        let mut m = TextMeasurer::new();
+        let one = TextBlock::new("Medium", 0.0, 0.0).with_size(16.0);
+        let mut two = TextBlock::new("Medium medium", 0.0, 0.0).with_size(16.0);
+        two.max_width = 50.0; // forces a wrap
+        let (_, h_two) = m.measure_block(&two);
+        assert!(h_two > m.measure_block(&one).1, "precondition: it wrapped");
+        let single = m.measure_block_ink(&one).expect("inks");
+        let wrapped = m.measure_block_ink(&two).expect("inks");
+        assert!(
+            wrapped.1 - wrapped.0 > single.1 - single.0,
+            "a wrapped block's ink must span its lines: {single:?} vs {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn ink_band_is_cached_per_key() {
+        let mut m = TextMeasurer::new();
+        let block = TextBlock::new("Medium", 0.0, 0.0).with_size(16.0);
+        let a = m.measure_block_ink(&block);
+        let b = m.measure_block_ink(&block); // cache hit
+        assert_eq!(a, b);
+        // A different size is a different key, so it must re-measure, not reuse.
+        let bigger = TextBlock::new("Medium", 0.0, 0.0).with_size(32.0);
+        assert_ne!(a, m.measure_block_ink(&bigger));
+    }
+
     #[test]
     fn embox_fallback_matches_line_box_centring() {
         // When a font lacks cap/x metrics, `resolve_vmetrics` stores the em-box
@@ -4904,8 +5661,14 @@ mod tests {
         let (vw, vh) = m.measure_vertical(text, 24.0);
         let (hw, hh) = m.measure(text, 24.0, None);
 
-        assert!(vh > vw, "vertical column should be taller than wide: {vw}x{vh}");
-        assert!(hw > hh, "horizontal run should be wider than tall: {hw}x{hh}");
+        assert!(
+            vh > vw,
+            "vertical column should be taller than wide: {vw}x{vh}"
+        );
+        assert!(
+            hw > hh,
+            "horizontal run should be wider than tall: {hw}x{hh}"
+        );
         // Stacked height ≈ 5 rows; clearly taller than the single-line height.
         assert!(
             vh > hh * 4.0,
@@ -5038,7 +5801,10 @@ mod tests {
             (30.0..70.0).contains(&min_x),
             "centred column should be inset ~half the slack from the left (min_x={min_x})"
         );
-        assert!(max_x < max_width, "column stays within max_width (max_x={max_x})");
+        assert!(
+            max_x < max_width,
+            "column stays within max_width (max_x={max_x})"
+        );
     }
 }
 
@@ -5104,11 +5870,12 @@ mod icon_tests {
     #[test]
     fn icon_atlas_generates_and_caches_a_tile() {
         let mut atlas = MsdfGlyphAtlas::with_params(ICON_REF_PX, DEFAULT_PX_RANGE);
-        let data = phosphor_font_data();
-        let gid = phosphor_glyph_id(PhosphorIcon::Plus).expect("Plus resolves");
+        let g = PhosphorIcon::Plus.glyph().expect("Plus resolves");
+        let data = icon_font_snapshot()[g.font.index() as usize];
+        let key = g.font.index() as u64;
 
         let t1 = atlas
-            .glyph(PHOSPHOR_FONT_ID, gid, data)
+            .glyph(key, g.glyph_id, data)
             .expect("Plus generates a tile");
         assert!(t1.region.w > 0 && t1.region.h > 0);
         // A real icon has horizontal and vertical extent.
@@ -5116,22 +5883,65 @@ mod icon_tests {
         assert!(t1.metrics.top_em > t1.metrics.bottom_em);
 
         // Cached: same tile, no new packing.
-        let t2 = atlas.glyph(PHOSPHOR_FONT_ID, gid, data).expect("cached");
+        let t2 = atlas.glyph(key, g.glyph_id, data).expect("cached");
         assert_eq!(t1, t2);
+    }
+
+    /// Two icon fonts share one atlas, so the resolution `render_icons` performs
+    /// — index the font snapshot by `IconGlyph::font`, key the atlas by the same
+    /// id — must give the *same glyph index* in different fonts different tiles.
+    /// Getting this wrong would silently draw font A's art for font B's icon.
+    #[cfg(all(feature = "phosphor-icons", feature = "bundled-font"))]
+    #[test]
+    fn two_icon_fonts_resolve_to_distinct_tiles_for_the_same_glyph_index() {
+        use crate::render::register_icon_font;
+
+        let other = register_icon_font("text-icons-under-test", notosans::REGULAR_TTF)
+            .expect("noto parses as a face");
+        let phosphor = PhosphorIcon::Gear.glyph().expect("gear resolves");
+        // Deliberately the *same* glyph index in the other font — the font id is
+        // the only thing that may distinguish these two.
+        let twin = IconGlyph {
+            font: other,
+            glyph_id: phosphor.glyph_id,
+        };
+
+        let fonts = icon_font_snapshot();
+        let mut atlas = MsdfGlyphAtlas::with_params(ICON_REF_PX, DEFAULT_PX_RANGE);
+        let a = atlas
+            .glyph(
+                phosphor.font.index() as u64,
+                phosphor.glyph_id,
+                fonts[phosphor.font.index() as usize],
+            )
+            .expect("phosphor tile");
+        let b = atlas
+            .glyph(
+                twin.font.index() as u64,
+                twin.glyph_id,
+                fonts[twin.font.index() as usize],
+            )
+            .expect("other-font tile");
+        assert_ne!(
+            a.region, b.region,
+            "same glyph index in two fonts must pack to two tiles"
+        );
     }
 
     #[test]
     fn push_icon_quad_emits_six_verts_with_tint_and_clip() {
         use crate::affine::Affine2;
         let mut atlas = MsdfGlyphAtlas::with_params(ICON_REF_PX, DEFAULT_PX_RANGE);
-        let data = phosphor_font_data();
-        let gid = phosphor_glyph_id(PhosphorIcon::Check).unwrap();
-        let tile = atlas.glyph(PHOSPHOR_FONT_ID, gid, data).unwrap();
+        let g = PhosphorIcon::Check.glyph().unwrap();
+        let data = icon_font_snapshot()[g.font.index() as usize];
+        let tile = atlas
+            .glyph(g.font.index() as u64, g.glyph_id, data)
+            .unwrap();
 
         let icon = IconMsdf {
             local: Rect::new(0.0, 0.0, 32.0, 32.0),
             transform: Affine2::translation(100.0, 50.0),
-            glyph_id: gid,
+            glyph: g,
             tint: [0.2, 0.4, 0.6, 1.0],
             clip: Some(Rect::new(0.0, 0.0, 200.0, 200.0)),
         };

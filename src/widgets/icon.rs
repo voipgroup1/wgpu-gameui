@@ -15,26 +15,41 @@
 //! ```ignore
 //! Icon::new(PhosphorIcon::Gear).draw(rect, &mut list);
 //! Icon::new(PhosphorIcon::Trash).tint([0.9, 0.2, 0.2, 1.0]).draw(rect, &mut list);
+//!
+//! // A glyph from an application-registered icon font.
+//! Icon::from_glyph(wedge).draw(rect, &mut list);
 //! ```
 
 use crate::layout::Rect;
-use crate::render::PhosphorIcon;
+use crate::render::{IconGlyph, PhosphorIcon};
 
 use super::DrawList;
 
-/// A vector icon ([`PhosphorIcon`]) drawn through the MSDF icon atlas.
+/// A vector icon — from the built-in [`PhosphorIcon`] set or any registered icon
+/// font — drawn through the MSDF icon atlas.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Icon {
-    icon: PhosphorIcon,
+    /// Resolved at construction. `None` when the source enum had no glyph in the
+    /// font, in which case the widget simply draws nothing.
+    glyph: Option<IconGlyph>,
     tint: [f32; 4],
 }
 
 impl Icon {
-    /// An icon at its natural color (white fill, modulated by the draw list's
-    /// current tint).
+    /// A built-in Phosphor icon at its natural color (white fill, modulated by
+    /// the draw list's current tint).
     pub fn new(icon: PhosphorIcon) -> Self {
         Self {
-            icon,
+            glyph: icon.glyph(),
+            tint: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+
+    /// An icon from a pre-resolved glyph — the route for a font registered with
+    /// [`register_icon_font`](crate::render::register_icon_font).
+    pub fn from_glyph(glyph: IconGlyph) -> Self {
+        Self {
+            glyph: Some(glyph),
             tint: [1.0, 1.0, 1.0, 1.0],
         }
     }
@@ -45,12 +60,18 @@ impl Icon {
         self
     }
 
-    /// Draw the icon fit-centered into `rect`. No-op for a zero-area rect.
+    /// Draw the icon fit-centered into `rect`. No-op for a zero-area rect or an
+    /// unresolvable glyph.
     pub fn draw(&self, rect: Rect, list: &mut DrawList) {
+        let Some(glyph) = self.glyph else {
+            return;
+        };
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return;
         }
-        list.icon_msdf(rect, self.icon, self.tint);
+        list.push_debug_scope_rect("Icon", rect);
+        list.icon_msdf(rect, glyph, self.tint);
+        list.pop_debug_scope();
     }
 }
 
@@ -75,6 +96,20 @@ mod tests {
             .tint([0.0, 1.0, 0.0, 1.0])
             .draw(Rect::new(0.0, 0.0, 16.0, 16.0), &mut list);
         assert_eq!(list.icons_msdf[0].tint, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    /// The two constructors must land on the same glyph for the same icon —
+    /// `from_glyph` is the escape hatch, not a different rendering path.
+    #[test]
+    fn from_glyph_matches_the_phosphor_constructor() {
+        let g = PhosphorIcon::Gear.glyph().expect("gear resolves");
+        let mut a = DrawList::new();
+        let mut b = DrawList::new();
+        let rect = Rect::new(4.0, 5.0, 20.0, 20.0);
+        Icon::new(PhosphorIcon::Gear).draw(rect, &mut a);
+        Icon::from_glyph(g).draw(rect, &mut b);
+        assert_eq!(a.icons_msdf, b.icons_msdf);
+        assert_eq!(a.icons_msdf[0].glyph, g);
     }
 
     #[test]

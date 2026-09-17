@@ -245,7 +245,8 @@ impl SpriteAtlas {
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| {
-                slot.as_ref().map(|s| (i as SpriteId, s.region.w, s.region.h))
+                slot.as_ref()
+                    .map(|s| (i as SpriteId, s.region.w, s.region.h))
             })
             .collect();
 
@@ -626,7 +627,9 @@ mod tests {
         let mut atlas = SpriteAtlas::new();
         let big = 256u32;
         let pixels = vec![0u8; (big * big * 4) as usize];
-        let ids: Vec<_> = (0..4).map(|_| atlas.insert(None, big, big, &pixels)).collect();
+        let ids: Vec<_> = (0..4)
+            .map(|_| atlas.insert(None, big, big, &pixels))
+            .collect();
         let footprint_before = atlas.next_shelf_y;
 
         // Remove two of the four, leaving shelf fragmentation (the shelf cursor
@@ -648,8 +651,8 @@ mod tests {
             for j in (i + 1)..regions.len() {
                 let a = regions[i];
                 let b = regions[j];
-                let separate = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y
-                    || b.y + b.h <= a.y;
+                let separate =
+                    a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
                 assert!(separate, "compacted regions overlap: {a:?} vs {b:?}");
             }
         }

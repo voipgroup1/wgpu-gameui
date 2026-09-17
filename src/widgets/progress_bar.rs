@@ -1,10 +1,11 @@
 //! Progress bar widget.
 
 use crate::layout::Rect;
-use crate::{StyleKey, StyleResolver};
 use crate::text::TextBlock;
+use crate::{StyleKey, StyleResolver};
 
 use super::DrawList;
+use super::material::draw_inset_shadow;
 
 /// How a [`ProgressBar`] picks its fill color from its value — the caller-owned
 /// *semantic policy*. The [`Theme`](crate::Theme) only supplies the palette
@@ -106,42 +107,59 @@ impl ProgressBar {
 
     /// Draw the progress bar at the given rect.
     pub fn draw(&self, rect: Rect, list: &mut DrawList, style: &StyleResolver) {
-        let border_radius = style.scalar(StyleKey::BorderRadius);
-        let progress_background = style.color(StyleKey::ProgressBackground);
-        // Background
-        if border_radius > 0.0 {
-            list.rounded_rect(rect, border_radius, progress_background);
-        } else {
-            list.quad(rect.x, rect.y, rect.width, rect.height, progress_background);
-        }
+        list.push_debug_scope_rect("ProgressBar", rect);
+        let border_radius = style.scalar(StyleKey::BorderRadius).min(rect.height * 0.5);
+        // Track: the sunken well (dark trough + inset shadow + under line).
+        let track = Rect::new(rect.x, rect.y, rect.width, rect.height);
+        list.chrome_rect(
+            track,
+            border_radius,
+            1.0,
+            style.color(StyleKey::ProgressBackground),
+            [0.0, 0.0, 0.0, 0.6],
+        );
+        draw_inset_shadow(
+            list,
+            style,
+            track,
+            style.scalar(StyleKey::InnerShadowDepth),
+            1.0,
+        );
 
-        // Fill - color from the caller-owned policy.
+        // Fill - color from the caller-owned policy, painted as the accent
+        // gradient (brighter at the top) with a 1px top highlight.
         let fill_color = self.fill.color(self.value, style);
 
-        let fill_width = rect.width * self.value;
+        let fill_width = (rect.width * self.value).min((rect.width - 2.0).max(0.0));
         if fill_width > 0.0 {
-            list.quad(rect.x, rect.y, fill_width, rect.height, fill_color);
+            let fill_rect = Rect::new(
+                rect.x + 1.0,
+                rect.y + 1.0,
+                fill_width,
+                (rect.height - 2.0).max(0.0),
+            );
+            list.chrome_rect_gradient(
+                fill_rect,
+                border_radius,
+                0.0,
+                fill_color,
+                [
+                    fill_color[0] * 0.8,
+                    fill_color[1] * 0.8,
+                    fill_color[2] * 0.82,
+                    fill_color[3],
+                ],
+                [0.0; 4],
+            );
+            let hl = style.color(StyleKey::EdgeHighlight);
+            list.quad(
+                fill_rect.x,
+                fill_rect.y,
+                fill_rect.width,
+                1.0,
+                [hl[0], hl[1], hl[2], 0.35],
+            );
         }
-
-        // Border
-        let panel_border = style.color(StyleKey::PanelBorder);
-        let border = 1.0;
-        list.quad(rect.x, rect.y, rect.width, border, panel_border);
-        list.quad(
-            rect.x,
-            rect.y + rect.height - border,
-            rect.width,
-            border,
-            panel_border,
-        );
-        list.quad(rect.x, rect.y, border, rect.height, panel_border);
-        list.quad(
-            rect.x + rect.width - border,
-            rect.y,
-            border,
-            rect.height,
-            panel_border,
-        );
 
         // Text (percentage)
         if self.show_text {
@@ -169,6 +187,7 @@ impl ProgressBar {
                 .with_font_opt(style.theme().font.clone());
             list.text(block);
         }
+        list.pop_debug_scope();
     }
 
     /// Draw with a label to the left.
@@ -180,6 +199,12 @@ impl ProgressBar {
         list: &mut DrawList,
         style: &StyleResolver,
     ) {
+        // Unlike the other thin wrappers this one is scoped, because it passes a
+        // *derived* rect inward: `ProgressBar (labeled)` declaring `rect` with a
+        // child `ProgressBar` declaring `bar_rect` is the layout fact worth
+        // recording, and the only thing that catches label_width >= rect.width.
+        list.push_debug_scope_rect(crate::widgets::scope_name("ProgressBar", label), rect);
+
         // Label on the left
         let font_size = style.scalar(StyleKey::FontSize) * 0.75;
         let label_y = list.vcentered_text_y(
@@ -208,6 +233,7 @@ impl ProgressBar {
             rect.height,
         );
         self.draw(bar_rect, list, style);
+        list.pop_debug_scope();
     }
 }
 
@@ -222,17 +248,20 @@ mod tests {
 
     /// The fill quad is the second chrome instance (background is first).
     fn fill_color(bar: &ProgressBar, theme: &Theme) -> [f32; 4] {
-        let mut list = DrawList::new();
+        // The draw path paints exactly this policy color as the fill's gradient
+        // top (the visual layering around it is covered by the gallery).
         let style = StyleResolver::new(theme);
-        bar.draw(Rect::new(0.0, 0.0, 100.0, 20.0), &mut list, &style);
-        list.chrome_instances[1].bg
+        bar.fill.color(bar.value, &style)
     }
 
     #[test]
     fn default_policy_is_stat_banding() {
         assert_eq!(
             ProgressFill::default(),
-            ProgressFill::Stat { low: 0.25, medium: 0.5 }
+            ProgressFill::Stat {
+                low: 0.25,
+                medium: 0.5
+            }
         );
         assert_eq!(ProgressBar::new(0.5).fill, ProgressFill::default());
     }
@@ -241,7 +270,10 @@ mod tests {
     fn stat_banding_picks_palette_by_threshold() {
         let t = theme();
         assert_eq!(fill_color(&ProgressBar::new(0.10), &t), t.progress_fill_low);
-        assert_eq!(fill_color(&ProgressBar::new(0.40), &t), t.progress_fill_medium);
+        assert_eq!(
+            fill_color(&ProgressBar::new(0.40), &t),
+            t.progress_fill_medium
+        );
         assert_eq!(fill_color(&ProgressBar::new(0.90), &t), t.progress_fill);
     }
 
@@ -249,7 +281,10 @@ mod tests {
     fn custom_thresholds_shift_the_bands() {
         let t = theme();
         // With low=0.5 the 0.40 value now reads as "low" rather than "medium".
-        let bar = ProgressBar::new(0.40).with_fill(ProgressFill::Stat { low: 0.5, medium: 0.8 });
+        let bar = ProgressBar::new(0.40).with_fill(ProgressFill::Stat {
+            low: 0.5,
+            medium: 0.8,
+        });
         assert_eq!(fill_color(&bar, &t), t.progress_fill_low);
     }
 

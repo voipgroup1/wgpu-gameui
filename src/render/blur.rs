@@ -14,8 +14,14 @@
 //!
 //! Pass A blurs horizontally from the scene into a (downsampled) intermediate;
 //! pass B blurs vertically from the intermediate into the target.
+//!
+//! Both passes are recorded into one encoder, and so is any second
+//! `blur_backdrop` call in the same frame, so each pass takes its own uniform slot
+//! from a per-frame arena — see [`uniform_arena`](super::uniform_arena).
 
 use bytemuck::{Pod, Zeroable};
+
+use crate::render::UniformArena;
 
 const SHADER: &str = include_str!("blur.wgsl");
 
@@ -75,13 +81,11 @@ pub(crate) struct Blur {
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     src_bgl: wgpu::BindGroupLayout,
-    // One uniform buffer per pass: both passes are recorded into the same
-    // encoder before submit, so a single shared buffer would let pass B's
-    // contents clobber pass A's before the GPU runs either.
-    uniform_a: wgpu::Buffer,
-    uniform_b: wgpu::Buffer,
-    uniform_bg_a: wgpu::BindGroup,
-    uniform_bg_b: wgpu::BindGroup,
+    // One uniform slot per pass, from a per-frame arena: both passes are recorded
+    // into one encoder before submit, so a shared slot would let pass B's contents
+    // clobber pass A's before the GPU runs either — and a second `blur_backdrop`
+    // call in the same frame would clobber the first call's. See `uniform_arena`.
+    uniforms: UniformArena,
     inter: Option<Intermediate>,
     format: wgpu::TextureFormat,
 }
@@ -103,19 +107,13 @@ impl Blur {
             ..Default::default()
         });
 
-        let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("blur uniform bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let uniforms = UniformArena::new(
+            device,
+            "blur uniform",
+            std::mem::size_of::<BlurUniforms>() as u64,
+            wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+        );
+        let uniform_bgl = uniforms.layout();
 
         let src_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blur source bgl"),
@@ -143,7 +141,6 @@ impl Blur {
             label: Some("blur pipeline layout"),
             bind_group_layouts: &[Some(&uniform_bgl), Some(&src_bgl)],
             immediate_size: 0,
-
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -175,47 +172,20 @@ impl Blur {
             cache: None,
         });
 
-        let uniform_size = std::mem::size_of::<BlurUniforms>() as u64;
-        let uniform_a = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("blur uniform A"),
-            size: uniform_size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let uniform_b = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("blur uniform B"),
-            size: uniform_size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let uniform_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blur uniform bg A"),
-            layout: &uniform_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_a.as_entire_binding(),
-            }],
-        });
-        let uniform_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blur uniform bg B"),
-            layout: &uniform_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_b.as_entire_binding(),
-            }],
-        });
-
         Self {
             pipeline,
             sampler,
             src_bgl,
-            uniform_a,
-            uniform_b,
-            uniform_bg_a,
-            uniform_bg_b,
+            uniforms,
             inter: None,
             format,
         }
+    }
+
+    /// Release this frame's uniform slots. Called once per frame from
+    /// [`UiRenderer::begin_frame`](crate::UiRenderer::begin_frame).
+    pub(crate) fn begin_frame(&mut self) {
+        self.uniforms.reset();
     }
 
     fn ensure_intermediate(&mut self, device: &wgpu::Device, size: (u32, u32)) {
@@ -235,7 +205,8 @@ impl Blur {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: self.format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             });
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -288,7 +259,8 @@ impl Blur {
             _pad0: 0.0,
             tint: [1.0, 1.0, 1.0, 1.0],
         };
-        queue.write_buffer(&self.uniform_a, 0, bytemuck::bytes_of(&ua));
+        let (slot_a, _) = self.uniforms.allocate(device);
+        queue.write_buffer(self.uniforms.buffer(), slot_a, bytemuck::bytes_of(&ua));
 
         // Pass B: vertical blur, intermediate -> target (region quad). The
         // radius is scaled down by `ds` because one intermediate texel spans
@@ -301,7 +273,8 @@ impl Blur {
             _pad0: 0.0,
             tint: params.tint,
         };
-        queue.write_buffer(&self.uniform_b, 0, bytemuck::bytes_of(&ub));
+        let (slot_b, _) = self.uniforms.allocate(device);
+        queue.write_buffer(self.uniforms.buffer(), slot_b, bytemuck::bytes_of(&ub));
 
         let src_bg_a = self.make_src_bg(device, backdrop.view);
         let src_bg_b = self.make_src_bg(device, &inter.view);
@@ -321,10 +294,10 @@ impl Blur {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
-                multiview_mask: None,
+                multiview_mask: None, 
             });
             rp.set_pipeline(&self.pipeline);
-            rp.set_bind_group(0, &self.uniform_bg_a, &[]);
+            rp.set_bind_group(0, self.uniforms.bind_group(), &[slot_a as u32]);
             rp.set_bind_group(1, &src_bg_a, &[]);
             rp.draw(0..4, 0..1);
         }
@@ -343,10 +316,10 @@ impl Blur {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
-                multiview_mask: None
+                multiview_mask: None,
             });
             rp.set_pipeline(&self.pipeline);
-            rp.set_bind_group(0, &self.uniform_bg_b, &[]);
+            rp.set_bind_group(0, self.uniforms.bind_group(), &[slot_b as u32]);
             rp.set_bind_group(1, &src_bg_b, &[]);
             rp.draw(0..4, 0..1);
         }

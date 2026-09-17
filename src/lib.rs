@@ -25,37 +25,74 @@
 //! // result.get(2) = floor label rect
 //! // result.get(3) = down button rect
 //! ```
-
+//!
+//! # Debugging a layout
+//!
+//! Positioning bugs produce no error, just a wrong picture. The [`debug`]
+//! module describes a *finished* frame — a named tree of world-space boxes
+//! plus what looks wrong with them (off-screen, overflowing its container,
+//! clipped away by a boundary, misaligned) — as text or JSON, with
+//! [`DebugReport::assert_clean`](debug::DebugReport::assert_clean) to guard a
+//! layout in a test:
+//!
+//! ```ignore
+//! let report = wgpu_gameui::debug::DebugReport::measured_layers(&mut layers, screen);
+//! println!("{}", report.to_text());
+//! report.assert_clean();
+//! ```
+//!
+//! For pixels rather than boxes, [`HeadlessGpu`] renders a frame offscreen and
+//! [`write_png`] saves it.
 
 // Public API is the contract for integrating apps; every exported type, field,
 // and method must carry rustdoc. `warn` (not `deny`) so a work-in-progress
 // build still compiles, but the project's warning-clean bar surfaces any gap.
 #![warn(missing_docs)]
+// Tests intentionally build input snapshots incrementally to make event intent
+// obvious, and use explicit `drop(ctx)` to end mutable borrows before assertions.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::drop_non_drop,
+        clippy::field_reassign_with_default,
+        clippy::items_after_test_module
+    )
+)]
+
+#[cfg(feature = "syntax-highlighting")]
+mod syntax;
 mod text;
 
+#[cfg(feature = "syntax-lua")]
+pub use syntax::SyntaxConfigurationError;
+#[cfg(feature = "syntax-highlighting")]
+pub use syntax::{HighlightConfiguration, SyntaxHighlighting, SyntaxTheme};
 pub use text::{
     CaretPos, FontHandle, FontSystemHandle, FontVMetrics, SelRect, TextAlign, TextBlock,
     TextDirection, TextGlow, TextMeasurer, TextOutline, TextRenderer, TextShadow, TextSpan,
-    Underline,
-    VisualCaret, VisualGlyph, WrapMode, byte_at_point, byte_on_adjacent_line, caret_for_byte,
-    load_font_bytes, load_font_file, register_bundled_fonts, resolve_span_color, selection_rects,
-    shared_font_system, text_caret_layout, text_cursor_positions, text_visual_layout,
-    visual_caret_neighbor, visual_caret_pos, vcentered_line_y,
+    TextStyleRange, Underline, VisualCaret, VisualGlyph, WrapMode, byte_at_point,
+    byte_on_adjacent_line, caret_for_byte, load_font_bytes, load_font_file, register_bundled_fonts,
+    resolve_range_color, resolve_span_color, selection_rects, shared_font_system,
+    text_caret_layout, text_cursor_positions, text_visual_layout, vcentered_line_y,
+    visual_caret_neighbor, visual_caret_pos,
 };
 
 /// Font weight and style selectors (re-exported from `glyphon`/`cosmic-text`)
 /// for `TextBlock::with_weight`/`with_style` and the `UiContext` font stack.
-pub use glyphon::{Style, Weight};
+pub use glyphon::cosmic_text::{Style, Weight};
 
-mod animation;
 pub mod affine;
+mod animation;
 mod click_tracker;
 pub mod color;
 mod cursor;
+pub mod debug;
 mod drag_tracker;
 mod frame;
+mod interaction;
 pub mod layer;
 pub mod layout;
+mod measure;
 mod nav;
 pub mod projection;
 pub mod render;
@@ -69,14 +106,32 @@ pub use animation::{AnimSlot, AnimationState, Easing, ease, lerp, lerp_color};
 pub use click_tracker::{ClickTracker, DEFAULT_DOUBLE_CLICK_THRESHOLD, DEFAULT_HOLD_THRESHOLD};
 pub use color::Hsva;
 pub use cursor::{CursorIcon, CursorState};
+/// The entry point to layout inspection — see [`mod@debug`] for the full API.
+pub use debug::DebugReport;
 pub use drag_tracker::{DEFAULT_DRAG_THRESHOLD, DragTracker};
 pub use frame::Frame;
+pub use interaction::{
+    HitRegion, HitShape, InteractionScene, OrderKey, PointerPolicy, Response, WidgetId,
+};
 pub use layer::{Layer, LayerKind, LayerStack};
-pub use nav::{GamepadNav, KeyboardNav, ManualNav, NavInput, NavMap, map_gamepad, map_keyboard};
+pub use measure::{
+    ArrangeError, MeasureBuffer, MeasureConstraints, MeasureContext, MeasuredChild, MeasuredText,
+    Measurement, TextMetrics,
+};
+pub use nav::{
+    ArrowFocusNav, GamepadNav, KeyboardNav, ManualNav, NavInput, NavMap, map_gamepad, map_keyboard,
+};
 pub use projection::{world_to_screen, world_to_screen_na};
+#[cfg(feature = "headless")]
+pub use render::HeadlessGpu;
+pub use render::{
+    Backdrop, BlurParams, CAPTURE_FORMAT, NineSliceMeta, RenderStats, SpriteAtlas, SpriteId,
+    UiRenderer, capture_draw_list, capture_layers, write_png,
+};
 #[cfg(feature = "phosphor-icons")]
-pub use render::PhosphorIcon;
-pub use render::{Backdrop, BlurParams, NineSliceMeta, SpriteAtlas, SpriteId, UiRenderer};
+pub use render::{
+    IconFontId, IconGlyph, PhosphorIcon, icon_font_id, icon_glyph, register_icon_font,
+};
 pub use style::{StyleKey, StyleOverlay, StyleResolver, StyleValue};
 pub use theme::Theme;
 pub use ui_context::{AlignH, AlignV, FontSpec, UiContext, UiState};
@@ -180,6 +235,14 @@ pub struct InputState {
     pub key_end: bool,
     /// Delete key was pressed this frame.
     pub key_delete: bool,
+    /// Platform select-all shortcut (Ctrl+A, or Cmd+A on macOS) was pressed.
+    pub key_select_all: bool,
+    /// Platform cut shortcut (Ctrl+X, or Cmd+X on macOS) was pressed.
+    pub key_cut: bool,
+    /// Platform copy shortcut (Ctrl+C, or Cmd+C on macOS) was pressed.
+    pub key_copy: bool,
+    /// Platform paste shortcut (Ctrl+V, or Cmd+V on macOS) was pressed.
+    pub key_paste: bool,
     /// Tab key was pressed this frame. Drives focus navigation
     /// (Shift+Tab reverses via [`shift_pressed`](Self::shift_pressed)).
     pub key_tab: bool,
@@ -195,6 +258,23 @@ pub struct InputState {
     pub shift_pressed: bool,
     /// Ctrl (or Cmd on macOS) key is currently held.
     pub ctrl_pressed: bool,
+    /// Alt (or Option on macOS) is currently held. Held state, like
+    /// [`shift_pressed`](Self::shift_pressed)/[`ctrl_pressed`](Self::ctrl_pressed);
+    /// cleared by the windowing layer on key-up, not by [`end_frame`](Self::end_frame).
+    pub alt_down: bool,
+    /// Alt went down this frame (press edge).
+    ///
+    /// Alt is the one modifier with an *edge* pair as well as a held flag,
+    /// because a bare Alt tap is a gesture in its own right (arming a menu bar):
+    /// a press and release that both land between two rendered frames would be
+    /// invisible to held-only state. Mirroring the mouse's
+    /// `mouse_down`/`mouse_clicked`/`mouse_released` triple is deliberate.
+    /// Per-frame; cleared by [`end_frame`](Self::end_frame).
+    pub alt_pressed: bool,
+    /// Every Alt key came up this frame (release edge). See
+    /// [`alt_pressed`](Self::alt_pressed). Per-frame; cleared by
+    /// [`end_frame`](Self::end_frame).
+    pub alt_released: bool,
     /// Device-agnostic navigation intents for this frame (directional, confirm,
     /// cancel, focus next/prev). Filled by a [`NavMap`] — passed to
     /// [`UiState::begin_frame`](crate::UiState::begin_frame) / [`Frame::new`] —
@@ -245,11 +325,19 @@ impl InputState {
         self.key_home = false;
         self.key_end = false;
         self.key_delete = false;
+        self.key_select_all = false;
+        self.key_cut = false;
+        self.key_copy = false;
+        self.key_paste = false;
         self.key_tab = false;
         self.key_escape = false;
         self.key_space = false;
         self.key_up = false;
         self.key_down = false;
+        // Alt's edges are per-frame events; `alt_down` is held state owned by the
+        // windowing layer, so it is deliberately not cleared here.
+        self.alt_pressed = false;
+        self.alt_released = false;
         // Navigation intents are per-frame edges (like the key events they're
         // mapped from), so clear them too. The next frame's `NavMap` repopulates.
         self.nav = NavInput::default();
@@ -307,7 +395,11 @@ impl InputState {
             key_down: false,
             // A layer under a modal/popup must not navigate either.
             nav: NavInput::default(),
-            // shift/ctrl are modifier state, not events — preserve them
+            // Alt's edges are events, not modifier state; `alt_down` is
+            // preserved by the `..self.clone()` below.
+            alt_pressed: false,
+            alt_released: false,
+            // shift/ctrl/alt are modifier state, not events — preserve them
             // so modals that have text inputs still see modifier keys.
             ..self.clone()
         }
@@ -413,5 +505,69 @@ mod input_state_tests {
         let c = i.consumed();
         assert!(c.preedit.is_empty(), "consumed must clear preedit");
         assert_eq!(c.preedit_cursor, None);
+    }
+
+    // ---- Alt: held state plus edges ----
+
+    #[test]
+    fn alt_edges_cleared_by_end_frame_but_held_state_persists() {
+        let mut i = InputState {
+            alt_down: true,
+            alt_pressed: true,
+            alt_released: false,
+            ..InputState::default()
+        };
+        i.end_frame();
+        assert!(!i.alt_pressed, "press edge is a per-frame event");
+        assert!(!i.alt_released);
+        assert!(i.alt_down, "alt_down is held state, not a per-frame event");
+    }
+
+    #[test]
+    fn alt_release_edge_cleared_by_end_frame() {
+        let mut i = InputState {
+            alt_released: true,
+            ..InputState::default()
+        };
+        i.end_frame();
+        assert!(!i.alt_released);
+    }
+
+    #[test]
+    fn consumed_zeros_alt_edges_but_preserves_alt_down() {
+        // A layer under a modal must not see Alt as a gesture, but a text field
+        // there still needs to know the modifier is held.
+        let i = InputState {
+            alt_down: true,
+            alt_pressed: true,
+            alt_released: true,
+            ..InputState::default()
+        };
+        let c = i.consumed();
+        assert!(!c.alt_pressed, "consumed must zero the Alt press edge");
+        assert!(!c.alt_released, "consumed must zero the Alt release edge");
+        assert!(c.alt_down, "consumed preserves held modifier state");
+    }
+
+    #[test]
+    fn a_bare_alt_tap_is_observable_for_exactly_one_frame() {
+        // The reason Alt carries edges as well as held state: a press and release
+        // that both arrive between two rendered frames would otherwise be
+        // invisible. The tap is observable for exactly the frame it lands in.
+        let mut i = InputState {
+            alt_down: false, // already up again by the time the frame renders
+            alt_pressed: true,
+            alt_released: true,
+            ..InputState::default()
+        };
+        assert!(
+            i.alt_pressed && i.alt_released,
+            "the tap is visible on the frame it lands in"
+        );
+        i.end_frame();
+        assert!(
+            !i.alt_pressed && !i.alt_released,
+            "and gone the next, so one tap cannot arm the bar twice"
+        );
     }
 }

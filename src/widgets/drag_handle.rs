@@ -34,9 +34,9 @@
 //! // `win` has now moved by the drag; `out.dragging` is true while held.
 //! ```
 
+use crate::StyleKey;
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::StyleKey;
 
 use super::{DragCapture, DragId, DrawContext};
 
@@ -134,6 +134,10 @@ impl DragHandle {
         rect: Rect,
         ctx: &mut DrawContext,
     ) -> DragHandleOutput {
+        ctx.push_debug_scope_rect(
+            crate::widgets::scope_name("DragHandle", self.label.as_deref().unwrap_or_default()),
+            rect,
+        );
         let input = ctx.input;
         let s = ctx.styles();
 
@@ -217,6 +221,7 @@ impl DragHandle {
             list.text(block);
         }
 
+        ctx.pop_debug_scope();
         DragHandleOutput {
             dragging,
             started,

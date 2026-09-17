@@ -305,6 +305,25 @@ fn draw_tooltip_body(
     x = x.max(margin);
     y = y.max(margin);
 
+    // A tooltip sizes itself to its content, so its allocation is only known
+    // here. Both public entry points funnel through this function, so scoping it
+    // once covers them and skips their "not visible" early returns entirely —
+    // an unhovered tooltip has no allocation to declare.
+    list.push_debug_scope_rect(
+        "Tooltip",
+        Rect::new(x - 9.0, y - 9.0, width + 18.0, height + 18.0 + 6.0),
+    );
+
+    // Drop shadow: the design floats tooltips on `0 6px 18px` black (falloff
+    // margin = half the CSS blur = 9px); the scope above includes its skirt.
+    list.drop_shadow(
+        Rect::new(x, y, width, height),
+        6.0,
+        9.0,
+        3.0,
+        [0.0, 0.0, 0.0, 0.6],
+    );
+
     let bg_color = [0.10, 0.10, 0.15, 0.95];
     let border_color = style.color(StyleKey::PanelBorder);
     list.quad(x, y, width, height, bg_color);
@@ -421,6 +440,7 @@ fn draw_tooltip_body(
             }
         }
     }
+    list.pop_debug_scope();
 }
 
 #[cfg(test)]

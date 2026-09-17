@@ -34,7 +34,6 @@ pub struct Affine2 {
     pub ty: f32,
     ///
     pub angle: f32,
-
 }
 
 impl Affine2 {
@@ -131,7 +130,6 @@ impl Affine2 {
     /// Translation + axis-aligned scale only — rectangles remain axis-aligned.
     pub fn is_axis_aligned(&self) -> bool {
         ( self.b == 0.0 && self.c == 0.0 ) || self.angle.sin() ==0.0
-
     }
 
     /// Determinant of the linear (2x2) part — the signed area scale factor.
@@ -164,24 +162,20 @@ impl Affine2 {
         Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
     }
 
-    /// The inverse transform: `self.compose(&self.inverse())` is the identity.
-    /// Returns [`IDENTITY`](Self::IDENTITY) for a degenerate (zero-determinant)
-    /// transform rather than producing NaNs.
-    ///
-    /// Maps world-space coordinates back into the current local frame — e.g. a
-    /// widget handed a world-space rect that the draw list will re-transform
-    /// needs the *local* rect (and local mouse) to draw and hit-test correctly.
-    pub fn inverse(&self) -> Self {
+    /// The inverse transform when the linear part is finite and non-degenerate.
+    /// Returns `None` for a singular transform instead of inventing hittable
+    /// geometry. Interaction code should use this form.
+    pub fn try_inverse(&self) -> Option<Self> {
         let det = self.determinant();
-        if det.abs() < 1e-12 {
-            return Self::IDENTITY;
+        if !det.is_finite() || det.abs() < 1e-12 {
+            return None;
         }
         let inv_det = 1.0 / det;
         let ia = self.d * inv_det;
         let ib = -self.b * inv_det;
         let ic = -self.c * inv_det;
         let id = self.a * inv_det;
-        Self {
+        let inverse = Self {
             a: ia,
             b: ib,
             tx: -(ia * self.tx + ib * self.ty),
@@ -189,7 +183,25 @@ impl Affine2 {
             d: id,
             ty: -(ic * self.tx + id * self.ty),
             angle: -self.angle,
-        }
+        };
+        [
+            inverse.a, inverse.b, inverse.tx, inverse.c, inverse.d, inverse.ty,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(inverse)
+    }
+
+    /// The inverse transform: `self.compose(&self.inverse())` is the identity.
+    /// Returns [`IDENTITY`](Self::IDENTITY) for a degenerate (zero-determinant)
+    /// transform rather than producing NaNs. New hit-testing code should prefer
+    /// [`try_inverse`](Self::try_inverse), where singular geometry is not hittable.
+    ///
+    /// Maps world-space coordinates back into the current local frame — e.g. a
+    /// widget handed a world-space rect that the draw list will re-transform
+    /// needs the *local* rect (and local mouse) to draw and hit-test correctly.
+    pub fn inverse(&self) -> Self {
+        self.try_inverse().unwrap_or(Self::IDENTITY)
     }
 
     /// Transform the four corners of a rect, returning them in TL, TR, BR, BL

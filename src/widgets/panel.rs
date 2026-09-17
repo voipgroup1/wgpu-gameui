@@ -49,6 +49,9 @@ impl Panel {
 
     /// Draw a panel at a layout-computed rect.
     pub fn draw_at(rect: Rect, list: &mut DrawList, style: &StyleResolver) {
+        // `draw` forwards here verbatim, so the scope lives on this side only —
+        // a `Panel > Panel` pair declaring the same rect would be pure noise.
+        list.push_debug_scope_rect("Panel", rect);
         let radius = style.scalar(StyleKey::BorderRadius);
         let panel = style.color(StyleKey::Panel);
         let panel_border = style.color(StyleKey::PanelBorder);
@@ -81,11 +84,14 @@ impl Panel {
             inner_h,
             panel_border,
         );
+        list.pop_debug_scope();
     }
 
     /// Draw a nine-slice textured panel at a layout-computed rect.
     pub fn draw_nine_slice(rect: Rect, list: &mut DrawList, texture_key: &str) {
+        list.push_debug_scope_rect("Panel", rect);
         list.nine_slice(rect.x, rect.y, rect.width, rect.height, texture_key);
+        list.pop_debug_scope();
     }
 }
 

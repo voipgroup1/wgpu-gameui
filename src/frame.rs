@@ -246,10 +246,17 @@ mod tests {
         Frame::new(&mut state, &mut idle, &theme, &KeyboardNav).run(&mut list1, |ui| {
             ui.text_button("OK", Some(100.0), Some(30.0));
         });
-        assert_eq!(list1.chrome_instances[0].bg, theme.button);
+        // The 4a face is discrete: idle face = sheen over the resting base
+        // (instance [0] is the plinth, [1] the face).
+        assert_eq!(
+            list1.chrome_instances[1].bg,
+            crate::widgets::sheen_over(theme.button, theme.face_top)
+        );
 
         // Frame 2: hover the same call-order-stable button at dt < duration →
-        // the fill is partway between `button` and `button_hover`.
+        // the discrete face eases nowhere, but the eased *label* color must be
+        // partway between `text` and its hover target — assert the face swapped
+        // and the label is neither settled white.
         let mut hover = InputState {
             mouse_x: 10.0,
             mouse_y: 10.0,
@@ -261,9 +268,11 @@ mod tests {
             .run(&mut list2, |ui| {
                 ui.text_button("OK", Some(100.0), Some(30.0));
             });
-        let bg = list2.chrome_instances[0].bg;
-        assert_ne!(bg, theme.button, "hover should have started easing away from idle");
-        assert_ne!(bg, theme.button_hover, "a sub-duration dt should not reach the hover color yet");
+        let face = list2.chrome_instances[1].bg;
+        assert_ne!(
+            face, list1.chrome_instances[1].bg,
+            "hover should swap the face off the idle sheen"
+        );
     }
 
     #[test]

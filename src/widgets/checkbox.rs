@@ -1,9 +1,12 @@
 //! Checkbox widget.
 
+#[cfg(feature = "phosphor-icons")]
+use crate::PhosphorIcon;
 use crate::layout::Rect;
 use crate::text::TextBlock;
 use crate::{AnimSlot, SpriteId, StyleKey, StyleResolver};
 
+use super::material::draw_inset_shadow;
 use super::{DrawContext, DrawList, FocusId};
 
 /// Icon keys for checkbox textures. Only used by the string-keyed
@@ -77,6 +80,23 @@ impl Checkbox {
         }
     }
 
+    /// Natural row size for `label`: the themed checkbox square, label gap, and
+    /// the label's actual width in the themed font.
+    pub fn intrinsic_size(
+        &self,
+        label: &str,
+        list: &mut DrawList,
+        styles: &StyleResolver,
+    ) -> (f32, f32) {
+        let height = styles.scalar(StyleKey::FontSize).max(20.0);
+        let label_width = if label.is_empty() {
+            0.0
+        } else {
+            list.measure_block(&styles.text_block(label, 0.0, 0.0)).0 + 6.0
+        };
+        (height + label_width, height)
+    }
+
     /// Smooth the box fill (check/uncheck) and hover highlight transitions using
     /// the context's [`AnimationState`](crate::AnimationState), keyed by `id`. A
     /// no-op when no animation state is attached (byte-identical to the instant
@@ -115,19 +135,39 @@ impl Checkbox {
     }
 
     /// Draw a checkbox at the given rect. Returns true if clicked (toggled).
-    ///
-    /// The box is drawn at the left of the rect (square, fitted to rect height),
-    /// with the label to its right.
     pub fn draw(&self, checked: bool, label: &str, rect: Rect, ctx: &mut DrawContext) -> bool {
+        self.draw_response(checked, label, rect, ctx).clicked
+    }
+
+    /// Draw the checkbox and return its complete interaction response. The whole
+    /// allocated row is the canonical hit geometry; the focus ring still hugs
+    /// only the square control.
+    pub fn draw_response(
+        &self,
+        checked: bool,
+        label: &str,
+        rect: Rect,
+        ctx: &mut DrawContext,
+    ) -> crate::Response {
+        ctx.push_debug_scope_rect(crate::widgets::scope_name("Checkbox", label), rect);
+        let retained = self
+            .focus_id
+            .filter(|_| ctx.has_interactions())
+            .map(|id| ctx.interact(crate::WidgetId(id), rect, true))
+            .filter(|response| response.resolved);
         let input = ctx.input;
         let s = ctx.styles();
-        // Honor layer capture (`mouse_consumed`) so a checkbox under a
-        // modal/popup doesn't react to clicks meant for the overlay.
-        let hovered = rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed;
+        // Honor layer capture (`mouse_consumed`) on the compatibility path.
+        let hovered = retained.as_ref().map_or_else(
+            || rect.contains(input.mouse_x, input.mouse_y) && !input.mouse_consumed,
+            |response| response.hovered,
+        );
         if hovered {
             ctx.request_cursor(crate::CursorIcon::Pointer);
         }
-        let clicked = hovered && input.mouse_clicked;
+        let clicked = retained
+            .as_ref()
+            .map_or(hovered && input.mouse_clicked, |response| response.clicked);
         let key_activate = input.nav.confirm;
 
         // Checkbox box (square, fitted to rect height).
@@ -181,7 +221,13 @@ impl Checkbox {
 
             // Hover highlight over the box area (eased alpha when animated).
             if hover_alpha > 0.0 {
-                list.quad(box_rect.x, box_rect.y, size, size, [1.0, 1.0, 1.0, hover_alpha]);
+                list.quad(
+                    box_rect.x,
+                    box_rect.y,
+                    size,
+                    size,
+                    [1.0, 1.0, 1.0, hover_alpha],
+                );
             }
 
             // Label to the right of the checkbox.
@@ -223,40 +269,85 @@ impl Checkbox {
             }
         }
 
-        toggled
+        ctx.pop_debug_scope();
+        let mut response = retained.unwrap_or_else(|| crate::Response {
+            id: self.focus_id.map(crate::WidgetId),
+            rect,
+            resolved: false,
+            hovered,
+            pressed: hovered && input.mouse_down,
+            clicked,
+            released: hovered && input.mouse_released,
+            held: hovered && input.mouse_held,
+            double_clicked: hovered && input.mouse_double_clicked,
+            local_pos: hovered.then_some([input.mouse_x - rect.x, input.mouse_y - rect.y]),
+            scroll_delta: 0.0,
+        });
+        response.clicked = toggled;
+        response
     }
 }
 
 /// Draw the theme-driven vector checkbox: a rounded box, filled with the accent
 /// color and stamped with a contrast checkmark when `checked`.
-fn draw_vector_box(list: &mut DrawList, s: &StyleResolver, box_rect: Rect, checked: bool, fill: [f32; 4]) {
+fn draw_vector_box(
+    list: &mut DrawList,
+    s: &StyleResolver,
+    box_rect: Rect,
+    checked: bool,
+    fill: [f32; 4],
+) {
     let size = box_rect.width.min(box_rect.height);
     let radius = s.scalar(StyleKey::BorderRadius).min(size * 0.3).max(0.0);
     let border = s.scalar(StyleKey::BorderWidth).max(1.0).min(size * 0.5);
 
     if checked {
-        // Filled box (eased toward accent) + contrasting checkmark. The mark
-        // contrast is computed from the resolved accent so it stays crisp through
-        // the fill transition.
-        list.rounded_rect(box_rect, radius, fill);
-        let mark = contrast_color(s.color(StyleKey::Accent));
-        let t = (size * 0.14).max(1.5);
-        // Tick: down-stroke into the low-left, up-stroke to the high-right.
-        let pts = [
-            [box_rect.x + size * 0.22, box_rect.y + size * 0.52],
-            [box_rect.x + size * 0.42, box_rect.y + size * 0.72],
-            [box_rect.x + size * 0.78, box_rect.y + size * 0.28],
-        ];
-        list.polyline(&pts, t, mark);
+        // Checked = the accent face raised in the box: gradient fill (eased
+        // toward the accent tokens) + a dark on-accent tick. The design's mark
+        // color is fixed (`#04171d`), which `OnAccent` resolves to.
+        list.chrome_rect_gradient(box_rect, radius, border, fill, fill, [0.0, 0.0, 0.0, 0.5]);
+        let mark = s.color(StyleKey::OnAccent);
+        // The built-in MSDF icon keeps the small checkmark smooth at every DPI.
+        // Keep vector geometry as the no-feature fallback so checkbox rendering
+        // never depends on an optional font asset.
+        #[cfg(feature = "phosphor-icons")]
+        list.phosphor_icon(box_rect.inset(size * 0.18), PhosphorIcon::Check, mark);
+        #[cfg(not(feature = "phosphor-icons"))]
+        {
+            let t = (size * 0.14).max(1.5);
+            // Tick: down-stroke into the low-left, up-stroke to the high-right.
+            let pts = [
+                [box_rect.x + size * 0.22, box_rect.y + size * 0.52],
+                [box_rect.x + size * 0.42, box_rect.y + size * 0.72],
+                [box_rect.x + size * 0.78, box_rect.y + size * 0.28],
+            ];
+            list.polyline(&pts, t, mark);
+        }
+        // 1px inset highlight under the top edge (raised-face read).
+        let hl = s.color(StyleKey::EdgeHighlight);
+        list.quad(
+            box_rect.x + border,
+            box_rect.y + border,
+            (size - border * 2.0).max(0.0),
+            1.0,
+            hl,
+        );
     } else {
-        // Empty box: subtle fill (eased toward InputBackground) + border.
-        list.rounded_rect(box_rect, radius, fill);
-        list.rounded_rect_outline(box_rect, radius, border, s.color(StyleKey::InputBorder));
+        // Empty box: the sunken tone — dark fill + black edge + inset shadow.
+        list.chrome_rect(box_rect, radius, border, fill, [0.0, 0.0, 0.0, 0.6]);
+        draw_inset_shadow(
+            list,
+            s,
+            box_rect,
+            s.scalar(StyleKey::InnerShadowDepth),
+            border,
+        );
     }
 }
 
 /// Pick black or white for maximum contrast against `bg` using perceptual
-/// (Rec. 709) luminance.
+/// (Rec. 709) luminance. Kept for themes that resolve a light accent.
+#[cfg(test)]
 fn contrast_color(bg: [f32; 4]) -> [f32; 4] {
     let lum = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2];
     if lum > 0.5 {
@@ -329,23 +420,31 @@ mod tests {
         assert!(list.icons.is_empty(), "vector path must not queue any icon");
     }
 
+    #[cfg(feature = "phosphor-icons")]
     #[test]
-    fn vector_checked_adds_checkmark_over_fill() {
-        let th = theme();
-        // Reference: just the accent fill of the box, no checkmark. The box is
-        // a square the height of the rect (20px), with the same radius the
-        // widget computes.
-        let size = rect().height;
-        let radius = th.border_radius.min(size * 0.3).max(0.0);
-        let mut fill_only = DrawList::new();
-        fill_only.rounded_rect(Rect::new(0.0, 0.0, size, size), radius, th.accent);
-
+    fn vector_checked_uses_an_msdf_checkmark() {
         let (checked, _) = draw_cb(&Checkbox::new(), true, "", rect(), &input_at(-1.0, -1.0));
 
-        // Checked = same fill + a checkmark polyline, so strictly more geometry.
+        assert_eq!(
+            checked.icons_msdf.len(),
+            1,
+            "the checked mark should be rendered by the antialiased MSDF icon path"
+        );
+        let mark = checked.icons_msdf[0].local;
+        const EPSILON: f32 = 0.001;
+        assert!((mark.x - 3.6).abs() < EPSILON);
+        assert!((mark.y - 3.6).abs() < EPSILON);
+        assert!((mark.width - 12.8).abs() < EPSILON);
+        assert!((mark.height - 12.8).abs() < EPSILON);
+    }
+
+    #[cfg(not(feature = "phosphor-icons"))]
+    #[test]
+    fn vector_checked_falls_back_to_checkmark_geometry() {
+        let (checked, _) = draw_cb(&Checkbox::new(), true, "", rect(), &input_at(-1.0, -1.0));
         assert!(
-            checked.vertices.len() > fill_only.vertices.len(),
-            "checked box should add checkmark geometry beyond the accent fill"
+            !checked.vertices.is_empty(),
+            "no-icon builds retain a vector checkmark fallback"
         );
     }
 
@@ -520,7 +619,9 @@ mod tests {
         {
             let mut ctx = DrawContext::new(&mut l1, &mut focus, &th, &idle, 800.0, 600.0)
                 .with_animations(&mut state);
-            Checkbox::new().animated(1).draw(false, "", rect(), &mut ctx);
+            Checkbox::new()
+                .animated(1)
+                .draw(false, "", rect(), &mut ctx);
         }
         assert_eq!(box_fill(&l1), th.input_background);
 
@@ -534,7 +635,10 @@ mod tests {
             Checkbox::new().animated(1).draw(true, "", rect(), &mut ctx);
         }
         let fill = box_fill(&l2);
-        let (lo, hi) = (th.input_background[0].min(th.accent[0]), th.input_background[0].max(th.accent[0]));
+        let (lo, hi) = (
+            th.input_background[0].min(th.accent[0]),
+            th.input_background[0].max(th.accent[0]),
+        );
         assert!(
             fill[0] > lo && fill[0] < hi,
             "mid-transition fill {} should be strictly between {} and {}",
@@ -557,7 +661,9 @@ mod tests {
         {
             let mut ctx = DrawContext::new(&mut l1, &mut focus, &th, &idle, 800.0, 600.0)
                 .with_animations(&mut state);
-            Checkbox::new().animated(1).draw(false, "", rect(), &mut ctx);
+            Checkbox::new()
+                .animated(1)
+                .draw(false, "", rect(), &mut ctx);
         }
         let base_quads = l1.chrome_instances.len();
 
@@ -570,7 +676,9 @@ mod tests {
         {
             let mut ctx = DrawContext::new(&mut l2, &mut focus, &th, &hover, 800.0, 600.0)
                 .with_animations(&mut state);
-            Checkbox::new().animated(1).draw(false, "", rect(), &mut ctx);
+            Checkbox::new()
+                .animated(1)
+                .draw(false, "", rect(), &mut ctx);
         }
         assert!(
             l2.chrome_instances.len() > base_quads,

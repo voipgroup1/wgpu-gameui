@@ -141,24 +141,24 @@ impl DragTracker {
 
         let mut delta = [0.0f32, 0.0];
 
-        if input.mouse_down {
-            if let Some(origin) = self.origin {
-                // Per-frame movement since the previous update.
-                delta = [pos.0 - self.prev.0, pos.1 - self.prev.1];
-                self.prev = pos;
+        if input.mouse_down
+            && let Some(origin) = self.origin
+        {
+            // Per-frame movement since the previous update.
+            delta = [pos.0 - self.prev.0, pos.1 - self.prev.1];
+            self.prev = pos;
 
-                if !self.active {
-                    let dx = pos.0 - origin.0;
-                    let dy = pos.1 - origin.1;
-                    let dist_sq = dx * dx + dy * dy;
-                    // A drag requires *movement*: the pointer must have actually
-                    // left the origin and travelled at least the threshold. The
-                    // `> 0` guard matters only at `threshold == 0`, where it
-                    // means "any nonzero movement drags" rather than "a still
-                    // press is instantly a drag".
-                    if dist_sq > 0.0 && dist_sq >= self.threshold_sq {
-                        self.active = true;
-                    }
+            if !self.active {
+                let dx = pos.0 - origin.0;
+                let dy = pos.1 - origin.1;
+                let dist_sq = dx * dx + dy * dy;
+                // A drag requires *movement*: the pointer must have actually
+                // left the origin and travelled at least the threshold. The
+                // `> 0` guard matters only at `threshold == 0`, where it
+                // means "any nonzero movement drags" rather than "a still
+                // press is instantly a drag".
+                if dist_sq > 0.0 && dist_sq >= self.threshold_sq {
+                    self.active = true;
                 }
             }
         }

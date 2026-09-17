@@ -24,6 +24,7 @@ use crate::layout::Rect;
 use crate::{InputState, SpriteId, StyleKey, StyleResolver};
 
 use super::button::{ButtonVisual, draw_chrome};
+use super::material::Tone;
 use super::{DrawList, Image, ImageAlign, ImageFit};
 
 /// Image / icon button — an [`Image`] with clickable button chrome.
@@ -117,6 +118,7 @@ impl ImageButton {
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return false;
         }
+        list.push_debug_scope_rect("ImageButton", rect);
 
         let hovered =
             self.enabled && !input.mouse_consumed && rect.contains(input.mouse_x, input.mouse_y);
@@ -133,6 +135,7 @@ impl ImageButton {
                     enabled: self.enabled,
                     hovered,
                     pressed,
+                    tone: Tone::default(),
                 },
             );
         }
@@ -180,6 +183,7 @@ impl ImageButton {
             }
         }
 
+        list.pop_debug_scope();
         clicked
     }
 }
@@ -211,7 +215,12 @@ mod tests {
         let mut list = DrawList::new();
         let theme = Theme::default();
         let input = input_at(50.0, 50.0, true, true);
-        assert!(ImageButton::sprite(ID).draw(rect(), &mut list, &StyleResolver::new(&theme), &input));
+        assert!(ImageButton::sprite(ID).draw(
+            rect(),
+            &mut list,
+            &StyleResolver::new(&theme),
+            &input
+        ));
     }
 
     #[test]
@@ -219,7 +228,12 @@ mod tests {
         let mut list = DrawList::new();
         let theme = Theme::default();
         let input = input_at(200.0, 200.0, true, true);
-        assert!(!ImageButton::sprite(ID).draw(rect(), &mut list, &StyleResolver::new(&theme), &input));
+        assert!(!ImageButton::sprite(ID).draw(
+            rect(),
+            &mut list,
+            &StyleResolver::new(&theme),
+            &input
+        ));
     }
 
     #[test]
@@ -227,11 +241,12 @@ mod tests {
         let mut list = DrawList::new();
         let theme = Theme::default();
         let input = input_at(50.0, 50.0, true, true);
-        assert!(
-            !ImageButton::sprite(ID)
-                .enabled(false)
-                .draw(rect(), &mut list, &StyleResolver::new(&theme), &input)
-        );
+        assert!(!ImageButton::sprite(ID).enabled(false).draw(
+            rect(),
+            &mut list,
+            &StyleResolver::new(&theme),
+            &input
+        ));
     }
 
     #[test]
@@ -240,7 +255,12 @@ mod tests {
         let theme = Theme::default();
         let mut input = input_at(50.0, 50.0, true, true);
         input.mouse_consumed = true;
-        assert!(!ImageButton::sprite(ID).draw(rect(), &mut list, &StyleResolver::new(&theme), &input));
+        assert!(!ImageButton::sprite(ID).draw(
+            rect(),
+            &mut list,
+            &StyleResolver::new(&theme),
+            &input
+        ));
     }
 
     #[test]
@@ -248,9 +268,12 @@ mod tests {
         let mut list = DrawList::new();
         let theme = Theme::default();
         let input = input_at(0.0, 0.0, false, false);
-        ImageButton::sprite(ID)
-            .padding(12.0)
-            .draw(rect(), &mut list, &StyleResolver::new(&theme), &input);
+        ImageButton::sprite(ID).padding(12.0).draw(
+            rect(),
+            &mut list,
+            &StyleResolver::new(&theme),
+            &input,
+        );
         // Stretch fills the inset box; recover it from the last icon's TL corner.
         let c = list.icons.last().expect("an icon was drawn").corners;
         assert!((c[0][0] - 22.0).abs() < 1e-3, "inset x: {}", c[0][0]); // 10 + 12
@@ -269,12 +292,12 @@ mod tests {
         ImageButton::sprite(ID)
             .bare()
             .draw(rect(), &mut bare, &StyleResolver::new(&theme), &input);
-        // Chrome records one instanced rounded-rect (background + border); the
+        // Chrome records the material (plinth + face + highlight); the
         // bare variant draws no chrome instance.
         assert_eq!(
             chrome.chrome_instances.len(),
-            1,
-            "chrome draws one instance"
+            3,
+            "chrome draws plinth + face + highlight"
         );
         assert!(bare.chrome_instances.is_empty(), "bare draws no chrome");
     }

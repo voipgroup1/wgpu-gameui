@@ -303,12 +303,11 @@ impl TreeState {
                 }
             }
         } else if keys.activate {
-            if let Some(i) = cur {
-                let NavRow { id, branch, .. } = nav[i];
-                if branch {
-                    self.toggle(id);
-                }
-            }
+            cur.map(|i| nav[i])
+                .filter(|row| row.branch)
+                .map(|row| row.id)
+                .into_iter()
+                .for_each(|id| self.toggle(id));
         }
     }
 }
@@ -489,6 +488,7 @@ impl<'a> TreeNode<'a> {
         state: &mut TreeState,
         ctx: &mut DrawContext,
     ) -> TreeNodeOutput {
+        ctx.push_debug_scope_rect(crate::widgets::scope_name("TreeNode", self.label), rect);
         let s = ctx.styles();
         let theme = ctx.theme;
         let input = ctx.input;
@@ -540,7 +540,13 @@ impl<'a> TreeNode<'a> {
 
         // ---- full-row highlight (selection wins over hover) ---------------
         if selected {
-            list.quad(rect.x, rect.y, rect.width, rect.height, s.color(StyleKey::Accent));
+            list.quad(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                s.color(StyleKey::Accent),
+            );
         } else if row_hovered {
             list.quad(
                 rect.x,
@@ -627,11 +633,13 @@ impl<'a> TreeNode<'a> {
         // navigation activates after a click. Safe here: the `ctx.input` borrow
         // ended above (we snapshot `mouse_clicked`), so `&mut ctx` is free.
         if body_clicked || toggled || action.is_some() {
-            if let Some(fid) = state.focus_id {
-                ctx.focus.request(fid);
-            }
+            state
+                .focus_id
+                .into_iter()
+                .for_each(|focus_id| ctx.focus.request(focus_id));
         }
 
+        ctx.pop_debug_scope();
         let expanded = !self.leaf && state.is_expanded(id);
         TreeNodeOutput {
             expanded,
@@ -963,7 +971,7 @@ mod tests {
 
     #[test]
     fn label_color_overrides_default_text_color() {
-        use glyphon::Color;
+        use glyphon::cosmic_text::Color;
 
         // Default path: the label takes the theme text colour.
         let mut s = TreeState::new();

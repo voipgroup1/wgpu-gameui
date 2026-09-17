@@ -44,6 +44,15 @@ pub enum ImageFit {
     /// Draw at natural pixel size with no scaling, aligned within the box (may
     /// overflow — push a clip rect if you need it bounded).
     None,
+    /// Repeat the image at natural pixel size across the whole box (a tiled
+    /// background). Requires a [`SpriteId`] source and [`Image::natural_size`];
+    /// anything else falls back to `Stretch`. The image is drawn at 1:1, the
+    /// box is filled edge-to-edge starting at the top-left, and a partial tile
+    /// at the right/bottom edge is cropped. Tiles wrap in the shader, so one
+    /// draw covers any box size; sampling still comes from the shared atlas,
+    /// so keep at least a pixel of fully-opaque margin inside the source art
+    /// (no atlas-neighbor bleed on the outermost texels) for seamless tiling.
+    Tile,
 }
 
 /// Placement of the scaled image within leftover box space (used by
@@ -158,6 +167,19 @@ impl Image {
                 (self.aligned(dest, nw * scale, nh * scale), None)
             }
             ImageFit::None => (self.aligned(dest, nw, nh), None),
+            ImageFit::Tile => {
+                if !can_crop {
+                    // Tiling needs UV wrapping (sprite source only): fill instead.
+                    return (dest, None);
+                }
+                // Draw the box exactly; the shader repeats the source at natural
+                // scale and the fragment `fract` crops the right/bottom partial
+                // tile. `src` carries the tile count as a UV span in tile units:
+                // u spans (box_width / natural_width) tiles, etc.
+                let u = (dest.width / nw).max(0.0);
+                let v = (dest.height / nh).max(0.0);
+                (dest, Some([0.0, 0.0, u, v]))
+            }
             ImageFit::Cover => {
                 if !can_crop {
                     // No UV crop available (string-key source): fill the box.
@@ -188,10 +210,18 @@ impl Image {
         if dest.width <= 0.0 || dest.height <= 0.0 {
             return;
         }
+        // Declares `dest`, not the fitted sub-rect `resolve` returns: `dest` is
+        // the allocation, and letterboxing inside it is the widget working.
+        list.push_debug_scope_rect("Image", dest);
         match &self.source {
             Source::Sprite(id) => {
                 let (r, uv) = self.resolve(dest, true);
                 match uv {
+                    // A Tile span is in whole-tile units (u1/v1 > 1), a crop is
+                    // a 0..1 sub-rect — the flag tells the renderer which.
+                    Some(uv) if self.fit == ImageFit::Tile => {
+                        list.image_tiled(*id, r, uv, self.tint)
+                    }
                     Some(uv) => list.image_cropped(*id, r, uv, self.tint),
                     None => list.image(*id, r, self.tint),
                 }
@@ -202,6 +232,7 @@ impl Image {
                 list.icon(key, r.x, r.y, r.width, r.height);
             }
         }
+        list.pop_debug_scope();
     }
 }
 
@@ -376,5 +407,63 @@ mod tests {
         let mut list = DrawList::new();
         Image::sprite(ID).draw(Rect::new(0.0, 0.0, 0.0, 50.0), &mut list);
         assert!(list.icons.is_empty());
+    }
+
+    #[test]
+    fn tile_fills_dest_with_uv_span_in_tile_units() {
+        let mut list = DrawList::new();
+        // 64x64 source across a 200x100 box: 200/64 = 3.125 tiles across,
+        // 100/64 = 1.5625 down; the right/bottom partial tile is cropped in
+        // the shader, so the drawn rect is still exactly the box.
+        let dest = Rect::new(0.0, 0.0, 200.0, 100.0);
+        Image::sprite(ID)
+            .natural_size(64.0, 64.0)
+            .fit(ImageFit::Tile)
+            .draw(dest, &mut list);
+        let r = drawn_rect(&list);
+        approx(r.x, 0.0);
+        approx(r.y, 0.0);
+        approx(r.width, 200.0);
+        approx(r.height, 100.0);
+        let uv = list.icons[0].src.expect("tile carries a UV span");
+        approx(uv[0], 0.0);
+        approx(uv[1], 0.0);
+        approx(uv[2], 200.0 / 64.0);
+        approx(uv[3], 100.0 / 64.0);
+        assert!(list.icons[0].wrap, "the tile draw sets the wrap flag");
+    }
+
+    #[test]
+    fn tile_without_sprite_or_natural_size_falls_back_to_fill() {
+        // Key source can't UV-wrap.
+        let mut list = DrawList::new();
+        Image::key("bg.png")
+            .natural_size(64.0, 64.0)
+            .fit(ImageFit::Tile)
+            .draw(Rect::new(0.0, 0.0, 100.0, 100.0), &mut list);
+        assert!(list.icons[0].wrap == false && list.icons[0].src.is_none());
+
+        // Sprite source without a natural size has no tile extent either.
+        let mut list = DrawList::new();
+        Image::sprite(ID)
+            .fit(ImageFit::Tile)
+            .draw(Rect::new(0.0, 0.0, 100.0, 100.0), &mut list);
+        assert!(list.icons[0].src.is_none());
+        assert!(!list.icons[0].wrap);
+    }
+
+    #[test]
+    fn tile_ignores_align() {
+        // Tiling is anchored at the top-left by definition; alignment must not
+        // shift the pattern (it has no leftover space to place anyway).
+        let mut list = DrawList::new();
+        Image::sprite(ID)
+            .natural_size(64.0, 64.0)
+            .fit(ImageFit::Tile)
+            .align(ImageAlign::TOP_LEFT)
+            .draw(Rect::new(10.0, 20.0, 200.0, 100.0), &mut list);
+        approx(drawn_rect(&list).x, 10.0);
+        approx(drawn_rect(&list).y, 20.0);
+        assert!(list.icons[0].wrap);
     }
 }

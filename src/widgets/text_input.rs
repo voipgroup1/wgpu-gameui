@@ -1,7 +1,9 @@
 //! Text input widget with selection, cursor navigation, and clipboard support.
 
 use std::borrow::Cow;
-
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::{Arc,Mutex};
 use crate::InputState;
 use crate::StyleKey;
 use crate::layout::Rect;
@@ -9,8 +11,17 @@ use crate::text::{
     CaretPos, TextBlock, TextSpan, Underline, VisualGlyph, WrapMode, byte_at_point,
     byte_on_adjacent_line, caret_for_byte, selection_rects, visual_caret_neighbor,
 };
+#[cfg(feature = "syntax-highlighting")]
+use crate::{SyntaxHighlighting, TextStyleRange};
+#[cfg(feature = "syntax-highlighting")]
+use tree_sitter_highlight::Highlighter;
 
 use super::{DrawContext, FocusId};
+
+/// Shared clipboard reader used by retained text editors.
+pub type ClipboardGet = Arc<Mutex<Box<dyn FnMut() -> String + Send>>>;
+/// Shared clipboard writer used by retained text editors.
+pub type ClipboardSet = Arc<Mutex<Box<dyn FnMut(String) + Send>>>;
 
 /// Snap a byte index to the nearest char boundary at or below it, clamped to
 /// `s.len()`. Guards the `value[..cursor]` slice in [`compose_preedit`] against
@@ -199,6 +210,13 @@ pub struct TextInput {
     /// Vertical scroll offset in pixels (multiline only). Maintained by autoscroll
     /// in [`draw`](Self::draw) so the caret line stays inside the box.
     pub scroll_offset: f32,
+    /// Horizontal scroll offset in pixels (single-line only). Maintained by
+    /// [`draw`](Self::draw) so long values keep the caret inside the field.
+    pub horizontal_scroll_offset: f32,
+    /// Selection anchor captured when a primary-button drag begins. This is kept
+    /// separately from `selection_start` so dragging back to the anchor and then
+    /// past it continues to extend the same selection.
+    drag_selection_anchor: Option<usize>,
     /// Sticky horizontal column (pixels) for Up/Down navigation. Seeded from the
     /// caret's x on the first vertical move and cleared by any horizontal
     /// move/edit, so a run of Up/Down keeps the original column.
@@ -217,9 +235,25 @@ pub struct TextInput {
     /// Set via [`with_direction`](Self::with_direction).
     pub direction: crate::TextDirection,
     /// Clipboard getter — returns the current clipboard contents.
-    clipboard_get: Option<Box<dyn FnMut() -> String + Send>>,
+    clipboard_get: Option<ClipboardGet>,
     /// Clipboard setter — writes text to the clipboard.
-    clipboard_set: Option<Box<dyn FnMut(String) + Send>>,
+    clipboard_set: Option<ClipboardSet>,
+    /// Optional language and palette for multiline source highlighting.
+    #[cfg(feature = "syntax-highlighting")]
+    syntax: Option<SyntaxHighlighting>,
+    /// Value for which `syntax_ranges` was last built.
+    #[cfg(feature = "syntax-highlighting")]
+    syntax_cached_value: String,
+    /// Cached byte-range styles; cheap `Arc` clone into each frame's TextBlock.
+    #[cfg(feature = "syntax-highlighting")]
+    syntax_ranges: std::sync::Arc<Vec<TextStyleRange>>,
+    /// Reusable range storage and parser, used only when source changes.
+    #[cfg(feature = "syntax-highlighting")]
+    syntax_range_scratch: Vec<TextStyleRange>,
+    #[cfg(feature = "syntax-highlighting")]
+    syntax_highlighter: Highlighter,
+    #[cfg(all(test, feature = "syntax-highlighting"))]
+    syntax_rebuilds: usize,
 }
 
 impl Default for TextInput {
@@ -235,11 +269,25 @@ impl Default for TextInput {
             selection_start: None,
             multiline: false,
             scroll_offset: 0.0,
+            horizontal_scroll_offset: 0.0,
+            drag_selection_anchor: None,
             desired_caret_x: None,
             mask: None,
             direction: crate::TextDirection::Auto,
             clipboard_get: None,
             clipboard_set: None,
+            #[cfg(feature = "syntax-highlighting")]
+            syntax: None,
+            #[cfg(feature = "syntax-highlighting")]
+            syntax_cached_value: String::new(),
+            #[cfg(feature = "syntax-highlighting")]
+            syntax_ranges: std::sync::Arc::new(Vec::new()),
+            #[cfg(feature = "syntax-highlighting")]
+            syntax_range_scratch: Vec::new(),
+            #[cfg(feature = "syntax-highlighting")]
+            syntax_highlighter: Highlighter::new(),
+            #[cfg(all(test, feature = "syntax-highlighting"))]
+            syntax_rebuilds: 0,
         }
     }
 }
@@ -258,11 +306,25 @@ impl TextInput {
             selection_start: None,
             multiline: false,
             scroll_offset: 0.0,
+            horizontal_scroll_offset: 0.0,
+            drag_selection_anchor: None,
             desired_caret_x: None,
             mask: None,
             direction: crate::TextDirection::Auto,
             clipboard_get: None,
             clipboard_set: None,
+            #[cfg(feature = "syntax-highlighting")]
+            syntax: None,
+            #[cfg(feature = "syntax-highlighting")]
+            syntax_cached_value: String::new(),
+            #[cfg(feature = "syntax-highlighting")]
+            syntax_ranges: std::sync::Arc::new(Vec::new()),
+            #[cfg(feature = "syntax-highlighting")]
+            syntax_range_scratch: Vec::new(),
+            #[cfg(feature = "syntax-highlighting")]
+            syntax_highlighter: Highlighter::new(),
+            #[cfg(all(test, feature = "syntax-highlighting"))]
+            syntax_rebuilds: 0,
         }
     }
 
@@ -283,6 +345,50 @@ impl TextInput {
     pub fn with_placeholder(mut self, placeholder: impl Into<String>) -> Self {
         self.placeholder = placeholder.into();
         self
+    }
+
+    /// Set or clear syntax highlighting. Changing the language or palette
+    /// invalidates the retained byte-range cache; reusing the same configuration
+    /// does not reparse.
+    #[cfg(feature = "syntax-highlighting")]
+    pub fn set_syntax_highlighting(&mut self, syntax: Option<SyntaxHighlighting>) {
+        if self.syntax != syntax {
+            self.syntax = syntax;
+            self.syntax_cached_value.clear();
+            self.syntax_ranges = std::sync::Arc::new(Vec::new());
+        }
+    }
+
+    /// Builder form of [`set_syntax_highlighting`](Self::set_syntax_highlighting).
+    #[cfg(feature = "syntax-highlighting")]
+    pub fn with_syntax_highlighting(mut self, syntax: SyntaxHighlighting) -> Self {
+        self.set_syntax_highlighting(Some(syntax));
+        self
+    }
+
+    #[cfg(feature = "syntax-highlighting")]
+    fn update_syntax_cache(&mut self) {
+        let Some(syntax) = &self.syntax else {
+            return;
+        };
+        if self.syntax_cached_value == self.value {
+            return;
+        }
+        self.syntax_range_scratch.clear();
+        syntax.highlight_into(
+            &mut self.syntax_highlighter,
+            &self.value,
+            &mut self.syntax_range_scratch,
+        );
+        let fresh = std::mem::take(&mut self.syntax_range_scratch);
+        let old = std::mem::replace(&mut self.syntax_ranges, std::sync::Arc::new(fresh));
+        self.syntax_range_scratch = std::sync::Arc::try_unwrap(old).unwrap_or_default();
+        self.syntax_cached_value.clear();
+        self.syntax_cached_value.push_str(&self.value);
+        #[cfg(test)]
+        {
+            self.syntax_rebuilds += 1;
+        }
     }
 
     /// Make this a password field: characters are displayed as a bullet (`•`)
@@ -349,13 +455,23 @@ impl TextInput {
     }
 
     /// Set the clipboard getter closure (e.g. `|| arboard::Clipboard::new().unwrap().get_text().unwrap_or_default()`).
-    pub fn set_clipboard_get(&mut self, f: impl FnMut() -> String + Send + 'static) {
-        self.clipboard_get = Some(Box::new(f));
+    pub fn set_clipboard_get(&mut self, f: impl FnMut() -> String + 'static + Send) {
+        self.clipboard_get = Some(Arc::new(Mutex::new(Box::new(f))));
+    }
+
+    /// Share a clipboard getter across retained text fields.
+    pub fn set_shared_clipboard_get(&mut self, f: ClipboardGet) {
+        self.clipboard_get = Some(f);
     }
 
     /// Set the clipboard setter closure (e.g. `|t| { let _ = arboard::Clipboard::new().unwrap().set_text(t); }`).
-    pub fn set_clipboard_set(&mut self, f: impl FnMut(String) + Send + 'static) {
-        self.clipboard_set = Some(Box::new(f));
+    pub fn set_clipboard_set(&mut self, f: impl FnMut(String) + 'static + Send) {
+        self.clipboard_set = Some(Arc::new(Mutex::new(Box::new(f))));
+    }
+
+    /// Share a clipboard setter across retained text fields.
+    pub fn set_shared_clipboard_set(&mut self, f: ClipboardSet) {
+        self.clipboard_set = Some(f);
     }
 
     // ---- Selection helpers ----
@@ -473,12 +589,8 @@ impl TextInput {
     /// Cut: copy selection to clipboard then delete it.
     fn cut(&mut self) {
         let text = self.selected_text().map(|s| s.to_string());
-        if let Some(ref text) = text {
-            if let Some(ref mut set) = self.clipboard_set {
-                set(text.clone());
-            }
-        }
-        if text.is_some() {
+        if let (Some(text), Some(set)) = (&text, &self.clipboard_set) {
+            (*set.lock().unwrap())(text.clone());
             self.delete_selection();
         }
     }
@@ -486,10 +598,8 @@ impl TextInput {
     /// Copy: copy selection to clipboard.
     fn copy(&mut self) {
         let text = self.selected_text().map(|s| s.to_string());
-        if let Some(ref text) = text {
-            if let Some(ref mut set) = self.clipboard_set {
-                set(text.clone());
-            }
+        if let (Some(text), Some(set)) = (&text, &self.clipboard_set) {
+            (*set.lock().unwrap())(text.clone());
         }
     }
 
@@ -498,13 +608,13 @@ impl TextInput {
         let clip = self
             .clipboard_get
             .as_mut()
-            .map(|get| get())
+            .map(|get| (*get.lock().unwrap())())
             .unwrap_or_default();
         if clip.is_empty() {
             return;
         }
-        let clip_fix = if !self.multiline {
-            clip.chars().filter(|c| *c!='\r'&& *c!='\n').collect()
+        let clip_fix = if  !self.multiline {
+             clip.chars().filter(|c| *c!='\r'&& *c!='\n').collect()
         }else {
             String::from(&clip)
         };
@@ -513,7 +623,7 @@ impl TextInput {
             self.delete_selection();
         }
         self.value.insert_str(self.cursor_pos, &clip_fix);
-        self.cursor_pos += clip.len();
+        self.cursor_pos += clip_fix.len();
         self.selection_start = None;
     }
 
@@ -565,7 +675,7 @@ impl TextInput {
                 Some((c as u8 + b'a' - 1) as char)
             } else {
                 let lower = c.to_ascii_lowercase();
-                if ('a'..='z').contains(&lower) {
+                if lower.is_ascii_lowercase() {
                     Some(lower)
                 } else {
                     None
@@ -573,23 +683,22 @@ impl TextInput {
             }
         });
 
-        // Ctrl+A — Select All
-        if ctrl_letter == Some('a') {
+        // Explicit shortcut edges are preferred: unlike committed text, hosts can
+        // populate these reliably even when Ctrl/Cmd suppresses text delivery.
+        // `ctrl_letter` remains as a compatibility fallback for existing adapters.
+        if input.key_select_all || ctrl_letter == Some('a') {
             self.select_all();
             return;
         }
-        // Ctrl+X — Cut
-        if ctrl_letter == Some('x') {
+        if input.key_cut || ctrl_letter == Some('x') {
             self.cut();
             return;
         }
-        // Ctrl+C — Copy
-        if ctrl_letter == Some('c') {
+        if input.key_copy || ctrl_letter == Some('c') {
             self.copy();
             return;
         }
-        // Ctrl+V — Paste
-        if ctrl_letter == Some('v') {
+        if input.key_paste || ctrl_letter == Some('v') {
             self.paste();
             return;
         }
@@ -757,9 +866,19 @@ impl TextInput {
     /// [`set_clipboard_set`](Self::set_clipboard_set) before drawing.
     pub fn draw(&mut self, id: FocusId, ctx: &mut DrawContext) -> bool {
         // I-beam cursor while hovering the field (before borrowing ctx fields).
-        if ctx.input.is_hovered(self.x, self.y, self.width, self.height) {
+        if ctx
+            .input
+            .is_hovered(self.x, self.y, self.width, self.height)
+        {
             ctx.request_cursor(crate::CursorIcon::Text);
         }
+        // The field owns its own geometry, so it declares the box it was
+        // configured with. Pushed before the reborrows below, which hold `ctx`
+        // for the rest of the body.
+        ctx.push_debug_scope_rect(
+            "TextInput",
+            Rect::new(self.x, self.y, self.width, self.height),
+        );
         let s = ctx.styles();
         let list = &mut *ctx.draw_list;
         let focus = &mut *ctx.focus;
@@ -782,8 +901,27 @@ impl TextInput {
 
         // ---- Geometry & layout policy ----
         let padding = s.scalar(StyleKey::Padding);
-        let text_x = self.x + padding;
-        let text_max_w = self.width - padding * 2.0;
+        // Clamp padding so the inner clip always has positive area. If the
+        // theme padding exceeds what the field can afford, the text clip
+        // collapses to zero and all content becomes invisible — a silent,
+        // baffling failure mode that previously went undetected.
+        let max_pad_h = (self.height / 2.0 - 1.0).max(0.0);
+        let max_pad_w = (self.width / 2.0 - 1.0).max(0.0);
+        if padding > max_pad_h || padding > max_pad_w {
+            log::warn!(
+                "TextInput: theme padding ({padding:.1}px) exceeds field size \
+                 ({w:.0}×{h:.0}px) — clamping to ({pw:.1}, {ph:.1}) so text stays visible. \
+                 Increase the field size or reduce StyleKey::Padding.",
+                w = self.width,
+                h = self.height,
+                pw = max_pad_w,
+                ph = max_pad_h,
+            );
+        }
+        let eff_pad_w = padding.min(max_pad_w);
+        let eff_pad_h = padding.min(max_pad_h);
+        let text_x = self.x + eff_pad_w;
+        let text_max_w = self.width - eff_pad_w * 2.0;
         // Single-line never wraps (a long value overflows + clips); multiline
         // wraps to the field width.
         let wrap = if multiline {
@@ -805,18 +943,17 @@ impl TextInput {
         // and down as the user types capitals vs lowercase — pin it to the
         // x-height band (the common typing case).
         let text_top = if multiline {
-            self.y + padding
+            self.y + eff_pad_h
         } else {
             let m = list.font_vmetrics(s.theme().font.as_ref());
             let font_size = s.scalar(StyleKey::FontSize);
-            self.y + self.height / 2.0 - font_size * m.baseline_ratio
-                + font_size * m.x_ratio / 2.0
+            self.y + self.height / 2.0 - font_size * m.baseline_ratio + font_size * m.x_ratio / 2.0
         };
         let inner_rect = Rect::new(
             text_x,
-            self.y + padding,
+            self.y + eff_pad_h,
             text_max_w,
-            (self.height - padding * 2.0).max(0.0),
+            (self.height - eff_pad_h * 2.0).max(1.0),
         );
 
         // Single-line selection/caret band, centred on the field box. `text_top`
@@ -845,6 +982,7 @@ impl TextInput {
                 } else {
                     None
                 }
+
             )
         } else {
             Vec::new()
@@ -858,28 +996,27 @@ impl TextInput {
         // logical movement + left-edge caret rendering so it stays coherent
         // (single-line is the bidi-precise editing surface — multiline RTL caret
         // edge-precision is a documented limitation, like boundary affinity).
-        let move_vis: Vec<VisualGlyph> = if focused
-            && !multiline
-            && self.mask.is_none()
-            && !self.value.is_empty()
-        {
-            list.text_visual_layout(
-                &self.value,
-                s.scalar(StyleKey::FontSize),
-                Some(text_max_w),
-                wrap,
-                self.direction,
+        let move_vis: Vec<VisualGlyph> =
+            if focused && !multiline && self.mask.is_none() && !self.value.is_empty() {
+                list.text_visual_layout(
+                    &self.value,
+                    s.scalar(StyleKey::FontSize),
+                    Some(text_max_w),
+                    wrap,
+                    self.direction,
                 if let Some(font) = s.theme().font.as_ref() {
                     Some(font.family())
                 } else {
                     None
                 }
-            )
-        } else {
-            Vec::new()
-        };
+
+                )
+            } else {
+                Vec::new()
+            };
 
         // ---- Click-to-position ----
+        let pre_click_anchor = self.selection_start.unwrap_or(self.cursor_pos);
         if clicked && focused {
             if multiline {
                 // Hit-test against the laid-out lines, accounting for the scroll
@@ -898,20 +1035,18 @@ impl TextInput {
                 self.desired_caret_x = None;
             } else {
                 let click_x = input.mouse_x;
-                let text_left = self.x + padding;
-                let text_right = self.x + self.width - padding;
+                let text_left = self.x + eff_pad_w;
+                let text_right = self.x + self.width - eff_pad_w;
 
                 if click_x >= text_left && click_x <= text_right {
-                    let local_x = click_x - text_left;
+                    let local_x = click_x - text_left + self.horizontal_scroll_offset;
                     // Measure against the masked display, then map the picked
                     // display byte back to a real value byte.
                     let display = self.display_value();
-                    let positions = list.text_cursor_positions(
-                        &display,
-                        s.scalar(StyleKey::FontSize),
-                        Some(text_max_w),
-                    );
-                    let byte_pos = self.display_to_value_byte(closest_cursor_pos(&positions, local_x));
+                    let positions =
+                        list.text_cursor_positions(&display, s.scalar(StyleKey::FontSize), None);
+                    let byte_pos =
+                        self.display_to_value_byte(closest_cursor_pos(&positions, local_x));
                     if input.shift_pressed {
                         // Extend selection.
                         if self.selection_start.is_none() {
@@ -933,6 +1068,35 @@ impl TextInput {
                     }
                 }
             }
+            self.drag_selection_anchor = Some(if input.shift_pressed {
+                pre_click_anchor
+            } else {
+                self.cursor_pos
+            });
+        }
+
+        // Continue a primary-button selection after the press, including while
+        // the pointer is outside the field. The retained anchor makes reverse
+        // drags stable and lets the viewport scroll independently of the pointer.
+        if focused && self.drag_selection_anchor.is_some() && input.mouse_down && !clicked {
+            let byte_pos = if multiline {
+                let local_x = input.mouse_x - text_x;
+                let local_y = input.mouse_y - text_top + self.scroll_offset;
+                byte_at_point(&nav_layout, local_x, local_y)
+            } else {
+                let local_x =
+                    (input.mouse_x - text_x + self.horizontal_scroll_offset).clamp(0.0, f32::MAX);
+                let display = self.display_value();
+                let positions =
+                    list.text_cursor_positions(&display, s.scalar(StyleKey::FontSize), None);
+                self.display_to_value_byte(closest_cursor_pos(&positions, local_x))
+            };
+            self.selection_start = self.drag_selection_anchor;
+            self.cursor_pos = byte_pos;
+            self.desired_caret_x = None;
+        }
+        if !input.mouse_down {
+            self.drag_selection_anchor = None;
         }
 
         // Process keyboard events only while focused.
@@ -946,23 +1110,13 @@ impl TextInput {
         // (password) fields suppress the inline preedit so it can't leak.
         let composing = focused && !input.preedit.is_empty() && self.mask.is_none();
 
-        // ---- Draw background + border ----
-        // Honor `theme.border_radius` so text inputs match the other inputs
-        // (Dropdown/Button/Checkbox); `rounded_rect` falls back to a hard
-        // rectangle when the radius is 0, so a rectangular theme still works.
+        // ---- Draw background + border (the 4a input well) ----
+        // Sunken fill, black border, inset shadow, bottom light line; focus
+        // switches the border to the accent + soft outer ring (see
+        // `material::draw_well`). Hover keeps the resting border — the design
+        // highlights focus, not hover, on wells.
         let frame = Rect::new(self.x, self.y, self.width, self.height);
-        let radius = s.scalar(StyleKey::BorderRadius);
-        let border = s.scalar(StyleKey::BorderWidth);
-        let border_color = if focused {
-            s.color(StyleKey::InputFocusBorder)
-        } else if hovered {
-            s.color(StyleKey::Accent)
-        } else {
-            s.color(StyleKey::InputBorder)
-        };
-
-        list.rounded_rect(frame, radius, s.color(StyleKey::InputBackground));
-        list.rounded_rect_outline(frame, radius, border, border_color);
+        crate::widgets::material::draw_well(list, &s, frame, focused, false);
 
         // Render-time caret layout (multiline+focused), reflecting any edits made
         // this frame — used for autoscroll, per-line selection, and the caret.
@@ -978,14 +1132,15 @@ impl TextInput {
                 } else {
                     None
                 }
+
             )
         } else {
             Vec::new()
         };
 
-        // ---- Autoscroll to keep the caret line visible (multiline) ----
+        // ---- Autoscroll to keep the caret visible ----
         if multiline && focused {
-            let inner_h = (self.height - padding * 2.0).max(0.0);
+            let inner_h = (self.height - eff_pad_h * 2.0).max(1.0);
             let caret = caret_for_byte(&render_layout, self.cursor_pos);
             let caret_top = caret.line_top;
             let caret_h = if caret.line_height > 0.0 {
@@ -1002,9 +1157,36 @@ impl TextInput {
             if self.scroll_offset < 0.0 {
                 self.scroll_offset = 0.0;
             }
+        } else if !multiline {
+            let display = self.display_value();
+            let positions =
+                list.text_cursor_positions(&display, s.scalar(StyleKey::FontSize), None);
+            let caret_byte = self.value_to_display_byte(self.cursor_pos);
+            let caret_x = positions
+                .iter()
+                .find(|&&(byte, _)| byte >= caret_byte)
+                .map(|&(_, x)| x)
+                .unwrap_or_else(|| positions.last().map(|&(_, x)| x).unwrap_or(0.0));
+            let content_w = positions.last().map(|&(_, x)| x).unwrap_or(0.0);
+            if focused {
+                if caret_x < self.horizontal_scroll_offset {
+                    self.horizontal_scroll_offset = caret_x;
+                } else if caret_x > self.horizontal_scroll_offset + text_max_w {
+                    self.horizontal_scroll_offset = caret_x - text_max_w;
+                }
+            }
+            self.horizontal_scroll_offset = self
+                .horizontal_scroll_offset
+                .clamp(0.0, (content_w - text_max_w).max(0.0));
         }
 
         // ---- Resolve drawn text ----
+        // Reparse only after an edit or syntax configuration change. Cached byte
+        // ranges are shared into the per-frame TextBlock in constant time.
+        #[cfg(feature = "syntax-highlighting")]
+        if multiline && !composing {
+            self.update_syntax_cache();
+        }
         // The drawn string is the masked display (plaintext when unmasked); the
         // placeholder is shown unmasked when the value is empty. Built after the
         // autoscroll mutation above so the borrow it holds on `self` doesn't clash.
@@ -1015,18 +1197,17 @@ impl TextInput {
             (&display, s.color(StyleKey::Text))
         };
 
-        // Multiline content is clipped to the inner box (so wrapped + scrolled
-        // lines, the selection, and the caret never spill past the field).
-        if multiline {
-            list.push_clip(inner_rect);
-        }
+        // All editable content is clipped to the inner box. Multiline scrolls
+        // vertically; single-line fields scroll horizontally for long values.
+        list.push_clip_viewport(inner_rect);
 
-        // The vertical shift applied to text/selection/caret in multiline mode.
-        let scroll = if multiline {
-            self.scroll_offset
-        } else {
+        let scroll = if multiline { self.scroll_offset } else { 0.0 };
+        let horizontal_scroll = if multiline {
             0.0
+        } else {
+            self.horizontal_scroll_offset
         };
+        let draw_text_x = text_x - horizontal_scroll;
 
         // Render-time visual-order glyph layout of the *display* string for
         // single-line fields, shared by the bidi selection fill and the
@@ -1040,69 +1221,71 @@ impl TextInput {
                     Some(text_max_w),
                     wrap,
                     self.direction,
-                    if let Some(font) = s.theme().font.as_ref() {
-                        Some(font.family())
-                    } else {
-                        None
-                    }
+                if let Some(font) = s.theme().font.as_ref() {
+                    Some(font.family())
+                } else {
+                    None
+                }
+
                 )
             } else {
                 Vec::new()
             };
 
         // ---- Draw selection highlight ----
+        #[allow(clippy::collapsible_if)]
         if focused && !composing && !self.value.is_empty() {
-            if let Some((sel_start, sel_end)) = self.selection_range() {
-                if sel_start < sel_end {
-                    if multiline {
-                        let start_line = caret_for_byte(&render_layout, sel_start).line;
-                        let end_line = caret_for_byte(&render_layout, sel_end).line;
-                        for line in start_line..=end_line {
-                            let (line_lo, line_hi) = line_byte_range(&render_layout, line);
-                            let a = sel_start.max(line_lo);
-                            let b = sel_end.min(line_hi);
-                            if b < a {
-                                continue;
-                            }
-                            let x1 = line_x_for_byte(&render_layout, line, a);
-                            // Selection that continues onto the next line fills to
-                            // the inner edge (shows the newline is selected).
-                            let x2 = if sel_end > line_hi {
-                                text_max_w
-                            } else {
-                                line_x_for_byte(&render_layout, line, b)
-                            };
-                            let lt = render_layout
-                                .iter()
-                                .find(|p| p.line == line)
-                                .map(|p| p.line_top)
-                                .unwrap_or(0.0);
-                            list.quad(
-                                text_x + x1,
-                                text_top - scroll + lt,
-                                (x2 - x1).max(1.0),
-                                line_height,
-                                s.color(StyleKey::Accent),
-                            );
+            if let Some((sel_start, sel_end)) =
+                self.selection_range().filter(|(start, end)| start < end)
+            {
+                if multiline {
+                    let start_line = caret_for_byte(&render_layout, sel_start).line;
+                    let end_line = caret_for_byte(&render_layout, sel_end).line;
+                    for line in start_line..=end_line {
+                        let (line_lo, line_hi) = line_byte_range(&render_layout, line);
+                        let a = sel_start.max(line_lo);
+                        let b = sel_end.min(line_hi);
+                        if b < a {
+                            continue;
                         }
-                    } else {
-                        // Single-line: resolve bidi-correct visual rectangles.
-                        // A logically-contiguous selection can map to several
-                        // disjoint visual spans across an LTR↔RTL boundary, so
-                        // we draw one quad per returned rect. Selection bytes are
-                        // mapped to display bytes first (identity when unmasked;
-                        // masked bullets are LTR so this yields a single span).
-                        let ds = self.value_to_display_byte(sel_start);
-                        let de = self.value_to_display_byte(sel_end);
-                        for r in selection_rects(&caret_vis, ds, de) {
-                            list.quad(
-                                text_x + r.x,
-                                sl_band_top,
-                                r.w.max(1.0),
-                                sl_band_h,
-                                s.color(StyleKey::Accent),
-                            );
-                        }
+                        let x1 = line_x_for_byte(&render_layout, line, a);
+                        // Selection that continues onto the next line fills to
+                        // the inner edge (shows the newline is selected).
+                        let x2 = if sel_end > line_hi {
+                            text_max_w
+                        } else {
+                            line_x_for_byte(&render_layout, line, b)
+                        };
+                        let lt = render_layout
+                            .iter()
+                            .find(|p| p.line == line)
+                            .map(|p| p.line_top)
+                            .unwrap_or(0.0);
+                        list.quad(
+                            text_x + x1,
+                            text_top - scroll + lt,
+                            (x2 - x1).max(1.0),
+                            line_height,
+                            s.color(StyleKey::Accent),
+                        );
+                    }
+                } else {
+                    // Single-line: resolve bidi-correct visual rectangles.
+                    // A logically-contiguous selection can map to several
+                    // disjoint visual spans across an LTR↔RTL boundary, so
+                    // we draw one quad per returned rect. Selection bytes are
+                    // mapped to display bytes first (identity when unmasked;
+                    // masked bullets are LTR so this yields a single span).
+                    let ds = self.value_to_display_byte(sel_start);
+                    let de = self.value_to_display_byte(sel_end);
+                    for r in selection_rects(&caret_vis, ds, de) {
+                        list.quad(
+                            draw_text_x + r.x,
+                            sl_band_top,
+                            r.w.max(1.0),
+                            sl_band_h,
+                            s.color(StyleKey::Accent),
+                        );
                     }
                 }
             }
@@ -1125,7 +1308,7 @@ impl TextInput {
         let block_y = text_top - scroll;
         if let Some((_display, spans, _caret)) = &composed {
             let text_c = s.color(StyleKey::Text);
-            let text = TextBlock::new("", text_x, block_y)
+            let text = TextBlock::new("", draw_text_x, block_y)
                 .with_size(s.scalar(StyleKey::FontSize))
                 .with_wrap(wrap)
                 .with_color(
@@ -1138,7 +1321,7 @@ impl TextInput {
                 .with_spans(spans.clone());
             list.text(text);
         } else {
-            let text = TextBlock::new(text_content, text_x, block_y)
+            let text = TextBlock::new(text_content, draw_text_x, block_y)
                 .with_size(s.scalar(StyleKey::FontSize))
                 .with_wrap(wrap)
                 .with_color(
@@ -1148,6 +1331,12 @@ impl TextInput {
                 )
                 .with_max_width(text_max_w)
                 .with_direction(self.direction);
+            #[cfg(feature = "syntax-highlighting")]
+            let text = if multiline && !self.value.is_empty() && self.syntax.is_some() {
+                text.with_shared_style_ranges(self.syntax_ranges.clone())
+            } else {
+                text
+            };
             list.text(text);
         }
 
@@ -1170,19 +1359,16 @@ impl TextInput {
                 let cursor_x = if let Some((display, _spans, caret_byte)) = &composed {
                     // Caret position is measured on the composed display string so
                     // it sits inside the preedit where the IME asked.
-                    let positions = list.text_cursor_positions(
-                        display,
-                        s.scalar(StyleKey::FontSize),
-                        Some(text_max_w),
-                    );
+                    let positions =
+                        list.text_cursor_positions(display, s.scalar(StyleKey::FontSize), None);
                     let offset = positions
                         .iter()
                         .find(|&&(i, _)| i >= *caret_byte)
                         .map(|&(_, x)| x)
                         .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
-                    text_x + offset
+                    draw_text_x + offset
                 } else if self.value.is_empty() {
-                    text_x
+                    draw_text_x
                 } else {
                     // Edge-correct caret position from the visual layout: in RTL
                     // (or bidi) content the caret for a byte sits on the cell edge
@@ -1192,8 +1378,8 @@ impl TextInput {
                     // byte is mapped first (identity unmasked; masked = LTR).
                     let caret_disp = self.value_to_display_byte(self.cursor_pos);
                     crate::text::visual_caret_pos(&caret_vis, caret_disp)
-                        .map(|c| text_x + c.x)
-                        .unwrap_or(text_x)
+                        .map(|c| draw_text_x + c.x)
+                        .unwrap_or(draw_text_x)
                 };
                 // Single-line carets share the box-centred band as the selection
                 // (see `sl_band_top`/`sl_band_h`); multiline-composing keeps the
@@ -1209,10 +1395,9 @@ impl TextInput {
             }
         }
 
-        if multiline {
-            list.pop_clip();
-        }
+        list.pop_clip();
 
+        list.pop_debug_scope();
         clicked
     }
 }
@@ -1275,6 +1460,57 @@ mod tests {
     }
 
     #[test]
+    fn primary_drag_selects_text_and_keeps_anchor_outside_field() {
+        let mut ti = TextInput::new(0.0, 0.0, 90.0, 24.0).with_value("selection".to_string());
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+
+        let press = InputState {
+            mouse_x: 10.0,
+            mouse_y: 12.0,
+            mouse_down: true,
+            mouse_clicked: true,
+            ..Default::default()
+        };
+        focus.begin_frame(&press);
+        draw_input(&mut ti, 7, &mut focus, &mut list, &theme, &press);
+        let anchor = ti.cursor_pos;
+
+        list.clear();
+        let drag = InputState {
+            mouse_x: 200.0,
+            mouse_y: 12.0,
+            mouse_down: true,
+            is_dragging: true,
+            ..Default::default()
+        };
+        focus.begin_frame(&drag);
+        draw_input(&mut ti, 7, &mut focus, &mut list, &theme, &drag);
+        assert_eq!(ti.selection_start, Some(anchor));
+        assert_eq!(ti.cursor_pos, ti.value.len());
+        assert!(ti.selection_range().is_some_and(|(a, b)| a < b));
+    }
+
+    #[test]
+    fn long_single_line_scrolls_caret_into_inner_box() {
+        let mut ti = TextInput::new(0.0, 0.0, 80.0, 24.0)
+            .with_value("a very long value that cannot fit".to_string());
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        let input = InputState::default();
+        focus.focus(1);
+        focus.begin_frame(&input);
+        draw_input(&mut ti, 1, &mut focus, &mut list, &theme, &input);
+
+        assert!(ti.horizontal_scroll_offset > 0.0);
+        let caret = focus.ime_request().expect("focused input requests IME");
+        assert!(caret.x >= theme.padding);
+        assert!(caret.x <= ti.width - theme.padding + 0.1);
+    }
+
+    #[test]
     fn hover_requests_text_cursor() {
         use crate::{CursorIcon, CursorState};
         let mut ti = TextInput::new(5.0, 6.0, 120.0, 24.0).with_value("hi".to_string());
@@ -1334,7 +1570,10 @@ mod tests {
 
     #[test]
     fn password_builder_sets_bullet_mask() {
-        assert_eq!(TextInput::new(0.0, 0.0, 100.0, 24.0).password().mask, Some('•'));
+        assert_eq!(
+            TextInput::new(0.0, 0.0, 100.0, 24.0).password().mask,
+            Some('•')
+        );
         assert_eq!(
             TextInput::new(0.0, 0.0, 100.0, 24.0).with_mask('*').mask,
             Some('*')
@@ -1346,7 +1585,11 @@ mod tests {
     fn display_value_masks_per_char_but_value_is_plaintext() {
         let ti = make_input("secret").password();
         assert_eq!(ti.value, "secret", "value stays plaintext");
-        assert_eq!(&*ti.display_value(), "••••••", "display is one bullet per char");
+        assert_eq!(
+            &*ti.display_value(),
+            "••••••",
+            "display is one bullet per char"
+        );
         // Unmasked borrows the value unchanged.
         let plain = make_input("secret");
         assert_eq!(&*plain.display_value(), "secret");
@@ -1400,7 +1643,10 @@ mod tests {
         let mut ev = fake_input();
         ev.enter_pressed = true;
         ti.process_keyboard(&ev);
-        assert_eq!(ti.value, "pw", "masked field ignores multiline newline insertion");
+        assert_eq!(
+            ti.value, "pw",
+            "masked field ignores multiline newline insertion"
+        );
     }
 
     #[test]
@@ -1544,6 +1790,31 @@ mod tests {
         ti.process_keyboard(&input);
         assert_eq!(ti.selection_start, Some(0));
         assert_eq!(ti.cursor_pos, 11);
+    }
+
+    #[test]
+    fn explicit_shortcut_selects_all_without_text_input() {
+        let mut ti = make_input("hello world");
+        let input = InputState {
+            key_select_all: true,
+            ..Default::default()
+        };
+        ti.process_keyboard(&input);
+        assert_eq!(ti.selection_range(), Some((0, 11)));
+    }
+
+    #[test]
+    fn cut_without_clipboard_does_not_delete_selection() {
+        let mut ti = make_input("hello");
+        ti.selection_start = Some(0);
+        ti.cursor_pos = 5;
+        let input = InputState {
+            key_cut: true,
+            ..Default::default()
+        };
+        ti.process_keyboard(&input);
+        assert_eq!(ti.value, "hello");
+        assert_eq!(ti.selection_range(), Some((0, 5)));
     }
 
     #[test]
@@ -1739,17 +2010,15 @@ mod tests {
         let mut ti = make_input("hello world");
         ti.selection_start = Some(0);
         ti.cursor_pos = 5; // select "hello"
-        let copied_clone= copied.clone();
-        ti.set_clipboard_set(move |t|{
-            let mut copied = copied_clone.lock().unwrap();
-            copied.clone_from(&t)
+        ti.set_clipboard_set({
+            let copied = copied.clone();
+            move |t| *copied.lock().unwrap() = t
         });
         ti.cut();
         assert_eq!(ti.value, " world");
         assert_eq!(ti.cursor_pos, 0);
         assert_eq!(ti.selection_start, None);
-        let copied_clone= copied.clone();
-        assert_eq!(*copied_clone.lock().unwrap(), "hello");
+        assert_eq!(*copied.lock().unwrap(), "hello");
     }
 
     #[test]
@@ -1758,18 +2027,16 @@ mod tests {
         let mut ti = make_input("hello world");
         ti.selection_start = Some(6);
         ti.cursor_pos = 11; // select "world"
-        let copied_clone= copied.clone();
-        ti.set_clipboard_set(move |t|{
-            let mut copied = copied_clone.lock().unwrap();
-            copied.clone_from(&t)
+        ti.set_clipboard_set({
+            let copied = copied.clone();
+            move |t| *copied.lock().unwrap() = t
         });
         ti.copy();
         // Value unchanged after copy.
         assert_eq!(ti.value, "hello world");
         assert_eq!(ti.selection_start, Some(6));
         assert_eq!(ti.cursor_pos, 11);
-        let copied_clone= copied.clone();
-        assert_eq!(*copied_clone.lock().unwrap(), "world");
+        assert_eq!(*copied.lock().unwrap(), "world");
     }
 
     #[test]
@@ -1800,10 +2067,9 @@ mod tests {
         let mut ti = make_input("abcdef");
         ti.selection_start = Some(1);
         ti.cursor_pos = 4; // select "bcd"
-        let copied_clone= copied.clone();
-        ti.set_clipboard_set(move |t|{
-            let mut copied = copied_clone.lock().unwrap();
-            copied.clone_from(&t)
+        ti.set_clipboard_set({
+            let copied = copied.clone();
+            move |t| *copied.lock().unwrap() = t
         });
         let mut input = fake_input();
         input.ctrl_pressed = true;
@@ -1811,8 +2077,7 @@ mod tests {
         input.text_input = "\x18".to_string();
         ti.process_keyboard(&input);
         assert_eq!(ti.value, "aef");
-        let copied_clone= copied.clone();
-        assert_eq!(*copied_clone.lock().unwrap(), "bcd");
+        assert_eq!(*copied.lock().unwrap(), "bcd");
     }
 
     #[test]
@@ -1821,18 +2086,16 @@ mod tests {
         let mut ti = make_input("abcdef");
         ti.selection_start = Some(2);
         ti.cursor_pos = 5; // select "cde"
-        let copied_clone= copied.clone();
-        ti.set_clipboard_set(move |t|{
-            let mut copied = copied_clone.lock().unwrap();
-            copied.clone_from(&t)
+        ti.set_clipboard_set({
+            let copied = copied.clone();
+            move |t| *copied.lock().unwrap() = t
         });
         let mut input = fake_input();
         input.ctrl_pressed = true;
         input.text_input = "\x03".to_string(); // Ctrl+C ASCII code
         ti.process_keyboard(&input);
         assert_eq!(ti.value, "abcdef"); // unchanged
-        let copied_clone= copied.clone();
-        assert_eq!(*copied_clone.lock().unwrap(), "cde");
+        assert_eq!(*copied.lock().unwrap(), "cde");
     }
 
     #[test]
@@ -1899,7 +2162,7 @@ mod tests {
 
     /// Build a `[CaretPos]` layout matching what a multiline field lays out, so
     /// keyboard tests can exercise vertical nav / line Home-End off-screen.
-    fn caret_layout(text: &str, max_width: f32, family_name: Option<&str>) -> Vec<CaretPos> {
+    fn caret_layout(text: &str, max_width: f32) -> Vec<CaretPos> {
         let fsh = crate::text::shared_font_system();
         let mut fs = fsh.lock().unwrap();
         crate::text::text_caret_layout(
@@ -1909,7 +2172,7 @@ mod tests {
             20.0,
             max_width,
             WrapMode::WordOrGlyph,
-            family_name,
+            None,
             crate::text::TextDirection::Auto,
         )
     }
@@ -1941,7 +2204,7 @@ mod tests {
     fn up_down_move_across_lines() {
         // Two short lines; the layout is unambiguous.
         let mut ti = make_input("foo\nbar").with_multiline(true);
-        let layout = caret_layout("foo\nbar", 1000.0, Some("Alibaba PuHuiTi 2.0"));
+        let layout = caret_layout("foo\nbar", 1000.0);
         // Put the cursor at the end of line 0 ("foo", byte 3).
         ti.cursor_pos = 3;
         // Down → land on line 1.
@@ -1967,7 +2230,7 @@ mod tests {
     #[test]
     fn up_at_top_and_down_at_bottom_are_noops() {
         let mut ti = make_input("foo\nbar").with_multiline(true);
-        let layout = caret_layout("foo\nbar", 1000.0, Some("Alibaba PuHuiTi 2.0"));
+        let layout = caret_layout("foo\nbar", 1000.0);
         ti.cursor_pos = 1; // line 0
         let mut up = fake_input();
         up.key_up = true;
@@ -1992,7 +2255,7 @@ mod tests {
     #[test]
     fn shift_down_extends_selection() {
         let mut ti = make_input("foo\nbar").with_multiline(true);
-        let layout = caret_layout("foo\nbar", 1000.0, Some("Alibaba PuHuiTi 2.0"));
+        let layout = caret_layout("foo\nbar", 1000.0);
         ti.cursor_pos = 1;
         let mut ev = fake_input();
         ev.key_down = true;
@@ -2012,7 +2275,7 @@ mod tests {
         // column on line 0 should keep the column across the short middle line.
         let text = "abcdefghij\nx\nabcdefghij";
         let mut ti = make_input(text).with_multiline(true);
-        let layout = caret_layout(text, 1000.0, Some("Alibaba PuHuiTi 2.0"));
+        let layout = caret_layout(text, 1000.0);
         // Place the caret near the end of line 0 (byte 10, the '\n').
         ti.cursor_pos = 10;
         let start_x = caret_for_byte(&layout, ti.cursor_pos).x;
@@ -2049,7 +2312,7 @@ mod tests {
     fn home_end_are_line_relative_in_multiline() {
         let text = "hello\nworld";
         let mut ti = make_input(text).with_multiline(true);
-        let layout = caret_layout(text, 1000.0, Some("Alibaba PuHuiTi 2.0"));
+        let layout = caret_layout(text, 1000.0);
         // Cursor in the middle of line 1 ("world", byte 8).
         ti.cursor_pos = 8;
         let mut home = fake_input();
@@ -2065,7 +2328,7 @@ mod tests {
     #[test]
     fn line_bounds_finds_visual_line_extent() {
         let text = "ab\ncd";
-        let layout = caret_layout(text, 1000.0,Some("Alibaba PuHuiTi 2.0"));
+        let layout = caret_layout(text, 1000.0);
         // Byte 4 is on line 1 ("cd", bytes 3..5).
         let (lo, hi) = line_bounds(&layout, 4);
         assert_eq!(lo, 3);
@@ -2157,5 +2420,33 @@ mod tests {
         assert_eq!(floor_char_boundary("é", 1), 0);
         assert_eq!(floor_char_boundary("é", 2), 2);
         assert_eq!(floor_char_boundary("é", 99), 2, "clamped to len");
+    }
+
+    #[cfg(feature = "syntax-lua")]
+    #[test]
+    fn syntax_cache_rebuilds_only_for_value_or_configuration_changes() {
+        let syntax = crate::SyntaxHighlighting::lua(crate::SyntaxTheme::default()).unwrap();
+        let mut field = TextInput::new(0.0, 0.0, 200.0, 100.0)
+            .with_multiline(true)
+            .with_value("local x = 1")
+            .with_syntax_highlighting(syntax.clone());
+
+        field.update_syntax_cache();
+        assert_eq!(field.syntax_rebuilds, 1);
+        let first = field.syntax_ranges.clone();
+        field.update_syntax_cache();
+        assert_eq!(field.syntax_rebuilds, 1);
+        assert!(std::sync::Arc::ptr_eq(&first, &field.syntax_ranges));
+
+        field.value.push_str("\nreturn x");
+        field.update_syntax_cache();
+        assert_eq!(field.syntax_rebuilds, 2);
+        assert!(!std::sync::Arc::ptr_eq(&first, &field.syntax_ranges));
+
+        let mut changed_theme = crate::SyntaxTheme::default();
+        changed_theme.keyword = [1.0, 0.0, 0.0, 1.0];
+        field.set_syntax_highlighting(Some(crate::SyntaxHighlighting::lua(changed_theme).unwrap()));
+        field.update_syntax_cache();
+        assert_eq!(field.syntax_rebuilds, 3);
     }
 }

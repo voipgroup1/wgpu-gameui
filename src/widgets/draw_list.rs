@@ -4,7 +4,7 @@ use crate::affine::Affine2;
 use crate::layout::Rect;
 use crate::render::SpriteId;
 #[cfg(feature = "phosphor-icons")]
-use crate::render::{PhosphorIcon, phosphor_glyph_id};
+use crate::render::{IconGlyph, PhosphorIcon};
 use crate::text::{FontHandle, FontSystemHandle, FontVMetrics, TextBlock, TextMeasurer, Underline};
 
 pub(crate) const ROUNDED_RECT_CORNER_SEGMENTS: usize = 8;
@@ -22,7 +22,7 @@ fn next_draw_list_id() -> u64 {
 
 /// A colored vertex for triangle-based rendering.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     /// World-space position `[x, y]`.
     pub position: [f32; 2],
@@ -81,6 +81,11 @@ pub struct IconDraw {
     /// sprite) for cropped draws. `None` draws the whole sprite. Resolved
     /// against the atlas region at render time.
     pub src: Option<[f32; 4]>,
+    /// Tile-wrap flag: when `true`, `src` is a UV span in *tile units*
+    /// (u1/v1 may exceed 1) and the fragment shader repeats the source
+    /// region modulo its size, cropping at the draw's edges. Written only by
+    /// [`DrawList::image_tiled`].
+    pub wrap: bool,
 }
 
 /// A single instanced "chrome" rect (button background + border) for the SDF
@@ -98,6 +103,9 @@ pub struct ChromeInstance {
     pub rect: [f32; 4],
     /// Fill (background) color, tint already applied.
     pub bg: [f32; 4],
+    /// Gradient partner for `bg`: the fill is a vertical gradient from `bg` at
+    /// the top edge to `bg2` at the bottom edge. Equal to `bg` for a flat fill.
+    pub bg2: [f32; 4],
     /// Border color, tint already applied.
     pub border: [f32; 4],
     /// Clip rect `[x, y, w, h]` (ignored unless `params[2] > 0.5`).
@@ -128,7 +136,7 @@ pub struct CircleInstance {
     pub params: [f32; 4],
 }
 
-/// One entry in a [`DrawList`]'s ordered color-stage command stream.
+/// One entry in a [`DrawList`]'s ordered paint stream.
 ///
 /// The colored-quad stage is no longer a single soup draw: chrome rects are
 /// instanced and must interleave with surrounding soup geometry in submission
@@ -138,13 +146,22 @@ pub struct CircleInstance {
 /// pipeline. When no `chrome_rect` is ever called the stream stays empty and the
 /// renderer keeps its original single-draw fast path.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum ColorCmd {
+pub(crate) enum PaintCmd {
     /// Draw soup index positions `start..end` (absolute into `indices`).
     Soup { indices: std::ops::Range<u32> },
     /// Draw chrome instances `start..end` (into `chrome_instances`).
     Chrome { instances: std::ops::Range<u32> },
     /// Draw circle instances `start..end` (into `circle_instances`).
     Circle { instances: std::ops::Range<u32> },
+    /// Draw nine-slice payloads `start..end`.
+    NineSlice { draws: std::ops::Range<u32> },
+    /// Draw atlas icon/image payloads `start..end`.
+    Icon { draws: std::ops::Range<u32> },
+    /// Draw MSDF icon payloads `start..end`.
+    #[cfg(feature = "phosphor-icons")]
+    IconMsdf { draws: std::ops::Range<u32> },
+    /// Draw text payloads `start..end`.
+    Text { draws: std::ops::Range<u32> },
 }
 
 /// Opaque handle to a registered nine-slice resource.
@@ -184,12 +201,146 @@ pub struct IconMsdf {
     pub local: Rect,
     /// Affine applied to each fitted quad corner during tessellation.
     pub transform: Affine2,
-    /// Resolved Phosphor glyph index (from [`PhosphorIcon`] at push time).
-    pub glyph_id: u16,
+    /// Glyph resolved at push time — which icon font, and which glyph in it.
+    /// Resolving here (rather than at render time) keeps the render pass free of
+    /// registry lookups and lets a command outlive the enum it came from.
+    pub glyph: IconGlyph,
     /// Multiplied with the sampled field's fill color. Default white.
     pub tint: [f32; 4],
     /// Optional clip rect; `None` draws unclipped.
     pub clip: Option<Rect>,
+}
+
+/// Per-buffer element counts — a snapshot of how much geometry a [`DrawList`]
+/// held at one instant, or (as a difference of two snapshots) how much a
+/// [`DebugScope`] emitted.
+///
+/// Every geometry buffer on `DrawList` is append-only between [`DrawList::clear`]
+/// calls, so a pair of these snapshots delimits a contiguous, stable range in
+/// each buffer. That is what lets debug scopes be recorded without touching a
+/// single primitive method.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrimCounts {
+    /// Soup vertices ([`DrawList::vertices`]).
+    pub vertices: usize,
+    /// Soup indices ([`DrawList::indices`]).
+    pub indices: usize,
+    /// Text blocks ([`DrawList::texts`]).
+    pub texts: usize,
+    /// Atlas icon draws ([`DrawList::icons`]).
+    pub icons: usize,
+    /// Nine-slice draws ([`DrawList::nine_slices`]).
+    pub nine_slices: usize,
+    /// MSDF vector icon draws ([`DrawList::icons_msdf`]).
+    #[cfg(feature = "phosphor-icons")]
+    pub icons_msdf: usize,
+    /// Instanced chrome rects ([`DrawList::chrome_instances`]).
+    pub chrome_instances: usize,
+    /// Instanced circles ([`DrawList::circle_instances`]).
+    pub circle_instances: usize,
+    /// Primitives silently dropped by a non-positive size/radius/thickness
+    /// guard. These leave **no trace in any buffer**, so this counter is the
+    /// only evidence that an element collapsed — see
+    /// [`DrawList::dropped_degenerate`].
+    pub dropped_degenerate: usize,
+}
+
+impl PrimCounts {
+    /// Total number of drawn primitives, counting each soup *triangle* once
+    /// (soup vertices are shared, so raw vertex count overstates the work).
+    pub fn total(&self) -> usize {
+        let soup_tris = self.indices / 3;
+        #[cfg(feature = "phosphor-icons")]
+        let msdf = self.icons_msdf;
+        #[cfg(not(feature = "phosphor-icons"))]
+        let msdf = 0;
+        soup_tris
+            + self.texts
+            + self.icons
+            + self.nine_slices
+            + msdf
+            + self.chrome_instances
+            + self.circle_instances
+    }
+
+    /// Element-wise `self - earlier`, saturating at zero. Use this to turn a
+    /// scope's `(start, end)` snapshot pair into "what this scope emitted".
+    pub fn since(&self, earlier: PrimCounts) -> PrimCounts {
+        PrimCounts {
+            vertices: self.vertices.saturating_sub(earlier.vertices),
+            indices: self.indices.saturating_sub(earlier.indices),
+            texts: self.texts.saturating_sub(earlier.texts),
+            icons: self.icons.saturating_sub(earlier.icons),
+            nine_slices: self.nine_slices.saturating_sub(earlier.nine_slices),
+            #[cfg(feature = "phosphor-icons")]
+            icons_msdf: self.icons_msdf.saturating_sub(earlier.icons_msdf),
+            chrome_instances: self
+                .chrome_instances
+                .saturating_sub(earlier.chrome_instances),
+            circle_instances: self
+                .circle_instances
+                .saturating_sub(earlier.circle_instances),
+            dropped_degenerate: self
+                .dropped_degenerate
+                .saturating_sub(earlier.dropped_degenerate),
+        }
+    }
+
+    /// True when no primitives at all fall in this span.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// A named region of a [`DrawList`], recorded by
+/// [`push_debug_scope`](DrawList::push_debug_scope) /
+/// [`pop_debug_scope`](DrawList::pop_debug_scope).
+///
+/// Scopes are pure instrumentation — they emit no geometry and cost nothing
+/// unless pushed. Each one owns the contiguous span of primitives emitted
+/// between its push and its pop, which is what
+/// [`DebugReport`](crate::debug::DebugReport) turns into a named, nested tree
+/// of bounding boxes.
+///
+/// **Widget implementors** should use
+/// [`push_debug_scope_rect`](DrawList::push_debug_scope_rect) and declare the
+/// `Rect` the widget was handed: without a declared rect a scope's bounds are
+/// derived from what it painted, so it can never be found to have overflowed,
+/// and a widget that collapsed to nothing is indistinguishable from one that was
+/// never drawn. This crate's own widgets all do it, so applications get those
+/// checks for free and never supply geometry themselves — for an application, a
+/// scope is only ever a label ([`UiContext::debug_scope`](crate::UiContext::debug_scope)).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugScope {
+    /// Caller-supplied label, e.g. `"settings_window/ok_button"`.
+    pub name: String,
+    /// Index of the enclosing scope in [`DrawList::debug_scopes`], if nested.
+    pub parent: Option<usize>,
+    /// Nesting depth (0 for a top-level scope).
+    pub depth: usize,
+    /// The box this scope said it would paint into, in **world space** (the
+    /// active transform is applied at push time, as [`DrawList::push_clip`]
+    /// does). `None` when opened via [`DrawList::push_debug_scope`].
+    pub declared: Option<Rect>,
+    /// The clip rect in force when the scope was pushed, in world space.
+    /// Recorded directly rather than reconstructed from per-primitive clip
+    /// data, so it stays correct for primitives that carry no clip of their own.
+    pub clip: Option<Rect>,
+    /// Buffer lengths when the scope was pushed.
+    pub start: PrimCounts,
+    /// Buffer lengths when the scope was popped. Equal to `start` until then;
+    /// a scope left unpopped at report time is treated as closing at the end of
+    /// the list.
+    pub end: PrimCounts,
+    /// False until [`pop_debug_scope`](DrawList::pop_debug_scope) closes it.
+    pub closed: bool,
+}
+
+impl DebugScope {
+    /// Primitives emitted inside this scope (including nested child scopes).
+    pub fn counts(&self) -> PrimCounts {
+        self.end.since(self.start)
+    }
 }
 
 /// Draw list for collecting render commands.
@@ -213,22 +364,35 @@ pub struct DrawList {
     pub icons_msdf: Vec<IconMsdf>,
     /// Instanced chrome rects (button backgrounds/borders, plus rect/rounded-rect
     /// fills and outlines). Drawn by the chrome pipeline; interleaved with soup
-    /// geometry via `DrawList::color_cmds`.
+    /// geometry via `DrawList::paint_cmds`.
     pub chrome_instances: Vec<ChromeInstance>,
     /// Instanced circles (filled discs + ring outlines). Drawn by the circle
-    /// SDF pipeline; interleaved with soup/chrome via `DrawList::color_cmds`.
+    /// SDF pipeline; interleaved with soup/chrome via `DrawList::paint_cmds`.
     pub circle_instances: Vec<CircleInstance>,
     /// Ordered color-stage command stream (soup runs interleaved with chrome
     /// instance runs). Empty unless [`DrawList::chrome_rect`] was used, in which
     /// case the renderer falls back to a single soup draw.
-    pub(crate) color_cmds: Vec<ColorCmd>,
+    pub(crate) paint_cmds: Vec<PaintCmd>,
     /// Count of soup index positions already committed to a `Soup` command. Soup
     /// appended after the last command is the implicit trailing run.
     pub(crate) soup_committed_indices: u32,
     pub(crate) text_measurer: TextMeasurer,
     clip_stack: Vec<Rect>,
+    /// World-space rects of clips pushed via
+    /// [`push_clip_viewport`](DrawList::push_clip_viewport). See
+    /// [`viewport_clips`](DrawList::viewport_clips).
+    viewport_clips: Vec<Rect>,
     transform_stack: Vec<Affine2>,
     tint_stack: Vec<[f32; 4]>,
+    /// Recorded debug scopes, in push order. Empty (and never allocated) unless
+    /// [`push_debug_scope`](Self::push_debug_scope) is used, so instrumentation
+    /// costs nothing when it is off.
+    debug_scopes: Vec<DebugScope>,
+    /// Indices into `debug_scopes` for the currently-open scopes.
+    debug_scope_stack: Vec<usize>,
+    /// Running count of primitives rejected by a non-positive size/radius/
+    /// thickness guard. See [`DrawList::dropped_degenerate`].
+    dropped_degenerate: u32,
     /// Logged-once flag for "tried to draw rotated text" — glyphon does not
     /// support rotation, so we silently render axis-aligned.
     text_rotation_warned: bool,
@@ -250,12 +414,16 @@ impl Default for DrawList {
             icons_msdf: Vec::new(),
             chrome_instances: Vec::new(),
             circle_instances: Vec::new(),
-            color_cmds: Vec::new(),
+            paint_cmds: Vec::new(),
             soup_committed_indices: 0,
             text_measurer: TextMeasurer::default(),
             clip_stack: Vec::new(),
+            viewport_clips: Vec::new(),
             transform_stack: vec![Affine2::IDENTITY],
             tint_stack: vec![[1.0, 1.0, 1.0, 1.0]],
+            debug_scopes: Vec::new(),
+            debug_scope_stack: Vec::new(),
+            dropped_degenerate: 0,
             text_rotation_warned: false,
             id: next_draw_list_id(),
         }
@@ -294,12 +462,16 @@ impl DrawList {
             icons_msdf: Vec::new(),
             chrome_instances: Vec::new(),
             circle_instances: Vec::new(),
-            color_cmds: Vec::new(),
+            paint_cmds: Vec::new(),
             soup_committed_indices: 0,
             text_measurer: TextMeasurer::with_font_system(font_system),
             clip_stack: Vec::new(),
+            viewport_clips: Vec::new(),
             transform_stack: vec![Affine2::IDENTITY],
             tint_stack: vec![[1.0, 1.0, 1.0, 1.0]],
+            debug_scopes: Vec::new(),
+            debug_scope_stack: Vec::new(),
+            dropped_degenerate: 0,
             text_rotation_warned: false,
             id: next_draw_list_id(),
         }
@@ -314,10 +486,13 @@ impl DrawList {
         self.id
     }
 
-    /// Clear all queued geometry/commands and reset the clip, transform, and
-    /// tint stacks to their identity base, ready to reuse for the next frame.
-    /// The shared font system / measurer is retained.
+    /// Clear all queued geometry/commands and reset the clip, transform, tint,
+    /// and debug-scope stacks to their base state, ready to reuse for the next
+    /// frame. The shared font system / measurer is retained.
     pub fn clear(&mut self) {
+        self.debug_scopes.clear();
+        self.debug_scope_stack.clear();
+        self.dropped_degenerate = 0;
         self.vertices.clear();
         self.indices.clear();
         self.texts.clear();
@@ -327,9 +502,10 @@ impl DrawList {
         self.icons_msdf.clear();
         self.chrome_instances.clear();
         self.circle_instances.clear();
-        self.color_cmds.clear();
+        self.paint_cmds.clear();
         self.soup_committed_indices = 0;
         self.clip_stack.clear();
+        self.viewport_clips.clear();
         self.transform_stack.clear();
         self.transform_stack.push(Affine2::IDENTITY);
         self.tint_stack.clear();
@@ -349,13 +525,41 @@ impl DrawList {
         self.text_measurer.measure(text, font_size, max_width)
     }
 
+    /// Measure a queued [`TextBlock`] exactly as it will be laid out — font,
+    /// weight, style, wrap, and vertical stacking included. See
+    /// [`TextMeasurer::measure_block`]; prefer this over
+    /// [`measure_text`](Self::measure_text), which assumes the default font at
+    /// normal weight and style.
+    pub fn measure_block(&mut self, block: &TextBlock) -> (f32, f32) {
+        self.text_measurer.measure_block(block)
+    }
+
+    /// Borrow the narrow CPU text-measurement service used by contextual widget
+    /// measurement. It shares font state and caches with this draw list.
+    pub(crate) fn text_measurer_mut(&mut self) -> &mut TextMeasurer {
+        &mut self.text_measurer
+    }
+
+    /// The band of real glyph ink a queued [`TextBlock`] paints, as `(top,
+    /// bottom)` offsets below its top edge. `None` when it inks nothing.
+    ///
+    /// See [`TextMeasurer::measure_block_ink`] — this is the *painted* extent,
+    /// where [`measure_block`](Self::measure_block) is the *reserved* one, and a
+    /// vertically centred label deliberately makes those two disagree.
+    pub fn measure_block_ink(&mut self, block: &TextBlock) -> Option<(f32, f32)> {
+        self.text_measurer.measure_block_ink(block)
+    }
+
     /// Per-font vertical metrics for optical (cap-height) centring, for the given
     /// font at Normal weight/style (the only combination widget labels centre).
     /// Cached per font. Exposed mainly so debug tooling can draw the band; most
     /// callers want [`Self::vcentered_text_y`].
     pub fn font_vmetrics(&mut self, font: Option<&FontHandle>) -> FontVMetrics {
-        self.text_measurer
-            .vmetrics(font, glyphon::Weight::NORMAL, glyphon::Style::Normal)
+        self.text_measurer.vmetrics(
+            font,
+            glyphon::cosmic_text::Weight::NORMAL,
+            glyphon::cosmic_text::Style::Normal,
+        )
     }
 
     /// Top `y` for a single-line text block of `font_size` so the label `text` is
@@ -449,6 +653,128 @@ impl DrawList {
         crate::text::text_visual_layout(&mut fs, text, font_size, lh, mw, wrap, family_name, direction)
     }
 
+    // ---- Debug scopes ----
+
+    /// Current buffer lengths, as a [`PrimCounts`] snapshot.
+    pub(crate) fn prim_counts(&self) -> PrimCounts {
+        PrimCounts {
+            vertices: self.vertices.len(),
+            indices: self.indices.len(),
+            texts: self.texts.len(),
+            icons: self.icons.len(),
+            nine_slices: self.nine_slices.len(),
+            #[cfg(feature = "phosphor-icons")]
+            icons_msdf: self.icons_msdf.len(),
+            chrome_instances: self.chrome_instances.len(),
+            circle_instances: self.circle_instances.len(),
+            dropped_degenerate: self.dropped_degenerate as usize,
+        }
+    }
+
+    /// Open a named debug scope. Everything drawn until the matching
+    /// [`pop_debug_scope`](Self::pop_debug_scope) is attributed to `name` in the
+    /// [`DebugReport`](crate::debug::DebugReport).
+    ///
+    /// Emits no geometry and does not affect rendering in any way. Scopes nest.
+    ///
+    /// This is the labelling form. If you are **implementing a widget**, use
+    /// [`push_debug_scope_rect`](Self::push_debug_scope_rect) instead and declare
+    /// the `Rect` you were handed.
+    pub fn push_debug_scope(&mut self, name: impl Into<String>) {
+        self.open_debug_scope(name.into(), None);
+    }
+
+    /// Open a named debug scope declaring the box it was allocated — **the entry
+    /// point for widget implementors**.
+    ///
+    /// Pass the `Rect` the widget received from layout (or, for a widget that
+    /// stores its own geometry, the rect it derives from its fields). That is the
+    /// one fact the draw list cannot recover on its own: it records what was
+    /// painted, never what was assigned. Declaring it is what lets the report
+    /// tell "painted outside its box" and "drew nothing at all" apart from a
+    /// region that simply had little to draw.
+    ///
+    /// Applications never need this — every widget in this crate declares its
+    /// own allocation, so a caller only ever supplies a *label* via
+    /// [`push_debug_scope`](Self::push_debug_scope). Downstream custom widgets
+    /// should call this for the same reason the built-ins do.
+    ///
+    /// `rect` is in local space and transformed to its world-space AABB by the
+    /// active transform, matching [`push_clip`](Self::push_clip).
+    pub fn push_debug_scope_rect(&mut self, name: impl Into<String>, rect: Rect) {
+        let world = self.current_transform().transform_rect_aabb(rect);
+        self.open_debug_scope(name.into(), Some(world));
+    }
+
+    fn open_debug_scope(&mut self, name: String, declared: Option<Rect>) {
+        let start = self.prim_counts();
+        let parent = self.debug_scope_stack.last().copied();
+        let depth = self.debug_scope_stack.len();
+        let index = self.debug_scopes.len();
+        self.debug_scopes.push(DebugScope {
+            name,
+            parent,
+            depth,
+            declared,
+            clip: self.current_clip(),
+            start,
+            end: start,
+            closed: false,
+        });
+        self.debug_scope_stack.push(index);
+    }
+
+    /// Close the innermost open debug scope. No-op when none is open, so an
+    /// unbalanced pop cannot corrupt the record (it just loses attribution).
+    pub fn pop_debug_scope(&mut self) {
+        let Some(index) = self.debug_scope_stack.pop() else {
+            return;
+        };
+        let end = self.prim_counts();
+        let scope = &mut self.debug_scopes[index];
+        scope.end = end;
+        scope.closed = true;
+    }
+
+    /// All debug scopes recorded on this list, in push order. Parent indices in
+    /// [`DebugScope::parent`] refer into this slice.
+    pub fn debug_scopes(&self) -> &[DebugScope] {
+        &self.debug_scopes
+    }
+
+    /// How many primitives were rejected by a non-positive size, radius, or
+    /// thickness guard since the last [`clear`](Self::clear).
+    ///
+    /// This is the crate's only signal for a whole class of layout bug. Every
+    /// primitive returns early on a degenerate rect — `quad` bails on
+    /// `width <= 0.0`, and so on — which means an element whose size was
+    /// computed as, say, `rect.width - padding * 2.0` and came out negative
+    /// **vanishes leaving nothing at all in any buffer**. No amount of
+    /// inspecting the geometry can distinguish that from an element that was
+    /// never meant to be drawn; a non-zero count here can.
+    ///
+    /// Note that a legitimately hidden element (an `if` that chose not to draw)
+    /// does *not* increment this — only one that asked to draw something
+    /// impossible.
+    pub fn dropped_degenerate(&self) -> u32 {
+        self.dropped_degenerate
+    }
+
+    /// Number of debug scopes currently open. Callers that scope by depth (as
+    /// [`UiContext`](crate::UiContext) does) snapshot this and
+    /// [`truncate_debug_scopes`](Self::truncate_debug_scopes) back to it.
+    pub fn debug_scope_depth(&self) -> usize {
+        self.debug_scope_stack.len()
+    }
+
+    /// Close open debug scopes until only `depth` remain (no-op if already at
+    /// or below `depth`).
+    pub fn truncate_debug_scopes(&mut self, depth: usize) {
+        while self.debug_scope_stack.len() > depth {
+            self.pop_debug_scope();
+        }
+    }
+
     // ---- Clip stack ----
 
     /// Push a clipping rectangle. Nested clips are intersected with the current clip.
@@ -458,6 +784,17 @@ impl DrawList {
     /// approximate (over-clips along the diagonal) under rotation. Document the
     /// limitation rather than silently drawing wrong.
     pub fn push_clip(&mut self, rect: Rect) {
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            log::warn!(
+                "push_clip: degenerate input rect ({w:.1}×{h:.1} at ({x:.0},{y:.0})) — \
+                 all content under this clip will be invisible. Check that the \
+                 widget's padding doesn't exceed its size.",
+                w = rect.width,
+                h = rect.height,
+                x = rect.x,
+                y = rect.y,
+            );
+        }
         let world_rect = self.current_transform().transform_rect_aabb(rect);
         let clip = match self.current_clip() {
             Some(current) => current
@@ -476,6 +813,36 @@ impl DrawList {
     pub fn push_clip_exact(&mut self, rect: Rect) {
         let world_rect = self.current_transform().transform_rect_aabb(rect);
         self.clip_stack.push(world_rect);
+    }
+
+    /// Push a clip that is a **viewport**: a deliberately small window onto
+    /// content that is expected to be larger than it — a scroll view, a
+    /// dropdown's option list, a horizontally-scrolled text field.
+    ///
+    /// Geometrically identical to [`push_clip`](Self::push_clip). The only
+    /// difference is intent, and intent is exactly what the debug report cannot
+    /// infer: a clip that removes an element entirely is a layout bug when the
+    /// clip is a hard boundary (a window, a panel) and *the whole point* when it
+    /// is a viewport. Recording which is which is what lets
+    /// [`DebugReport`](crate::debug::DebugReport) flag the first and stay quiet
+    /// about the second.
+    ///
+    /// The recorded rect is the effective (already intersected, world-space)
+    /// clip, and the marking is sticky for the subtree: anything drawn while
+    /// this clip is active — including under further nested clips — counts as
+    /// living inside a viewport.
+    pub fn push_clip_viewport(&mut self, rect: Rect) {
+        self.push_clip(rect);
+        if let Some(clip) = self.current_clip() {
+            self.viewport_clips.push(clip);
+        }
+    }
+
+    /// Effective world-space rects of every viewport clip pushed this frame, in
+    /// push order. Read by the debug report; see
+    /// [`push_clip_viewport`](Self::push_clip_viewport).
+    pub fn viewport_clips(&self) -> &[Rect] {
+        &self.viewport_clips
     }
 
     /// Pop the current clipping rectangle.
@@ -609,6 +976,27 @@ impl DrawList {
         self.indices.extend_from_slice(&[base, base + 1, base + 2]);
     }
 
+    /// Add a single triangle with a distinct color per corner, in `p0`, `p1`,
+    /// `p2` order — the GPU interpolates linearly across the face. Like
+    /// [`Self::quad_gradient`], this reproduces any *linear* color ramp over
+    /// the triangle exactly (used for fills whose alpha follows an axis, e.g.
+    /// the curve editor's under-curve fade). Always soup geometry.
+    pub fn triangle_gradient(
+        &mut self,
+        p0: (f32, f32),
+        p1: (f32, f32),
+        p2: (f32, f32),
+        c0: [f32; 4],
+        c1: [f32; 4],
+        c2: [f32; 4],
+    ) {
+        let base = self.vertices.len() as u32;
+        self.vertices.push(self.vertex(p0.0, p0.1, c0));
+        self.vertices.push(self.vertex(p1.0, p1.1, c1));
+        self.vertices.push(self.vertex(p2.0, p2.1, c2));
+        self.indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+
     /// Add a filled rectangle.
     ///
     /// Fast path (translation-only transform): records a single fill-only SDF
@@ -619,6 +1007,7 @@ impl DrawList {
     /// still transforms correctly.
     pub fn quad(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
         if width <= 0.0 || height <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
         if self.current_transform().is_translate_only() {
@@ -656,6 +1045,7 @@ impl DrawList {
     /// transform + tint via `vertex`. No-op on non-positive size.
     pub fn quad_gradient(&mut self, rect: Rect, colors: [[f32; 4]; 4]) {
         if rect.width <= 0.0 || rect.height <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
         let x0 = rect.x;
@@ -686,6 +1076,7 @@ impl DrawList {
     /// [`vertical_gradient`](Self::vertical_gradient).
     pub fn linear_gradient(&mut self, rect: Rect, start: [f32; 4], end: [f32; 4], angle: f32) {
         if rect.width <= 0.0 || rect.height <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
         let (s, c) = angle.sin_cos();
@@ -718,6 +1109,113 @@ impl DrawList {
         self.quad_gradient(rect, [top, top, bottom, bottom]);
     }
 
+    /// Draw a soft rectangular **drop shadow** below/around a floating surface
+    /// (the design language's outer `box-shadow`s: dropdown lists, tooltips,
+    /// toasts, popovers, modals).
+    ///
+    /// `offset_y` shifts the **falloff** down (a positive design y-offset);
+    /// `blur` is the CSS-style blur radius. The opaque core always remains
+    /// beneath `rect`: translating it would expose a solid strip below the
+    /// surface whenever `offset_y` is nonzero. The upper/lower skirts instead
+    /// become asymmetrical, which preserves the directional shadow without an
+    /// offset copy of the panel. `radius` rounds the core so a shadow under a
+    /// rounded sheet doesn't poke out square corners.
+    ///
+    /// Built from five butt-joined gradient rects (top skirt, core, bottom
+    /// skirt, left/right skirts) — under a translation-only transform each is
+    /// a cheap instanced SDF rect; under rotation they fall back to soup.
+    /// Paints the shadow only: draw it *before* the surface so the sheet
+    /// covers the opaque center.
+    pub fn drop_shadow(
+        &mut self,
+        rect: Rect,
+        offset_y: f32,
+        blur: f32,
+        radius: f32,
+        color: [f32; 4],
+    ) {
+        if color[3] <= 0.0 || (blur <= 0.0 && offset_y == 0.0) {
+            self.dropped_degenerate += 1;
+            return;
+        }
+        if blur <= 0.0 {
+            // Without a falloff there is no way to express directional shadow
+            // without duplicating the entire surface as an opaque offset rect.
+            self.dropped_degenerate += 1;
+            return;
+        }
+
+        if rect.is_empty() {
+            self.dropped_degenerate += 1;
+            return;
+        }
+
+        let rgb = [color[0], color[1], color[2]];
+        let zero = [rgb[0], rgb[1], rgb[2], 0.0];
+        // CSS blur convolution softens even the part of the shadow touching the
+        // surface edge. Starting our linear skirts at the unblurred alpha made
+        // their first rows read as a dark, offset duplicate of the panel.
+        let edge = [rgb[0], rgb[1], rgb[2], color[3] * 0.35];
+        // The surface covers this core exactly. A positive offset redistributes
+        // the skirt, rather than translating that solid shape below the panel.
+        let core = rect;
+        let top_blur = (blur - offset_y).max(0.0);
+        let bottom_blur = (blur + offset_y).max(0.0);
+
+        // A nine-patch falloff. The previous implementation translated an
+        // opaque core by the offset, visibly extending a shadow surface past
+        // dropdown content. Keep the core coincident with the surface and only
+        // extend the directional falloff below it.
+        self.chrome_rect(core, radius, 0.0, color, [0.0; 4]);
+        if top_blur > 0.0 {
+            self.vertical_gradient(
+                Rect::new(core.x, core.y - top_blur, core.width, top_blur),
+                zero,
+                edge,
+            );
+        }
+        if bottom_blur > 0.0 {
+            self.vertical_gradient(
+                Rect::new(core.x, core.bottom(), core.width, bottom_blur),
+                edge,
+                zero,
+            );
+        }
+        self.horizontal_gradient(
+            Rect::new(core.x - blur, core.y, blur, core.height),
+            zero,
+            edge,
+        );
+        self.horizontal_gradient(
+            Rect::new(core.right(), core.y, blur, core.height),
+            edge,
+            zero,
+        );
+        // Quad-gradient corners connect the side ramps without painting an
+        // opaque square outside a rounded surface. Their one opaque corner is
+        // the corner adjacent to `core`.
+        if top_blur > 0.0 {
+            self.quad_gradient(
+                Rect::new(core.x - blur, core.y - top_blur, blur, top_blur),
+                [zero, zero, edge, zero],
+            );
+            self.quad_gradient(
+                Rect::new(core.right(), core.y - top_blur, blur, top_blur),
+                [zero, zero, zero, edge],
+            );
+        }
+        if bottom_blur > 0.0 {
+            self.quad_gradient(
+                Rect::new(core.x - blur, core.bottom(), blur, bottom_blur),
+                [zero, edge, zero, zero],
+            );
+            self.quad_gradient(
+                Rect::new(core.right(), core.bottom(), blur, bottom_blur),
+                [edge, zero, zero, zero],
+            );
+        }
+    }
+
     /// Fill `rect` with a radial gradient: `inner` at the center fading to
     /// `outer` toward the edges, as a triangle fan of `segments` wedges (clamped
     /// to ≥ 3). The fan radius reaches the rect's farthest corner so the whole
@@ -729,6 +1227,7 @@ impl DrawList {
     /// iso-color rings are circles centered in the rect, not ellipses.
     pub fn radial_gradient(&mut self, rect: Rect, inner: [f32; 4], outer: [f32; 4], segments: u32) {
         if rect.width <= 0.0 || rect.height <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
         let segments = segments.max(3);
@@ -762,6 +1261,7 @@ impl DrawList {
         let dy = p1[1] - p0[1];
         let len = (dx * dx + dy * dy).sqrt();
         if len <= f32::EPSILON || thickness <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
 
@@ -924,6 +1424,7 @@ impl DrawList {
     /// exactly like [`DrawList::quad`].
     pub fn rect_outline(&mut self, rect: Rect, thickness: f32, color: [f32; 4]) {
         if thickness <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
         // Fast path: one outline-only SDF instance (radius 0, transparent fill)
@@ -964,6 +1465,7 @@ impl DrawList {
         color: [f32; 4],
     ) {
         if thickness <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
         if radius <= 0.0 {
@@ -1069,7 +1571,28 @@ impl DrawList {
         bg: [f32; 4],
         border: [f32; 4],
     ) {
+        self.chrome_rect_gradient(rect, radius, thickness, bg, bg, border);
+    }
+
+    /// Draw a rounded-rect "chrome" panel whose **fill is a vertical gradient**
+    /// from `bg` (top edge) to `bg2` (bottom edge), plus a border — the same
+    /// instanced SDF fast path as [`Self::chrome_rect`].
+    ///
+    /// The design language this crate ships ("4a") builds every raised control
+    /// from such a face gradient (a subtle white sheen: brightest at the top,
+    /// falling off toward the bottom), so this is the normal entry point for
+    /// themed chrome; [`Self::chrome_rect`] is the flat-fill special case.
+    pub fn chrome_rect_gradient(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        thickness: f32,
+        bg: [f32; 4],
+        bg2: [f32; 4],
+        border: [f32; 4],
+    ) {
         if rect.width <= 0.0 || rect.height <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
 
@@ -1079,8 +1602,10 @@ impl DrawList {
             // run every vertex through the active transform.
             if radius > 0.0 {
                 self.rounded_rect(rect, radius, bg);
+                self.vertical_gradient(rect, bg, bg2);
             } else {
                 self.quad(rect.x, rect.y, rect.width, rect.height, bg);
+                self.vertical_gradient(rect, bg, bg2);
             }
             if thickness > 0.0 {
                 self.rounded_rect_outline(rect, radius, thickness, border);
@@ -1089,7 +1614,7 @@ impl DrawList {
         }
 
         // Fast path: one instance carrying both fill and border.
-        self.push_chrome_instance(rect, radius, thickness, bg, border);
+        self.push_chrome_instance(rect, radius, thickness, bg, bg2, border);
     }
 
     /// Record one SDF chrome instance (fill + border) for a translation-only
@@ -1103,6 +1628,7 @@ impl DrawList {
         radius: f32,
         thickness: f32,
         bg: [f32; 4],
+        bg2: [f32; 4],
         border: [f32; 4],
     ) {
         self.flush_soup();
@@ -1115,6 +1641,7 @@ impl DrawList {
         let inst = ChromeInstance {
             rect: [rect.x + m.tx, rect.y + m.ty, rect.width, rect.height],
             bg: self.apply_tint(bg),
+            bg2: self.apply_tint(bg2),
             border: self.apply_tint(border),
             clip,
             params: [radius, thickness, clip_enabled, 0.0],
@@ -1122,11 +1649,11 @@ impl DrawList {
         let idx = self.chrome_instances.len() as u32;
         self.chrome_instances.push(inst);
 
-        match self.color_cmds.last_mut() {
-            Some(ColorCmd::Chrome { instances }) if instances.end == idx => {
+        match self.paint_cmds.last_mut() {
+            Some(PaintCmd::Chrome { instances }) if instances.end == idx => {
                 instances.end = idx + 1;
             }
-            _ => self.color_cmds.push(ColorCmd::Chrome {
+            _ => self.paint_cmds.push(PaintCmd::Chrome {
                 instances: idx..idx + 1,
             }),
         }
@@ -1136,7 +1663,7 @@ impl DrawList {
     /// edge stays the fill color, no border ring). Backs the translation-only
     /// fast path of [`DrawList::quad`] / [`DrawList::rounded_rect`].
     fn fill_rect_instance(&mut self, rect: Rect, radius: f32, color: [f32; 4]) {
-        self.push_chrome_instance(rect, radius, 0.0, color, color);
+        self.push_chrome_instance(rect, radius, 0.0, color, color, color);
     }
 
     /// Record an outline-only SDF rect instance (transparent fill so only the
@@ -1144,7 +1671,7 @@ impl DrawList {
     /// [`DrawList::rect_outline`] / [`DrawList::rounded_rect_outline`].
     fn stroke_rect_instance(&mut self, rect: Rect, radius: f32, thickness: f32, color: [f32; 4]) {
         let transparent = [color[0], color[1], color[2], 0.0];
-        self.push_chrome_instance(rect, radius, thickness, transparent, color);
+        self.push_chrome_instance(rect, radius, thickness, transparent, transparent, color);
     }
 
     /// Record one SDF circle instance for a translation-only circle. Same
@@ -1175,23 +1702,79 @@ impl DrawList {
         let idx = self.circle_instances.len() as u32;
         self.circle_instances.push(inst);
 
-        match self.color_cmds.last_mut() {
-            Some(ColorCmd::Circle { instances }) if instances.end == idx => {
+        match self.paint_cmds.last_mut() {
+            Some(PaintCmd::Circle { instances }) if instances.end == idx => {
                 instances.end = idx + 1;
             }
-            _ => self.color_cmds.push(ColorCmd::Circle {
+            _ => self.paint_cmds.push(PaintCmd::Circle {
                 instances: idx..idx + 1,
             }),
         }
     }
 
+    /// Ordered commands consumed by the renderer and debug report.
+    pub(crate) fn paint_commands(&self) -> &[PaintCmd] {
+        &self.paint_cmds
+    }
+
+    /// Index range for soup not yet represented by an explicit command.
+    ///
+    /// The renderer submits this once after the command stream. Keeping the
+    /// mapping here prevents non-rendering consumers from duplicating the
+    /// implicit-tail rule.
+    pub(crate) fn trailing_soup_range(&self) -> std::ops::Range<u32> {
+        self.soup_committed_indices..self.indices.len() as u32
+    }
+
+    fn push_paint_cmd(&mut self, cmd: PaintCmd) {
+        match (self.paint_cmds.last_mut(), &cmd) {
+            (Some(PaintCmd::Soup { indices: a }), PaintCmd::Soup { indices: b })
+                if a.end == b.start =>
+            {
+                a.end = b.end
+            }
+            (Some(PaintCmd::Chrome { instances: a }), PaintCmd::Chrome { instances: b })
+                if a.end == b.start =>
+            {
+                a.end = b.end
+            }
+            (Some(PaintCmd::Circle { instances: a }), PaintCmd::Circle { instances: b })
+                if a.end == b.start =>
+            {
+                a.end = b.end
+            }
+            (Some(PaintCmd::NineSlice { draws: a }), PaintCmd::NineSlice { draws: b })
+                if a.end == b.start =>
+            {
+                a.end = b.end
+            }
+            (Some(PaintCmd::Icon { draws: a }), PaintCmd::Icon { draws: b })
+                if a.end == b.start =>
+            {
+                a.end = b.end
+            }
+            #[cfg(feature = "phosphor-icons")]
+            (Some(PaintCmd::IconMsdf { draws: a }), PaintCmd::IconMsdf { draws: b })
+                if a.end == b.start =>
+            {
+                a.end = b.end
+            }
+            (Some(PaintCmd::Text { draws: a }), PaintCmd::Text { draws: b })
+                if a.end == b.start =>
+            {
+                a.end = b.end
+            }
+            _ => self.paint_cmds.push(cmd),
+        }
+    }
+
     /// Commit soup geometry appended since the last command into a `Soup`
-    /// command, so a following chrome instance draws after it. No-op if nothing
+    /// command, so a following command draws after it. No-op if nothing
     /// new was appended.
     fn flush_soup(&mut self) {
         let total = self.indices.len() as u32;
         if total > self.soup_committed_indices {
-            self.color_cmds.push(ColorCmd::Soup {
+            self.push_paint_cmd(PaintCmd::Soup {
                 indices: self.soup_committed_indices..total,
             });
             self.soup_committed_indices = total;
@@ -1201,6 +1784,7 @@ impl DrawList {
     /// Emit a thick arc band between `inner` and `outer` radius from
     /// `start_angle` to `end_angle` as a strip of `segments` quads (two
     /// triangles each).
+    #[allow(clippy::too_many_arguments)]
     fn stroked_arc(
         &mut self,
         center: (f32, f32),
@@ -1238,6 +1822,7 @@ impl DrawList {
     /// other primitives.
     pub fn circle(&mut self, center: (f32, f32), radius: f32, color: [f32; 4]) {
         if radius <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
         // Fast path: one SDF disc instance (smooth at any radius) instead of a
@@ -1267,6 +1852,7 @@ impl DrawList {
         color: [f32; 4],
     ) {
         if radius <= 0.0 || thickness <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
         // Fast path: one SDF ring instance instead of a stroked-arc band.
@@ -1307,7 +1893,6 @@ impl DrawList {
             );
             self.text_rotation_warned = true;
         }
-        block.current_transform = m;
 
         // When span mode is active, derive the display content from the
         // concatenated span texts so the shape cache and cursor-position calls
@@ -1322,7 +1907,7 @@ impl DrawList {
         // early lets the underline quads below use the already-tinted colour).
         let tint = self.current_tint();
         if tint != [1.0, 1.0, 1.0, 1.0] {
-            // glyphon::Color is RGBA8; multiply per-channel via the public accessors.
+            // cosmic_text::Color is RGBA8; multiply per-channel via the public accessors.
             let r = block.color.r() as f32 / 255.0;
             let g = block.color.g() as f32 / 255.0;
             let b = block.color.b() as f32 / 255.0;
@@ -1331,13 +1916,13 @@ impl DrawList {
             let ng = (g * tint[1]).clamp(0.0, 1.0);
             let nb = (b * tint[2]).clamp(0.0, 1.0);
             let na = (a * tint[3]).clamp(0.0, 1.0);
-            block.color = glyphon::Color::rgba(
+            block.color = glyphon::cosmic_text::Color::rgba(
                 (nr * 255.0).round() as u8,
                 (ng * 255.0).round() as u8,
                 (nb * 255.0).round() as u8,
                 (na * 255.0).round() as u8,
             );
-            // Tint per-span colour and underline overrides with the same factor.
+            // Tint per-span/range colour and underline overrides with the same factor.
             for span in &mut block.spans {
                 if let Some(c) = &mut span.color {
                     c[0] = (c[0] * tint[0]).clamp(0.0, 1.0);
@@ -1355,6 +1940,9 @@ impl DrawList {
                     c[3] = (c[3] * tint[3]).clamp(0.0, 1.0);
                 }
             }
+            // Range styles are shared by retained editors; preserve that Arc and
+            // defer tint multiplication to glyph placement instead of cloning it.
+            block.style_range_tint = tint;
         }
 
         // Emit underline rects for spans that have `underline` set, BEFORE
@@ -1414,11 +2002,9 @@ impl DrawList {
         }
 
         // Transform origin.
-        //let origin = m.transform_point([block.x, block.y]);
-        //block.x = origin[0];
-        //block.y = origin[1];
-        block.x = block.x + m.tx;
-        block.y = block.y + m.ty;
+        let origin = m.transform_point([block.x, block.y]);
+        block.x = origin[0];
+        block.y = origin[1];
 
         // Apply uniform-ish scale: geometric mean of the two basis lengths,
         // which equals sqrt(|det|). This handles non-uniform axis-aligned
@@ -1438,28 +2024,49 @@ impl DrawList {
                 .intersection(clip)
                 .or_else(|| Some(Rect::new(clip.x, clip.y, 0.0, 0.0)));
         }
+        self.flush_soup();
+        let start = self.texts.len() as u32;
         self.texts.push(block);
+        self.push_paint_cmd(PaintCmd::Text {
+            draws: start..start + 1,
+        });
     }
 
-    /// Add a vector [`PhosphorIcon`], fit-centered into `rect` and rendered crisp
-    /// at any size through the MSDF icon atlas. `tint` multiplies the fill (use
-    /// `[1.0; 4]` for the icon's natural color). Honors the current transform,
-    /// tint stack, and clip. No-op for a zero-area rect or an unresolvable glyph.
+    /// Add a vector icon from any registered icon font, fit-centered into `rect`
+    /// and rendered crisp at any size through the MSDF icon atlas. `tint`
+    /// multiplies the fill (use `[1.0; 4]` for the icon's natural color). Honors
+    /// the current transform, tint stack, and clip. No-op for a zero-area rect.
+    ///
+    /// Resolve the [`IconGlyph`] once at startup (see
+    /// [`icon_glyph`](crate::render::icon_glyph)) and keep it — it is `Copy`.
     #[cfg(feature = "phosphor-icons")]
-    pub fn icon_msdf(&mut self, rect: Rect, icon: PhosphorIcon, tint: [f32; 4]) {
+    pub fn icon_msdf(&mut self, rect: Rect, glyph: IconGlyph, tint: [f32; 4]) {
         if rect.width <= 0.0 || rect.height <= 0.0 {
+            self.dropped_degenerate += 1;
             return;
         }
-        let Some(glyph_id) = phosphor_glyph_id(icon) else {
-            return;
-        };
+        self.flush_soup();
+        let start = self.icons_msdf.len() as u32;
         self.icons_msdf.push(IconMsdf {
             local: rect,
             transform: self.current_transform(),
-            glyph_id,
+            glyph,
             tint: self.apply_tint(tint),
             clip: self.current_clip(),
         });
+        self.push_paint_cmd(PaintCmd::IconMsdf {
+            draws: start..start + 1,
+        });
+    }
+
+    /// [`icon_msdf`](Self::icon_msdf) for the built-in Phosphor set — resolves
+    /// the enum to its glyph at push time. No-op if the glyph is unresolvable
+    /// (which the library's tests rule out for the curated set).
+    #[cfg(feature = "phosphor-icons")]
+    pub fn phosphor_icon(&mut self, rect: Rect, icon: PhosphorIcon, tint: [f32; 4]) {
+        if let Some(glyph) = icon.glyph() {
+            self.icon_msdf(rect, glyph, tint);
+        }
     }
 
     /// Add a textured icon by name. The renderer will resolve `icon_key` against
@@ -1468,6 +2075,8 @@ impl DrawList {
         let corners = self
             .current_transform()
             .transform_rect_corners(Rect::new(x, y, width, height));
+        self.flush_soup();
+        let start = self.icons.len() as u32;
         self.icons.push(IconDraw {
             corners,
             sprite: None,
@@ -1475,6 +2084,10 @@ impl DrawList {
             tint: self.current_tint(),
             clip: self.current_clip(),
             src: None,
+            wrap: false,
+        });
+        self.push_paint_cmd(PaintCmd::Icon {
+            draws: start..start + 1,
         });
     }
 
@@ -1492,6 +2105,8 @@ impl DrawList {
         let corners = self
             .current_transform()
             .transform_rect_corners(Rect::new(x, y, width, height));
+        self.flush_soup();
+        let start = self.icons.len() as u32;
         self.icons.push(IconDraw {
             corners,
             sprite: Some(sprite),
@@ -1499,6 +2114,10 @@ impl DrawList {
             tint: self.apply_tint(tint),
             clip: self.current_clip(),
             src: None,
+            wrap: false,
+        });
+        self.push_paint_cmd(PaintCmd::Icon {
+            draws: start..start + 1,
         });
     }
 
@@ -1522,8 +2141,40 @@ impl DrawList {
         self.push_image(sprite, dest, Some(src_uv), tint);
     }
 
+    /// Draw a loaded image sprite **tiled** across `dest` at its natural size:
+    /// the source repeats edge-to-edge (u1/v1 of `src_uv` are the tile count
+    /// along each axis, may exceed 1) and a partial tile at the right/bottom
+    /// edge is cropped to the draw. Repetition happens in the fragment shader
+    /// (region-relative `fract`), so one instance covers any destination — a
+    /// fullscreen backdrop costs one instance, not one per tile.
+    pub fn image_tiled(
+        &mut self,
+        sprite: SpriteId,
+        dest: Rect,
+        tile_span_uv: [f32; 4],
+        tint: [f32; 4],
+    ) {
+        let corners = self.current_transform().transform_rect_corners(dest);
+        self.flush_soup();
+        let start = self.icons.len() as u32;
+        self.icons.push(IconDraw {
+            corners,
+            sprite: Some(sprite),
+            icon_key: String::new(),
+            tint: self.apply_tint(tint),
+            clip: self.current_clip(),
+            src: Some(tile_span_uv),
+            wrap: true,
+        });
+        self.push_paint_cmd(PaintCmd::Icon {
+            draws: start..start + 1,
+        });
+    }
+
     fn push_image(&mut self, sprite: SpriteId, dest: Rect, src: Option<[f32; 4]>, tint: [f32; 4]) {
         let corners = self.current_transform().transform_rect_corners(dest);
+        self.flush_soup();
+        let start = self.icons.len() as u32;
         self.icons.push(IconDraw {
             corners,
             sprite: Some(sprite),
@@ -1531,11 +2182,17 @@ impl DrawList {
             tint: self.apply_tint(tint),
             clip: self.current_clip(),
             src,
+            wrap: false,
+        });
+        self.push_paint_cmd(PaintCmd::Icon {
+            draws: start..start + 1,
         });
     }
 
     /// Add a nine-slice textured panel by name.
     pub fn nine_slice(&mut self, x: f32, y: f32, width: f32, height: f32, texture_key: &str) {
+        self.flush_soup();
+        let start = self.nine_slices.len() as u32;
         self.nine_slices.push(NineSliceDraw {
             local: Rect::new(x, y, width, height),
             transform: self.current_transform(),
@@ -1543,6 +2200,9 @@ impl DrawList {
             texture_key: texture_key.to_string(),
             tint: self.current_tint(),
             clip: self.current_clip(),
+        });
+        self.push_paint_cmd(PaintCmd::NineSlice {
+            draws: start..start + 1,
         });
     }
 
@@ -1556,6 +2216,8 @@ impl DrawList {
         height: f32,
         tint: [f32; 4],
     ) {
+        self.flush_soup();
+        let start = self.nine_slices.len() as u32;
         self.nine_slices.push(NineSliceDraw {
             local: Rect::new(x, y, width, height),
             transform: self.current_transform(),
@@ -1563,6 +2225,9 @@ impl DrawList {
             texture_key: String::new(),
             tint: self.apply_tint(tint),
             clip: self.current_clip(),
+        });
+        self.push_paint_cmd(PaintCmd::NineSlice {
+            draws: start..start + 1,
         });
     }
 }
@@ -1594,7 +2259,7 @@ mod tests {
     use crate::affine::Affine2;
     use crate::layout::Rect;
 
-    use super::DrawList;
+    use super::{DrawList, PaintCmd, PrimCounts};
 
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
@@ -1783,15 +2448,16 @@ mod tests {
         list.push_transform();
         list.translate(40.0, 60.0);
         list.set_tint([1.0, 1.0, 1.0, 0.5]);
-        list.icon_msdf(
+        list.phosphor_icon(
             Rect::new(0.0, 0.0, 20.0, 20.0),
             PhosphorIcon::Plus,
             [1.0, 0.0, 0.0, 1.0],
         );
         assert_eq!(list.icons_msdf.len(), 1);
         let rec = list.icons_msdf[0];
-        // Glyph resolved to a real (non-notdef) id.
-        assert_ne!(rec.glyph_id, 0);
+        // Glyph resolved to a real (non-notdef) id in the Phosphor font.
+        assert_eq!(rec.glyph.font, crate::render::IconFontId::PHOSPHOR);
+        assert_ne!(rec.glyph.glyph_id, 0);
         // Tint is multiplied by the active tint stack (alpha 1.0 * 0.5).
         assert_eq!(rec.tint, [1.0, 0.0, 0.0, 0.5]);
         // The translate transform is carried (origin maps to (40, 60)).
@@ -1804,8 +2470,24 @@ mod tests {
     fn icon_msdf_skips_zero_rect() {
         use crate::render::PhosphorIcon;
         let mut list = DrawList::new();
-        list.icon_msdf(Rect::new(0.0, 0.0, 0.0, 20.0), PhosphorIcon::X, [1.0; 4]);
+        list.phosphor_icon(Rect::new(0.0, 0.0, 0.0, 20.0), PhosphorIcon::X, [1.0; 4]);
         assert!(list.icons_msdf.is_empty());
+    }
+
+    /// The generic verb and the Phosphor convenience wrapper must produce the
+    /// same record — the wrapper is a resolution shortcut, not a second path.
+    #[cfg(feature = "phosphor-icons")]
+    #[test]
+    fn phosphor_icon_matches_the_generic_verb() {
+        use crate::render::PhosphorIcon;
+        let glyph = PhosphorIcon::Gear.glyph().expect("gear resolves");
+        let rect = Rect::new(3.0, 4.0, 18.0, 18.0);
+
+        let mut a = DrawList::new();
+        a.phosphor_icon(rect, PhosphorIcon::Gear, [1.0; 4]);
+        let mut b = DrawList::new();
+        b.icon_msdf(rect, glyph, [1.0; 4]);
+        assert_eq!(a.icons_msdf, b.icons_msdf);
     }
 
     #[test]
@@ -1875,6 +2557,21 @@ mod tests {
     }
 
     #[test]
+    fn byte_range_styles_keep_original_content_and_shared_storage() {
+        let ranges = std::sync::Arc::new(vec![crate::TextStyleRange {
+            range: 0..5,
+            color: Some([1.0, 0.0, 0.0, 1.0]),
+            underline: crate::Underline::None,
+        }]);
+        let mut list = DrawList::new();
+        list.text(
+            crate::TextBlock::new("local café", 0.0, 0.0).with_shared_style_ranges(ranges.clone()),
+        );
+        assert_eq!(list.texts[0].content, "local café");
+        assert!(std::sync::Arc::ptr_eq(&list.texts[0].style_ranges, &ranges));
+    }
+
+    #[test]
     fn underline_inherit_uses_span_then_block_colour() {
         use crate::text::{TextBlock, TextSpan, Underline};
 
@@ -1916,7 +2613,10 @@ mod tests {
                     .all(|(a, b)| (a - b).abs() < 1e-3)
             })
         };
-        assert!(has_colour(span_red), "inherit underline should use span colour");
+        assert!(
+            has_colour(span_red),
+            "inherit underline should use span colour"
+        );
         assert!(
             has_colour(block_green),
             "inherit underline w/o span colour should fall back to block colour"
@@ -1968,6 +2668,130 @@ mod tests {
         list.quad_gradient(Rect::new(0.0, 0.0, 20.0, 0.0), [[1.0; 4]; 4]);
         assert!(list.vertices.is_empty());
         assert!(list.indices.is_empty());
+    }
+
+    #[test]
+    fn triangle_gradient_assigns_corner_colors() {
+        let mut list = DrawList::new();
+        let c0 = [1.0, 0.0, 0.0, 0.3];
+        let c1 = [0.0, 1.0, 0.0, 0.3];
+        let c2 = [0.0, 0.0, 1.0, 0.05];
+        list.triangle_gradient((0.0, 0.0), (10.0, 0.0), (5.0, 8.0), c0, c1, c2);
+        // Three soup vertices in argument order, each carrying its color, one
+        // triangle of indices.
+        assert_eq!(list.vertices.len(), 3);
+        assert_eq!(list.vertices[0].position, [0.0, 0.0]);
+        assert_eq!(list.vertices[0].color, c0);
+        assert_eq!(list.vertices[1].position, [10.0, 0.0]);
+        assert_eq!(list.vertices[1].color, c1);
+        assert_eq!(list.vertices[2].position, [5.0, 8.0]);
+        assert_eq!(list.vertices[2].color, c2);
+        assert_eq!(list.indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn triangle_gradient_matches_triangle_for_flat_colors() {
+        let mut g = DrawList::new();
+        let mut f = DrawList::new();
+        let c = [0.2, 0.5, 0.9, 0.5];
+        g.triangle_gradient((0.0, 0.0), (9.0, 1.0), (4.0, 7.0), c, c, c);
+        f.triangle((0.0, 0.0), (9.0, 1.0), (4.0, 7.0), c);
+        assert_eq!(g.vertices, f.vertices);
+        assert_eq!(g.indices, f.indices);
+    }
+
+    #[test]
+    fn drop_shadow_emits_soft_rects_beyond_the_surface() {
+        let mut list = DrawList::new();
+        let shadow = [0.0, 0.0, 0.0, 0.6];
+        let surface = Rect::new(100.0, 50.0, 80.0, 20.0);
+        list.drop_shadow(surface, 4.0, 10.0, 2.0, shadow);
+        // The opaque core stays exactly beneath the surface; offset makes the
+        // lower skirt longer instead of translating a dark panel-shaped copy.
+        assert_eq!(list.chrome_instances.len(), 1);
+        assert_eq!(list.chrome_instances[0].rect, [100.0, 50.0, 80.0, 20.0]);
+        assert_eq!(list.chrome_instances[0].bg, shadow);
+        assert_eq!(list.vertices.len(), 32); // 8 gradient patches
+        // The top ramp ends at the surface edge and starts transparent.
+        assert_eq!(list.vertices[0].position, [100.0, 44.0]);
+        assert_eq!(list.vertices[0].color, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(list.vertices[2].position, [180.0, 50.0]);
+        assert_eq!(list.vertices[2].color, [0.0, 0.0, 0.0, shadow[3] * 0.35]);
+    }
+
+    #[test]
+    fn drop_shadow_blur_zero_does_not_duplicate_the_surface() {
+        let mut list = DrawList::new();
+        let shadow = [0.0, 0.0, 0.0, 0.5];
+        let surface = Rect::new(10.0, 10.0, 40.0, 12.0);
+        list.drop_shadow(surface, 3.0, 0.0, 1.0, shadow);
+        assert!(list.chrome_instances.is_empty());
+        assert!(
+            list.vertices.is_empty(),
+            "no falloff means no shadow is emitted"
+        );
+    }
+
+    #[test]
+    fn drop_shadow_short_core_trims_the_skirts_without_degenerates() {
+        let mut list = DrawList::new();
+        // 4px-tall surface with an 8px blur: the core is 20px, so the skirts
+        // clamp toward the middle and the opaque band shrinks to 4px. Nothing
+        // degenerates (a dropped degenerate would trip the debug lints).
+        let before = list.dropped_degenerate;
+        list.drop_shadow(
+            Rect::new(0.0, 0.0, 50.0, 4.0),
+            0.0,
+            8.0,
+            1.0,
+            [0.0, 0.0, 0.0, 0.6],
+        );
+        assert_eq!(list.dropped_degenerate, before);
+        // One opaque core plus eight falloff patches; no degenerates even when
+        // the source surface is much shorter than its blur radius.
+        assert_eq!(list.chrome_instances.len(), 1);
+        assert_eq!(list.chrome_instances[0].rect, [0.0, 0.0, 50.0, 4.0]);
+        assert_eq!(list.vertices.len(), 32);
+    }
+
+    #[test]
+    fn drop_shadow_zero_height_surface_is_a_noop() {
+        let mut list = DrawList::new();
+        // A degenerate surface has no shadow core or meaningful edge to blur.
+        let before = list.dropped_degenerate;
+        list.drop_shadow(
+            Rect::new(0.0, 0.0, 50.0, 0.0),
+            0.0,
+            8.0,
+            1.0,
+            [0.0, 0.0, 0.0, 0.6],
+        );
+        assert_eq!(list.dropped_degenerate, before + 1);
+        assert!(list.chrome_instances.is_empty());
+        assert!(list.vertices.is_empty());
+    }
+
+    #[test]
+    fn drop_shadow_zero_alpha_and_zero_params_are_noops() {
+        let mut list = DrawList::new();
+        let before = list.dropped_degenerate;
+        list.drop_shadow(
+            Rect::new(0.0, 0.0, 40.0, 10.0),
+            0.0,
+            0.0,
+            1.0,
+            [0.0, 0.0, 0.0, 0.0],
+        );
+        list.drop_shadow(
+            Rect::new(0.0, 0.0, 40.0, 10.0),
+            0.0,
+            8.0,
+            1.0,
+            [0.0, 0.0, 0.0, 0.0],
+        );
+        assert!(list.chrome_instances.is_empty());
+        assert!(list.vertices.is_empty());
+        assert_eq!(list.dropped_degenerate, before + 2);
     }
 
     #[test]
@@ -2211,8 +3035,8 @@ mod tests {
         // One instance, one Chrome command, no soup geometry.
         assert_eq!(list.chrome_instances.len(), 1);
         assert_eq!(
-            list.color_cmds,
-            vec![super::ColorCmd::Chrome { instances: 0..1 }]
+            list.paint_cmds,
+            vec![super::PaintCmd::Chrome { instances: 0..1 }]
         );
         assert!(list.vertices.is_empty());
         let inst = list.chrome_instances[0];
@@ -2251,8 +3075,8 @@ mod tests {
         assert_eq!(list.chrome_instances.len(), 4);
         // All four collapse into a single contiguous Chrome run.
         assert_eq!(
-            list.color_cmds,
-            vec![super::ColorCmd::Chrome { instances: 0..4 }]
+            list.paint_cmds,
+            vec![super::PaintCmd::Chrome { instances: 0..4 }]
         );
     }
 
@@ -2266,12 +3090,12 @@ mod tests {
         list.line([0.0, 0.0], [10.0, 0.0], 2.0, [1.0; 4]); // 6 more indices
         list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
         assert_eq!(
-            list.color_cmds,
+            list.paint_cmds,
             vec![
-                super::ColorCmd::Soup { indices: 0..6 },
-                super::ColorCmd::Chrome { instances: 0..1 },
-                super::ColorCmd::Soup { indices: 6..12 },
-                super::ColorCmd::Chrome { instances: 1..2 },
+                super::PaintCmd::Soup { indices: 0..6 },
+                super::PaintCmd::Chrome { instances: 0..1 },
+                super::PaintCmd::Soup { indices: 6..12 },
+                super::PaintCmd::Chrome { instances: 1..2 },
             ]
         );
         // Trailing soup (after the last command) is implicit: committed cursor
@@ -2288,8 +3112,8 @@ mod tests {
         // The trailing line is NOT in a command; the renderer draws
         // indices[committed..total] as the trailing run.
         assert_eq!(
-            list.color_cmds,
-            vec![super::ColorCmd::Chrome { instances: 0..1 }]
+            list.paint_cmds,
+            vec![super::PaintCmd::Chrome { instances: 0..1 }]
         );
         assert_eq!(list.soup_committed_indices, 0);
         assert_eq!(list.indices.len(), 6);
@@ -2308,7 +3132,7 @@ mod tests {
         );
         // No instance recorded; geometry went into the soup, transformed.
         assert!(list.chrome_instances.is_empty());
-        assert!(list.color_cmds.is_empty());
+        assert!(list.paint_cmds.is_empty());
         assert!(!list.vertices.is_empty());
     }
 
@@ -2349,7 +3173,7 @@ mod tests {
         let mut list = DrawList::new();
         list.chrome_rect(Rect::new(0.0, 0.0, 0.0, 10.0), 4.0, 1.0, [1.0; 4], [0.0; 4]);
         assert!(list.chrome_instances.is_empty());
-        assert!(list.color_cmds.is_empty());
+        assert!(list.paint_cmds.is_empty());
     }
 
     #[test]
@@ -2358,11 +3182,295 @@ mod tests {
         list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]);
         list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
         assert!(!list.chrome_instances.is_empty());
-        assert!(!list.color_cmds.is_empty());
+        assert!(!list.paint_cmds.is_empty());
         list.clear();
         assert!(list.chrome_instances.is_empty());
-        assert!(list.color_cmds.is_empty());
+        assert!(list.paint_cmds.is_empty());
         assert_eq!(list.soup_committed_indices, 0);
+    }
+
+    // ---- Debug scopes ----
+
+    #[test]
+    fn debug_scope_records_span_of_emitted_primitives() {
+        let mut list = DrawList::new();
+        list.chrome_rect(
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            0.0,
+            0.0,
+            [1.0; 4],
+            [0.0; 4],
+        );
+        list.push_debug_scope("inner");
+        list.chrome_rect(Rect::new(0.0, 0.0, 5.0, 5.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        list.chrome_rect(Rect::new(5.0, 0.0, 5.0, 5.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        list.pop_debug_scope();
+        list.chrome_rect(Rect::new(0.0, 0.0, 3.0, 3.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+
+        let scopes = list.debug_scopes();
+        assert_eq!(scopes.len(), 1);
+        let s = &scopes[0];
+        assert_eq!(s.name, "inner");
+        assert!(s.closed);
+        // The scope owns exactly the two chrome rects drawn between push and pop.
+        assert_eq!(s.start.chrome_instances, 1);
+        assert_eq!(s.end.chrome_instances, 3);
+        assert_eq!(s.counts().chrome_instances, 2);
+        assert_eq!(s.counts().total(), 2);
+    }
+
+    #[test]
+    fn debug_scopes_nest_with_parent_and_depth() {
+        let mut list = DrawList::new();
+        list.push_debug_scope("window");
+        list.push_debug_scope("row");
+        list.push_debug_scope("button");
+        list.pop_debug_scope();
+        list.pop_debug_scope();
+        list.pop_debug_scope();
+
+        let s = list.debug_scopes();
+        assert_eq!(s.len(), 3);
+        assert_eq!((s[0].parent, s[0].depth), (None, 0));
+        assert_eq!((s[1].parent, s[1].depth), (Some(0), 1));
+        assert_eq!((s[2].parent, s[2].depth), (Some(1), 2));
+        assert!(s.iter().all(|sc| sc.closed));
+        assert_eq!(list.debug_scope_depth(), 0);
+    }
+
+    #[test]
+    fn sibling_scopes_get_the_same_parent() {
+        let mut list = DrawList::new();
+        list.push_debug_scope("panel");
+        list.push_debug_scope("a");
+        list.pop_debug_scope();
+        list.push_debug_scope("b");
+        list.pop_debug_scope();
+        list.pop_debug_scope();
+
+        let s = list.debug_scopes();
+        assert_eq!(s[1].parent, Some(0));
+        assert_eq!(s[2].parent, Some(0));
+        assert_eq!(s[1].depth, 1);
+        assert_eq!(s[2].depth, 1);
+    }
+
+    #[test]
+    fn declared_rect_is_transformed_to_world_space() {
+        let mut list = DrawList::new();
+        list.push_transform();
+        list.translate(100.0, 50.0);
+        list.push_debug_scope_rect("moved", Rect::new(10.0, 10.0, 20.0, 20.0));
+        list.pop_debug_scope();
+        list.pop_transform();
+
+        let declared = list.debug_scopes()[0].declared.expect("declared rect");
+        assert_eq!(
+            (declared.x, declared.y, declared.width, declared.height),
+            (110.0, 60.0, 20.0, 20.0)
+        );
+    }
+
+    #[test]
+    fn scope_records_active_clip() {
+        let mut list = DrawList::new();
+        list.push_clip(Rect::new(5.0, 6.0, 30.0, 40.0));
+        list.push_debug_scope("clipped");
+        list.pop_debug_scope();
+        list.pop_clip();
+        list.push_debug_scope("unclipped");
+        list.pop_debug_scope();
+
+        let s = list.debug_scopes();
+        assert_eq!(s[0].clip, Some(Rect::new(5.0, 6.0, 30.0, 40.0)));
+        assert_eq!(s[1].clip, None);
+    }
+
+    #[test]
+    fn unpopped_scope_stays_open() {
+        let mut list = DrawList::new();
+        list.push_debug_scope("leaked");
+        list.chrome_rect(Rect::new(0.0, 0.0, 4.0, 4.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+
+        let s = &list.debug_scopes()[0];
+        assert!(
+            !s.closed,
+            "an unpopped scope must be flagged, not silently closed"
+        );
+        assert_eq!(s.end, s.start, "end is only stamped on pop");
+        assert_eq!(list.debug_scope_depth(), 1);
+    }
+
+    #[test]
+    fn pop_without_push_is_a_noop() {
+        let mut list = DrawList::new();
+        list.pop_debug_scope();
+        list.pop_debug_scope();
+        assert!(list.debug_scopes().is_empty());
+        assert_eq!(list.debug_scope_depth(), 0);
+    }
+
+    #[test]
+    fn truncate_debug_scopes_closes_back_to_depth() {
+        let mut list = DrawList::new();
+        list.push_debug_scope("a");
+        list.push_debug_scope("b");
+        list.push_debug_scope("c");
+        list.truncate_debug_scopes(1);
+
+        assert_eq!(list.debug_scope_depth(), 1);
+        let s = list.debug_scopes();
+        assert!(!s[0].closed, "the scope at the retained depth stays open");
+        assert!(s[1].closed);
+        assert!(s[2].closed);
+    }
+
+    #[test]
+    fn clear_resets_debug_scopes() {
+        let mut list = DrawList::new();
+        list.push_debug_scope("stale");
+        list.chrome_rect(Rect::new(0.0, 0.0, 4.0, 4.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        list.pop_debug_scope();
+        assert_eq!(list.debug_scopes().len(), 1);
+
+        list.clear();
+        assert!(list.debug_scopes().is_empty());
+        assert_eq!(list.debug_scope_depth(), 0);
+    }
+
+    #[test]
+    fn scopes_cost_nothing_when_unused() {
+        let mut list = DrawList::new();
+        list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]);
+        assert!(list.debug_scopes().is_empty());
+        assert_eq!(list.debug_scope_depth(), 0);
+    }
+
+    #[test]
+    fn adjacent_scopes_own_disjoint_ranges_despite_command_run_merging() {
+        // `push_chrome_instance` MERGES consecutive chrome draws into one
+        // `PaintCmd::Chrome` run by mutating the last command in place, so
+        // `paint_cmds` is NOT append-only and must never be spanned. The
+        // instance buffers themselves are, which is what scopes rely on.
+        let mut list = DrawList::new();
+        list.push_debug_scope("a");
+        list.chrome_rect(Rect::new(0.0, 0.0, 5.0, 5.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        list.pop_debug_scope();
+        list.push_debug_scope("b");
+        list.chrome_rect(Rect::new(5.0, 0.0, 5.0, 5.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        list.pop_debug_scope();
+
+        // One merged draw command spanning both scopes...
+        assert_eq!(
+            list.paint_cmds.len(),
+            1,
+            "runs merge across the scope boundary"
+        );
+        // ...but the scopes still own disjoint, correct instance ranges.
+        let s = list.debug_scopes();
+        assert_eq!(
+            (s[0].start.chrome_instances, s[0].end.chrome_instances),
+            (0, 1)
+        );
+        assert_eq!(
+            (s[1].start.chrome_instances, s[1].end.chrome_instances),
+            (1, 2)
+        );
+    }
+
+    // ---- Degenerate-drop counter ----
+
+    #[test]
+    fn degenerate_quad_is_counted_not_silently_lost() {
+        let mut list = DrawList::new();
+        // The classic bug: padding ate the whole width.
+        list.quad(10.0, 10.0, -4.0, 20.0, [1.0; 4]);
+        assert!(list.vertices.is_empty(), "nothing is drawn");
+        assert!(list.chrome_instances.is_empty());
+        assert_eq!(list.dropped_degenerate(), 1, "but the drop is recorded");
+    }
+
+    #[test]
+    fn degenerate_drops_counted_across_primitive_kinds() {
+        let mut list = DrawList::new();
+        list.quad(0.0, 0.0, 0.0, 10.0, [1.0; 4]);
+        list.chrome_rect(Rect::new(0.0, 0.0, 10.0, 0.0), 0.0, 0.0, [1.0; 4], [0.0; 4]);
+        list.rect_outline(Rect::new(0.0, 0.0, 10.0, 10.0), 0.0, [1.0; 4]);
+        list.circle((5.0, 5.0), 0.0, [1.0; 4]);
+        list.line([0.0, 0.0], [10.0, 0.0], -1.0, [1.0; 4]);
+        assert_eq!(list.dropped_degenerate(), 5);
+    }
+
+    #[test]
+    fn rounded_rect_fallback_counts_the_drop_only_once() {
+        // `rounded_rect` delegates a degenerate rect to `quad`; only the
+        // delegate may count it, or one mistake reads as two.
+        let mut list = DrawList::new();
+        list.rounded_rect(Rect::new(0.0, 0.0, -5.0, 10.0), 4.0, [1.0; 4]);
+        assert_eq!(list.dropped_degenerate(), 1);
+    }
+
+    #[test]
+    fn healthy_primitives_do_not_count_as_drops() {
+        let mut list = DrawList::new();
+        list.quad(0.0, 0.0, 10.0, 10.0, [1.0; 4]);
+        list.chrome_rect(Rect::new(0.0, 0.0, 8.0, 8.0), 2.0, 1.0, [1.0; 4], [0.0; 4]);
+        list.circle((5.0, 5.0), 3.0, [1.0; 4]);
+        assert_eq!(list.dropped_degenerate(), 0);
+    }
+
+    #[test]
+    fn scope_spans_the_drop_counter() {
+        let mut list = DrawList::new();
+        list.quad(0.0, 0.0, -1.0, 5.0, [1.0; 4]); // outside any scope
+        list.push_debug_scope("toolbar");
+        list.quad(0.0, 0.0, -1.0, 5.0, [1.0; 4]);
+        list.quad(0.0, 0.0, 5.0, -1.0, [1.0; 4]);
+        list.pop_debug_scope();
+
+        let s = &list.debug_scopes()[0];
+        assert_eq!(s.counts().dropped_degenerate, 2, "attributed to the scope");
+        assert!(
+            s.counts().is_empty(),
+            "a scope that only dropped draws nothing"
+        );
+        assert_eq!(
+            list.dropped_degenerate(),
+            3,
+            "list-wide total includes the loose one"
+        );
+    }
+
+    #[test]
+    fn clear_resets_the_drop_counter() {
+        let mut list = DrawList::new();
+        list.quad(0.0, 0.0, -1.0, 5.0, [1.0; 4]);
+        assert_eq!(list.dropped_degenerate(), 1);
+        list.clear();
+        assert_eq!(list.dropped_degenerate(), 0);
+    }
+
+    #[test]
+    fn prim_counts_since_saturates_and_totals_triangles() {
+        let a = PrimCounts {
+            indices: 6,
+            texts: 1,
+            ..PrimCounts::default()
+        };
+        let b = PrimCounts {
+            indices: 12,
+            texts: 3,
+            chrome_instances: 2,
+            ..PrimCounts::default()
+        };
+        let d = b.since(a);
+        assert_eq!(d.indices, 6);
+        assert_eq!(d.texts, 2);
+        assert_eq!(d.chrome_instances, 2);
+        // 6 indices = 2 triangles, + 2 texts + 2 chrome
+        assert_eq!(d.total(), 6);
+        // reversed subtraction saturates rather than underflowing
+        assert!(a.since(b).is_empty());
     }
 
     #[test]
@@ -2377,5 +3485,21 @@ mod tests {
         let br = n.transform.transform_point([10.0, 10.0]);
         assert!(approx(tl[0], 50.0) && approx(tl[1], 60.0));
         assert!(approx(br[0], 70.0) && approx(br[1], 80.0));
+    }
+
+    #[test]
+    fn paint_stream_records_and_coalesces_all_payload_kinds() {
+        let mut d = DrawList::new();
+        d.nine_slice_id(7, 0.0, 0.0, 10.0, 10.0, [1.0; 4]);
+        d.nine_slice_id(7, 10.0, 0.0, 10.0, 10.0, [1.0; 4]);
+        d.icon("first", 0.0, 0.0, 8.0, 8.0);
+        d.icon("second", 8.0, 0.0, 8.0, 8.0);
+        d.triangle((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), [1.0; 4]);
+        d.quad(0.0, 0.0, 4.0, 4.0, [1.0; 4]);
+
+        assert!(matches!(&d.paint_cmds[0], PaintCmd::NineSlice { draws } if draws == &(0..2)));
+        assert!(matches!(&d.paint_cmds[1], PaintCmd::Icon { draws } if draws == &(0..2)));
+        assert!(matches!(&d.paint_cmds[2], PaintCmd::Soup { indices } if indices == &(0..3)));
+        assert!(matches!(&d.paint_cmds[3], PaintCmd::Chrome { instances } if instances == &(0..1)));
     }
 }

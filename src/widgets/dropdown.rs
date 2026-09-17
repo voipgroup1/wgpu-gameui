@@ -23,7 +23,10 @@
 //! let mut dropdowns = DropdownState::new();
 //! let mut focus = FocusState::new();
 //! // --- per frame ---
-//! dropdowns.begin_frame(&raw_input);
+//! // Order matters: the dropdown claims the navigation intents it will act on
+//! // (Esc/arrows/Enter while open) so `focus` never sees them — that is what
+//! // stops one Escape from both closing the list and blurring the focused field.
+//! dropdowns.begin_frame(&mut raw_input);
 //! focus.begin_frame(&raw_input);
 //! let popup = dropdowns.push_open_layer(&mut layers);   // from LAST frame's geometry
 //! let base_input = layers.input_for_base(&raw_input);   // blocks clicks under the open list
@@ -36,7 +39,9 @@
 //! if let Some((id, idx)) = dropdowns.draw_open_layer(&mut layers, popup, &style, &raw_input) {
 //!     if id == MY_ID { sel = idx; }
 //! }
-//! dropdowns.end_frame();
+//! // end_frame takes focus so a claimed row click does not blur the focused
+//! // widget: the item acts on it (Copy, Cut), so focus must survive.
+//! dropdowns.end_frame(&mut focus);
 //! focus.end_frame(None);
 //! ```
 //!
@@ -46,6 +51,8 @@
 //! This is the same one-frame latency the focus model's Tab navigation has and
 //! is imperceptible in practice. Selecting an item and closing are same-frame.
 
+#[cfg(feature = "phosphor-icons")]
+use crate::PhosphorIcon;
 use crate::layout::Rect;
 use crate::text::TextBlock;
 use crate::{InputState, LayerStack, StyleKey, StyleResolver};
@@ -63,8 +70,11 @@ const ITEM_HEIGHT: f32 = 28.0;
 const DEFAULT_MAX_VISIBLE: usize = 8;
 /// Vertical gap between the button and the floating list.
 const GAP_BELOW_BUTTON: f32 = 2.0;
-/// Half-width / half-height of the chevron glyph drawn at the button's right.
+/// Half-width / half-height of the chevron glyph drawn in the trigger.
 const CHEVRON: f32 = 4.0;
+/// Extra gap between the chevron's stroke and the field border, in addition to
+/// the theme's ordinary field padding.
+const CHEVRON_EDGE_GAP: f32 = 2.0;
 
 fn rgb(c: [f32; 4]) -> (u8, u8, u8) {
     (
@@ -113,6 +123,12 @@ pub struct DropdownState {
     escape: bool,
     mouse_clicked: bool,
     click_claimed: bool,
+    /// A *row* of the open list consumed this frame's click (clicked or
+    /// selected with Enter), as opposed to `click_claimed`, which also covers
+    /// the button toggling itself. Only a row claim is handed to
+    /// [`FocusState::claim_click`](crate::FocusState::claim_click): clicking the
+    /// button is an ordinary click elsewhere and should blur as usual.
+    row_claimed: bool,
     key_up: bool,
     key_down: bool,
     enter: bool,
@@ -126,15 +142,39 @@ impl DropdownState {
 
     /// Begin a frame: promote the geometry collected last frame into the
     /// view used this frame, and capture this frame's Esc/keyboard/click edges.
-    /// Call once per frame, before [`push_open_layer`](Self::push_open_layer).
-    pub fn begin_frame(&mut self, input: &InputState) {
+    ///
+    /// Takes `&mut InputState` because an open list **claims** the navigation
+    /// intents it acts on: `cancel`, `up`, `down` and `confirm` are zeroed in the
+    /// shared input so [`FocusState`](crate::FocusState) and any focused list or
+    /// text widget never see them. Without that, one Escape both closes the open
+    /// list and blurs the focused field, and arrows move a background selection
+    /// behind the popup at the same time.
+    ///
+    /// Only an *already-open* list claims. A closed dropdown must leave
+    /// `nav.confirm` alone so its button can be opened with Space/Enter — and
+    /// capturing the open edge unconditionally would make the same-frame
+    /// keyboard-open path immediately consume the very edge that opened it.
+    ///
+    /// Call once per frame, before [`push_open_layer`](Self::push_open_layer),
+    /// and **before** `FocusState::begin_frame`.
+    pub fn begin_frame(&mut self, input: &mut InputState) {
         self.geom = self.next_geom.take();
-        self.escape = input.nav.cancel;
+        let open = self.open.is_some();
+        self.escape = open && input.nav.cancel;
+        self.key_up = open && input.nav.up;
+        self.key_down = open && input.nav.down;
+        self.enter = open && input.nav.confirm;
+        if open {
+            // Claim the intents this frame's list is acting on. `next`/`prev`
+            // (Tab) are deliberately left alone: the list is not a Tab trap.
+            input.nav.cancel = false;
+            input.nav.up = false;
+            input.nav.down = false;
+            input.nav.confirm = false;
+        }
         self.mouse_clicked = input.mouse_clicked;
         self.click_claimed = false;
-        self.key_up = input.nav.up;
-        self.key_down = input.nav.down;
-        self.enter = input.nav.confirm;
+        self.row_claimed = false;
     }
 
     /// True when `id` is the open dropdown.
@@ -178,9 +218,7 @@ impl DropdownState {
     /// `input_for_base`/`input_for_layer` account for it) and is drawn into by
     /// index in [`draw_open_layer`](Self::draw_open_layer).
     pub fn push_open_layer(&mut self, layers: &mut LayerStack) -> Option<usize> {
-        if self.open.is_none() {
-            return None;
-        }
+        self.open?;
         let geom = self.geom.as_ref()?;
         let rect = Self::list_rect(geom);
         let idx = layers.push_popup(rect);
@@ -233,10 +271,11 @@ impl DropdownState {
         let scroll = self.scroll_offset;
 
         // ---- Keyboard / gamepad navigation ----
-        // Directional intents move the highlight. This uses the raw input (not
-        // layer-dispatched) because navigation isn't positional.
+        // Directional intents move the highlight. These are this frame's
+        // *captured* edges from `begin_frame`, because an open list zeroes the
+        // shared `nav` fields when it claims them.
         if !geom.items.is_empty() {
-            if input.nav.up {
+            if self.key_up {
                 self.highlighted = self.highlighted.saturating_sub(1);
                 // Scroll to keep highlighted in view.
                 let top = self.highlighted as f32 * geom.item_h;
@@ -247,7 +286,7 @@ impl DropdownState {
                     self.scroll_offset = bottom - list_rect.height;
                 }
             }
-            if input.nav.down {
+            if self.key_down {
                 self.highlighted = (self.highlighted + 1).min(geom.items.len() - 1);
                 let top = self.highlighted as f32 * geom.item_h;
                 let bottom = top + geom.item_h;
@@ -269,15 +308,40 @@ impl DropdownState {
 
         {
             let l = &mut layers.layers_mut()[idx].list;
-            // List background + border.
+            // Scoped inside this block so the pop precedes every `return` path
+            // in the click resolution below.
+            l.push_debug_scope_rect(
+                "Dropdown popup",
+                Rect::new(
+                    list_rect.x - 13.0,
+                    list_rect.y - 13.0,
+                    list_rect.width + 26.0,
+                    list_rect.height + 13.0 + 23.0, // shadow: 13px side/top skirt + 10px offset
+                ),
+            );
+            // Drop shadow: the design floats the option list on `0 10px 26px`
+            // black (falloff margin = half the CSS blur ≈ 13px).
+            l.drop_shadow(
+                list_rect,
+                10.0,
+                13.0,
+                style.scalar(StyleKey::BorderRadius),
+                [0.0, 0.0, 0.0, 0.6],
+            );
+            // List background + border — the raised sheet (near-black panel,
+            // 1px black edge).
             l.chrome_rect(
                 list_rect,
                 style.scalar(StyleKey::BorderRadius),
                 style.scalar(StyleKey::BorderWidth),
                 style.color(StyleKey::Panel),
-                style.color(StyleKey::PanelBorder),
+                [0.0, 0.0, 0.0, 0.7],
             );
-            l.push_clip(list_rect);
+            // Rows are clipped to the panel's interior so highlights cannot
+            // overpaint the sheet edge on the first or last visible option.
+            let border = style.scalar(StyleKey::BorderWidth).max(1.0);
+            let content_rect = list_rect.inset(border);
+            l.push_clip_viewport(content_rect);
             for (i, item) in geom.items.iter().enumerate() {
                 let iy = list_rect.y + i as f32 * geom.item_h - scroll;
                 // Cull rows fully outside the viewport.
@@ -298,7 +362,7 @@ impl DropdownState {
                 } else if hovered {
                     // Mouse hover only when keyboard isn't already highlighting
                     // a different item (to avoid fighting the user).
-                    if !input.nav.up && !input.nav.down {
+                    if !self.key_up && !self.key_down {
                         self.highlighted = i;
                     }
                     l.quad(list_rect.x, iy, list_rect.width, geom.item_h, hover);
@@ -308,17 +372,18 @@ impl DropdownState {
                 } else {
                     (txt_r, txt_g, txt_b)
                 };
-                let text_y =
-                    l.vcentered_text_y(iy, geom.item_h, font_size, font.as_ref(), item);
+                let text_y = l.vcentered_text_y(iy, geom.item_h, font_size, font.as_ref(), item);
                 l.text(
                     TextBlock::new(item.clone(), list_rect.x + pad, text_y)
                         .with_size(font_size)
                         .with_color(r, g, b)
-                        .with_max_width(list_rect.width - pad * 2.0)
+                        .with_max_width((list_rect.width - pad * 2.0).max(0.0))
+                        .with_ellipsis()
                         .with_font_opt(font.clone()),
                 );
             }
             l.pop_clip();
+            l.pop_debug_scope();
         }
 
         // Resolve a click on the list.
@@ -327,6 +392,7 @@ impl DropdownState {
             // A click anywhere inside the popup is "claimed" so end_frame's
             // click-elsewhere blur doesn't also fire.
             self.click_claimed = true;
+            self.row_claimed = true;
             let rel = li.mouse_y - list_rect.y + scroll;
             let row = (rel / geom.item_h).floor();
             if row >= 0.0 && (row as usize) < geom.items.len() {
@@ -335,12 +401,13 @@ impl DropdownState {
             }
         }
         // Confirm on the highlighted item selects it.
-        if input.nav.confirm && !geom.items.is_empty() {
+        if self.enter && !geom.items.is_empty() {
             let row = self.highlighted;
             if row < geom.items.len() {
                 result = Some((geom.id, row));
                 // Claim the click so end_frame doesn't also close us.
                 self.click_claimed = true;
+                self.row_claimed = true;
                 self.close();
             }
         }
@@ -348,9 +415,19 @@ impl DropdownState {
     }
 
     /// End a frame: close the dropdown on Escape or on a click that no dropdown
-    /// claimed (click-elsewhere-to-dismiss). Call once per frame, after
-    /// [`draw_open_layer`](Self::draw_open_layer).
-    pub fn end_frame(&mut self) {
+    /// claimed (click-elsewhere-to-dismiss), and hand a row click to `focus`.
+    ///
+    /// The focus hand-off is why this takes `&mut FocusState`:
+    /// [`FocusState`](crate::FocusState) blurs on any click it did not claim, so
+    /// choosing an option would otherwise blur the field that option acts on
+    /// (Copy, Cut, paste-into). Clicking the *button* is not a row claim and
+    /// still blurs as usual. Call once per frame, after
+    /// [`draw_open_layer`](Self::draw_open_layer) and **before**
+    /// `FocusState::end_frame`.
+    pub fn end_frame(&mut self, focus: &mut crate::FocusState) {
+        if self.row_claimed {
+            focus.claim_click();
+        }
         if self.escape || (self.mouse_clicked && !self.click_claimed) {
             self.close();
         }
@@ -414,6 +491,21 @@ impl<'a> Dropdown<'a> {
         self
     }
 
+    /// Natural size required to show the widest option without truncation,
+    /// including horizontal padding and the chevron affordance.
+    pub fn intrinsic_size(&self, list: &mut DrawList, styles: &StyleResolver) -> (f32, f32) {
+        let widest = self
+            .items
+            .iter()
+            .map(|item| list.measure_block(&styles.text_block(*item, 0.0, 0.0)).0)
+            .fold(0.0, f32::max);
+        let padding = styles.scalar(StyleKey::Padding);
+        (
+            widest + padding * 2.0 + CHEVRON * 3.0 + CHEVRON_EDGE_GAP,
+            styles.scalar(StyleKey::InputHeight),
+        )
+    }
+
     /// The screen-space rect the open option list occupies when this dropdown is
     /// open below `button_rect` — it floats directly below the button and is as
     /// tall as `min(items, max_visible)` rows.
@@ -449,10 +541,14 @@ impl<'a> Dropdown<'a> {
         ctx.register_focus(id);
 
         // Hand cursor over the closed dropdown button (before borrowing ctx).
-        if ctx.input.is_hovered(rect.x, rect.y, rect.width, rect.height) {
+        if ctx
+            .input
+            .is_hovered(rect.x, rect.y, rect.width, rect.height)
+        {
             ctx.request_cursor(crate::CursorIcon::Pointer);
         }
 
+        ctx.push_debug_scope_rect("Dropdown", rect);
         let s = ctx.styles();
         let list = &mut *ctx.draw_list;
         let input = ctx.input;
@@ -500,21 +596,9 @@ impl<'a> Dropdown<'a> {
         }
         let open = state.is_open(id);
 
-        // Button chrome: focus-style border when open, accent on hover.
-        let border = if open {
-            s.color(StyleKey::InputFocusBorder)
-        } else if hovered {
-            s.color(StyleKey::Accent)
-        } else {
-            s.color(StyleKey::InputBorder)
-        };
-        list.chrome_rect(
-            rect,
-            s.scalar(StyleKey::BorderRadius),
-            s.scalar(StyleKey::BorderWidth),
-            s.color(StyleKey::InputBackground),
-            border,
-        );
+        // Trigger: the input well — sunken field, accent border + focus ring
+        // when open (the design marks an open dropdown like a focused field).
+        super::material::draw_well_simple(list, &s, rect, open, false);
 
         // Selected label.
         let label = self.items.get(self.selected).copied().unwrap_or("");
@@ -536,7 +620,10 @@ impl<'a> Dropdown<'a> {
             TextBlock::new(label, rect.x + pad, text_y)
                 .with_size(font_size)
                 .with_color(r, g, b)
-                .with_max_width(rect.width - pad * 2.0 - CHEVRON * 3.0)
+                .with_max_width(
+                    (rect.width - pad * 2.0 - CHEVRON * 3.0 - CHEVRON_EDGE_GAP).max(0.0),
+                )
+                .with_ellipsis()
                 .with_font_opt(s.theme().font.clone()),
         );
 
@@ -557,19 +644,39 @@ impl<'a> Dropdown<'a> {
             });
         }
 
+        ctx.pop_debug_scope();
         DropdownOutput { clicked, open }
     }
 }
 
 /// Draw a small chevron (▼ closed / ▲ open) at the button's right edge.
 fn draw_chevron(list: &mut DrawList, rect: Rect, s: &StyleResolver, open: bool) {
-    let cx = rect.x + rect.width - s.scalar(StyleKey::Padding) - CHEVRON;
-    let cy = rect.y + rect.height / 2.0;
-    let dy = if open { -CHEVRON * 0.5 } else { CHEVRON * 0.5 };
+    let size = CHEVRON * 2.0;
+    let x = rect.right() - s.scalar(StyleKey::Padding) - CHEVRON_EDGE_GAP - size;
+    let y = rect.y + (rect.height - size) * 0.5;
     let color = s.color(StyleKey::TextDim);
-    // Two strokes meeting at the point.
-    list.line([cx - CHEVRON, cy - dy], [cx, cy + dy], 1.5, color);
-    list.line([cx + CHEVRON, cy - dy], [cx, cy + dy], 1.5, color);
+
+    // Carets are a reusable UI-icon concern, not a pair of aliased soup lines.
+    // MSDF provides scale-independent edge smoothing while the fallback retains
+    // the no-optional-font configuration.
+    #[cfg(feature = "phosphor-icons")]
+    list.phosphor_icon(
+        Rect::new(x, y, size, size),
+        if open {
+            PhosphorIcon::CaretUp
+        } else {
+            PhosphorIcon::CaretDown
+        },
+        color,
+    );
+    #[cfg(not(feature = "phosphor-icons"))]
+    {
+        let cx = x + size * 0.5;
+        let cy = y + size * 0.5;
+        let dy = if open { -CHEVRON * 0.5 } else { CHEVRON * 0.5 };
+        list.line([cx - CHEVRON, cy - dy], [cx, cy + dy], 1.5, color);
+        list.line([cx + CHEVRON, cy - dy], [cx, cy + dy], 1.5, color);
+    }
 }
 
 #[cfg(test)]
@@ -597,16 +704,21 @@ mod tests {
         Rect::new(10.0, 80.0, 120.0, 28.0)
     }
 
-    /// Drive one full frame: begin, draw both buttons, end. Returns nothing —
-    /// inspect `state` afterwards.
-    fn frame(state: &mut DropdownState, focus: &mut FocusState, theme: &Theme, inp: &InputState) {
-        focus.begin_frame(inp);
+    /// Drive one full frame: begin (the open list claims its nav edges before
+    /// `focus` reads them, matching the host contract), draw both buttons, end.
+    fn frame(
+        state: &mut DropdownState,
+        focus: &mut FocusState,
+        theme: &Theme,
+        inp: &mut InputState,
+    ) {
         state.begin_frame(inp);
+        focus.begin_frame(inp);
         let mut list = DrawList::new();
         let mut ctx = DrawContext::new(&mut list, focus, theme, inp, 800.0, 600.0);
         Dropdown::new(&ITEMS, 0).draw(1, rect_a(), state, &mut ctx);
         Dropdown::new(&ITEMS, 0).draw(2, rect_b(), state, &mut ctx);
-        state.end_frame();
+        state.end_frame(focus);
         focus.end_frame(None);
     }
 
@@ -628,7 +740,11 @@ mod tests {
         let menu = Dropdown::new(&ITEMS, 0)
             .with_max_visible(2)
             .open_list_rect(btn);
-        assert_eq!(menu.height, 2.0 * ITEM_HEIGHT, "scrollable list caps at max_visible rows");
+        assert_eq!(
+            menu.height,
+            2.0 * ITEM_HEIGHT,
+            "scrollable list caps at max_visible rows"
+        );
     }
 
     #[test]
@@ -636,6 +752,123 @@ mod tests {
         let s = DropdownState::new();
         assert_eq!(s.open(), None);
         assert!(!s.is_open(1));
+    }
+
+    #[test]
+    fn chevron_leaves_theme_padding_plus_an_edge_gap() {
+        let theme = Theme::default();
+        let s = StyleResolver::new(&theme);
+        let rect = Rect::new(10.0, 10.0, 120.0, 28.0);
+        let mut list = DrawList::new();
+        draw_chevron(&mut list, rect, &s, false);
+
+        #[cfg(feature = "phosphor-icons")]
+        {
+            let expected_x = rect.right() - theme.padding - CHEVRON_EDGE_GAP - CHEVRON * 2.0;
+            assert_eq!(
+                list.icons_msdf.len(),
+                1,
+                "chevron uses the smooth MSDF icon path"
+            );
+            assert!((list.icons_msdf[0].local.x - expected_x).abs() < 0.001);
+            assert!(
+                list.vertices.is_empty(),
+                "MSDF chevron emits no aliased line soup"
+            );
+        }
+        #[cfg(not(feature = "phosphor-icons"))]
+        {
+            let rightmost = list
+                .vertices
+                .iter()
+                .map(|vertex| vertex.position[0])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let right_inset = rect.right() - rightmost;
+            let minimum_visible_inset = theme.padding + CHEVRON_EDGE_GAP - 0.75;
+            assert!(
+                right_inset >= minimum_visible_inset,
+                "fallback chevron's visible geometry must keep the requested right padding"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_selected_label_is_single_line_and_ellipsized() {
+        const LONG: [&str; 1] = ["A selected option that cannot fit"];
+        let theme = Theme::default();
+        let input = InputState::default();
+        let mut state = DropdownState::new();
+        let mut focus = FocusState::new();
+        let mut list = DrawList::new();
+        let rect = Rect::new(10.0, 10.0, 80.0, 24.0);
+
+        Dropdown::new(&LONG, 0).draw(
+            1,
+            rect,
+            &mut state,
+            &mut DrawContext::new(&mut list, &mut focus, &theme, &input, 800.0, 600.0),
+        );
+
+        assert_eq!(list.texts.len(), 1);
+        let label = list.texts[0].clone();
+        assert!(
+            label.ellipsize,
+            "selected dropdown labels must be single-line"
+        );
+        assert!(
+            list.measure_block(&label).1 <= rect.height,
+            "selected label must remain inside the dropdown chrome",
+        );
+    }
+
+    #[test]
+    fn popup_row_highlights_are_clipped_inside_the_panel_border() {
+        let theme = Theme::default();
+        let styles = StyleResolver::new(&theme);
+        let mut input = InputState::default();
+        let mut state = DropdownState::new();
+        let mut layers = LayerStack::new();
+        let button = rect_a();
+        state.open_for_test(1, button, &ITEMS, 0);
+
+        state.begin_frame(&mut input);
+        let popup = state
+            .push_open_layer(&mut layers)
+            .expect("open dropdown has a popup");
+        state.draw_open_layer(&mut layers, Some(popup), &styles, &input);
+
+        let list = &layers.layers_mut()[popup].list;
+        let panel = Dropdown::new(&ITEMS, 0).open_list_rect(button);
+        assert!(
+            list.viewport_clips()
+                .iter()
+                .any(|clip| *clip == panel.inset(theme.border_width.max(1.0))),
+            "row paints are clipped to the panel interior and preserve its border"
+        );
+    }
+
+    #[test]
+    fn open_list_labels_are_single_line_and_ellipsized() {
+        const LONG: [&str; 1] = ["An option that cannot fit in its popup row"];
+        let theme = Theme::default();
+        let mut input = InputState::default();
+        let mut state = DropdownState::new();
+        let mut layers = LayerStack::new();
+        let button = Rect::new(10.0, 10.0, 80.0, 24.0);
+        state.open_for_test(1, button, &LONG, 0);
+
+        state.begin_frame(&mut input);
+        let popup = state.push_open_layer(&mut layers);
+        state.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &input);
+
+        let list = &mut layers.layers_mut()[popup.expect("popup layer")].list;
+        assert_eq!(list.texts.len(), 1);
+        let label = list.texts[0].clone();
+        assert!(label.ellipsize, "popup option labels must be single-line");
+        assert!(
+            list.measure_block(&label).1 <= ITEM_HEIGHT,
+            "popup option must remain inside its row",
+        );
     }
 
     #[test]
@@ -648,7 +881,7 @@ mod tests {
             &mut s,
             &mut focus,
             &theme,
-            &input(true, false, (20.0, 20.0)),
+            &mut input(true, false, (20.0, 20.0)),
         );
         assert!(s.is_open(1));
         // Click it again → closes.
@@ -656,7 +889,7 @@ mod tests {
             &mut s,
             &mut focus,
             &theme,
-            &input(true, false, (20.0, 20.0)),
+            &mut input(true, false, (20.0, 20.0)),
         );
         assert!(!s.is_open(1));
         assert_eq!(s.open(), None);
@@ -671,14 +904,14 @@ mod tests {
             &mut s,
             &mut focus,
             &theme,
-            &input(true, false, (20.0, 20.0)),
+            &mut input(true, false, (20.0, 20.0)),
         ); // open A
         assert!(s.is_open(1));
         frame(
             &mut s,
             &mut focus,
             &theme,
-            &input(true, false, (20.0, 90.0)),
+            &mut input(true, false, (20.0, 90.0)),
         ); // click B
         assert!(s.is_open(2));
         assert!(!s.is_open(1));
@@ -693,14 +926,14 @@ mod tests {
             &mut s,
             &mut focus,
             &theme,
-            &input(true, false, (20.0, 20.0)),
+            &mut input(true, false, (20.0, 20.0)),
         ); // open A
         assert!(s.is_open(1));
         frame(
             &mut s,
             &mut focus,
             &theme,
-            &input(false, true, (20.0, 20.0)),
+            &mut input(false, true, (20.0, 20.0)),
         ); // Esc
         assert!(!s.is_open(1));
     }
@@ -714,7 +947,7 @@ mod tests {
             &mut s,
             &mut focus,
             &theme,
-            &input(true, false, (20.0, 20.0)),
+            &mut input(true, false, (20.0, 20.0)),
         ); // open A
         assert!(s.is_open(1));
         // Click far from any button → unclaimed → end_frame closes.
@@ -722,7 +955,7 @@ mod tests {
             &mut s,
             &mut focus,
             &theme,
-            &input(true, false, (500.0, 500.0)),
+            &mut input(true, false, (500.0, 500.0)),
         );
         assert!(!s.is_open(1));
     }
@@ -736,9 +969,14 @@ mod tests {
             &mut s,
             &mut focus,
             &theme,
-            &input(true, false, (20.0, 20.0)),
+            &mut input(true, false, (20.0, 20.0)),
         ); // open A
-        frame(&mut s, &mut focus, &theme, &input(false, false, (0.0, 0.0))); // idle
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &mut input(false, false, (0.0, 0.0)),
+        ); // idle
         assert!(s.is_open(1));
     }
 
@@ -750,27 +988,27 @@ mod tests {
         let mut layers = LayerStack::new();
 
         // Frame 1: open A. At frame-top there's no geometry yet, so no popup.
-        focus.begin_frame(&input(true, false, (20.0, 20.0)));
-        s.begin_frame(&input(true, false, (20.0, 20.0)));
+        let mut open_in = input(true, false, (20.0, 20.0));
+        s.begin_frame(&mut open_in);
+        focus.begin_frame(&open_in);
         let popup = s.push_open_layer(&mut layers);
         assert_eq!(popup, None, "freshly-opened list has no layer this frame");
         let mut list = DrawList::new();
-        let input_open = input(true, false, (20.0, 20.0));
-        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &input_open, 800.0, 600.0);
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &open_in, 800.0, 600.0);
         Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
         drop(ctx);
-        let pick = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &input_open);
+        let pick = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &open_in);
         assert_eq!(pick, None);
-        s.end_frame();
+        s.end_frame(&mut focus);
         focus.end_frame(None);
         assert!(s.is_open(1));
 
         // Frame 2: geometry promoted → popup pushed; click the 2nd row ("Green").
         layers.clear();
         // List sits at y = 10 + 28 + 2 = 40; row 1 spans [68, 96).
-        let click_row1 = input(true, false, (20.0, 80.0));
+        let mut click_row1 = input(true, false, (20.0, 80.0));
+        s.begin_frame(&mut click_row1);
         focus.begin_frame(&click_row1);
-        s.begin_frame(&click_row1);
         let popup = s.push_open_layer(&mut layers);
         assert!(popup.is_some(), "open list has a layer on the next frame");
         let mut list = DrawList::new();
@@ -781,7 +1019,7 @@ mod tests {
         drop(ctx);
         let pick = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &click_row1);
         assert_eq!(pick, Some((1, 1)), "clicking row 1 returns (id=1, index=1)");
-        s.end_frame();
+        s.end_frame(&mut focus);
         focus.end_frame(None);
         assert!(!s.is_open(1), "selecting an option closes the dropdown");
     }
@@ -798,36 +1036,188 @@ mod tests {
         s
     }
 
+    /// Drive one full frame of an already-open list: begin (the list claims this
+    /// frame's navigation edges first, matching the host contract in
+    /// `UiState::begin_frame`), push the popup, draw the button and the open
+    /// layer, then tear down.
+    fn open_frame(
+        state: &mut DropdownState,
+        focus: &mut FocusState,
+        theme: &Theme,
+        layers: &mut LayerStack,
+        inp: &mut InputState,
+        selected: usize,
+    ) -> Option<(DropdownId, usize)> {
+        layers.clear();
+        state.begin_frame(inp);
+        focus.begin_frame(inp);
+        let popup = state.push_open_layer(layers);
+        let mut list = DrawList::new();
+        let mut ctx = DrawContext::new(&mut list, focus, theme, inp, 800.0, 600.0);
+        Dropdown::new(&ITEMS, selected).draw(1, rect_a(), state, &mut ctx);
+        drop(ctx);
+        let picked = state.draw_open_layer(layers, popup, &StyleResolver::new(theme), inp);
+        state.end_frame(focus);
+        focus.end_frame(None);
+        picked
+    }
+
+    #[test]
+    fn a_row_click_claims_the_click_for_focus_but_the_button_does_not() {
+        let theme = Theme::default();
+
+        // Clicking the button is an ordinary click elsewhere: focus blurs.
+        let mut s = DropdownState::new();
+        let mut focus = FocusState::new();
+        focus.focus(9);
+        frame(
+            &mut s,
+            &mut focus,
+            &theme,
+            &mut input(true, false, (20.0, 20.0)),
+        );
+        assert!(s.is_open(1));
+        assert!(
+            !focus.is_focused(9),
+            "clicking the button is click-elsewhere and blurs as usual"
+        );
+
+        // Choosing a row must not blur: the option acts on whatever was focused
+        // (Copy, Cut, paste-into), so the row hands its claim to focus.
+        let mut s = DropdownState::new();
+        let mut focus = FocusState::new();
+        let mut layers = LayerStack::new();
+        focus.focus(9);
+        s.open_for_test(1, rect_a(), &ITEMS, 0);
+
+        // Frame 1: promote the geometry so the list gets a popup layer, and draw
+        // the (open) button so the next frame has geometry to promote again.
+        let mut idle = input(false, false, (20.0, 20.0));
+        s.begin_frame(&mut idle);
+        focus.begin_frame(&idle);
+        let popup = s.push_open_layer(&mut layers);
+        let mut list = DrawList::new();
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &idle, 800.0, 600.0);
+        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
+        drop(ctx);
+        let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &idle);
+        s.end_frame(&mut focus);
+        focus.end_frame(None);
+        assert!(focus.is_focused(9), "hovering the list does not blur");
+        assert!(s.is_open(1));
+
+        // Frame 2: click row 0. The list top is rect_a().bottom + GAP = 40, so
+        // row 0 spans [40, 68).
+        layers.clear();
+        let mut click = input(true, false, (20.0, 50.0));
+        s.begin_frame(&mut click);
+        focus.begin_frame(&click);
+        let popup = s.push_open_layer(&mut layers);
+        let picked = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &click);
+        assert_eq!(picked, Some((1, 0)));
+        s.end_frame(&mut focus);
+        focus.end_frame(None);
+
+        assert!(!s.is_open(1), "choosing an option closes the list");
+        assert!(
+            focus.is_focused(9),
+            "and must not blur the widget the option acts on"
+        );
+    }
+
+    #[test]
+    fn escape_closing_the_list_does_not_blur_focus() {
+        // Same bug at the widget level: the list claims `nav.cancel` at
+        // frame-top, so focus never sees the edge it would blur on.
+        let theme = Theme::default();
+        let mut s = DropdownState::new();
+        let mut focus = FocusState::new();
+        let mut layers = LayerStack::new();
+        focus.focus(9);
+        s.open_for_test(1, rect_a(), &ITEMS, 0);
+
+        let mut esc = input(false, true, (20.0, 20.0));
+        assert!(esc.nav.cancel);
+        s.begin_frame(&mut esc);
+        assert!(!esc.nav.cancel, "the open list claimed the cancel edge");
+        focus.begin_frame(&esc);
+        let popup = s.push_open_layer(&mut layers);
+        let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &esc);
+        s.end_frame(&mut focus);
+        focus.end_frame(None);
+
+        assert!(!s.is_open(1), "Escape closes the open list");
+        assert!(focus.is_focused(9), "and must not blur the focused widget");
+    }
+
+    #[test]
+    fn a_closed_dropdown_does_not_claim_the_confirm_edge_it_opens_on() {
+        // If a closed dropdown claimed Enter, its own keyboard-open path would
+        // consume the very edge that asked it to open.
+        let theme = Theme::default();
+        let mut s = DropdownState::new();
+        let mut focus = FocusState::new();
+        let mut layers = LayerStack::new();
+        focus.focus(1);
+
+        let mut enter = InputState {
+            enter_pressed: true,
+            ..InputState::default()
+        };
+        crate::map_keyboard(&mut enter);
+        s.begin_frame(&mut enter);
+        assert!(
+            enter.nav.confirm,
+            "a closed dropdown must leave confirm alone"
+        );
+        assert!(!s.is_open(1));
+
+        let popup = s.push_open_layer(&mut layers);
+        assert_eq!(popup, None, "nothing open at frame-top");
+        let mut list = DrawList::new();
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &enter, 800.0, 600.0);
+        Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
+        drop(ctx);
+        assert!(s.is_open(1), "Enter on the focused button opens the list");
+
+        // The same frame must not then select: the confirm edge belonged to the
+        // act of opening, not to the list it revealed.
+        let pick = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &enter);
+        assert_eq!(
+            pick, None,
+            "the opening edge must not also select an option"
+        );
+        assert!(s.is_open(1), "the list stays open");
+    }
+
     #[test]
     fn arrow_down_moves_highlighted_in_open_list() {
         let theme = Theme::default();
         let mut s = DropdownState::new();
         let mut focus = FocusState::new();
-        let inp = input(true, false, (20.0, 20.0));
-        focus.begin_frame(&inp);
-        s.begin_frame(&inp);
+        let mut layers = LayerStack::new();
+
+        // Frame 1: click the button to open.
+        let mut open_in = input(true, false, (20.0, 20.0));
+        s.begin_frame(&mut open_in);
+        focus.begin_frame(&open_in);
         let mut list = DrawList::new();
-        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &inp, 800.0, 600.0);
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &open_in, 800.0, 600.0);
         Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
         drop(ctx);
-        s.end_frame();
+        s.end_frame(&mut focus);
         focus.end_frame(None);
         assert!(s.is_open(1));
 
-        // Frame 2: arrow down twice.
-        let kbd = input_keys(false, true, false);
-        focus.begin_frame(&kbd);
-        s.begin_frame(&kbd);
-        let mut layers = LayerStack::new();
-        let popup = s.push_open_layer(&mut layers);
-        // draw_open_layer processes arrow-down from input
-        let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &kbd);
+        // One begin_frame per frame: an open list captures the navigation edge at
+        // frame-top and claims it, so the edge is consumed exactly once.
+        let mut down = input_keys(false, true, false);
+        open_frame(&mut s, &mut focus, &theme, &mut layers, &mut down, 0);
         assert_eq!(s.highlighted, 1, "arrow down moves to index 1");
 
-        let kbd2 = input_keys(false, true, false);
-        let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &kbd2);
+        let mut down = input_keys(false, true, false);
+        open_frame(&mut s, &mut focus, &theme, &mut layers, &mut down, 0);
         assert_eq!(s.highlighted, 2, "arrow down moves to index 2");
-        s.end_frame();
     }
 
     #[test]
@@ -835,27 +1225,27 @@ mod tests {
         let theme = Theme::default();
         let mut s = DropdownState::new();
         let mut focus = FocusState::new();
-        let inp = input(true, false, (20.0, 20.0));
+        let mut inp = input(true, false, (20.0, 20.0));
+        s.begin_frame(&mut inp);
         focus.begin_frame(&inp);
-        s.begin_frame(&inp);
         let mut list = DrawList::new();
         let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &inp, 800.0, 600.0);
         Dropdown::new(&ITEMS, 2).draw(1, rect_a(), &mut s, &mut ctx); // selected = 2 → highlighted starts at 2
         drop(ctx);
-        s.end_frame();
+        s.end_frame(&mut focus);
         focus.end_frame(None);
         assert!(s.is_open(1));
         assert_eq!(s.highlighted, 2);
 
         // Frame 2: arrow up.
-        let kbd = input_keys(true, false, false);
+        let mut kbd = input_keys(true, false, false);
+        s.begin_frame(&mut kbd);
         focus.begin_frame(&kbd);
-        s.begin_frame(&kbd);
         let mut layers = LayerStack::new();
         let popup = s.push_open_layer(&mut layers);
         let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &kbd);
         assert_eq!(s.highlighted, 1, "arrow up moves to index 1");
-        s.end_frame();
+        s.end_frame(&mut focus);
     }
 
     #[test]
@@ -863,14 +1253,14 @@ mod tests {
         let theme = Theme::default();
         let mut s = DropdownState::new();
         let mut focus = FocusState::new();
-        let inp = input(true, false, (20.0, 20.0));
+        let mut inp = input(true, false, (20.0, 20.0));
+        s.begin_frame(&mut inp);
         focus.begin_frame(&inp);
-        s.begin_frame(&inp);
         let mut list = DrawList::new();
         let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &inp, 800.0, 600.0);
         Dropdown::new(&ITEMS, 0).draw(1, rect_a(), &mut s, &mut ctx);
         drop(ctx);
-        s.end_frame();
+        s.end_frame(&mut focus);
         focus.end_frame(None);
         assert!(s.is_open(1));
 
@@ -881,8 +1271,8 @@ mod tests {
             ..Default::default()
         };
         crate::map_keyboard(&mut kbd);
+        s.begin_frame(&mut kbd);
         focus.begin_frame(&kbd);
-        s.begin_frame(&kbd);
         let mut layers = LayerStack::new();
         let popup = s.push_open_layer(&mut layers);
         let mut list = DrawList::new();
@@ -891,7 +1281,7 @@ mod tests {
         drop(ctx);
         let _ = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &kbd);
         assert_eq!(s.highlighted, 1);
-        s.end_frame();
+        s.end_frame(&mut focus);
         focus.end_frame(None);
 
         // Frame 3: draw button (not clicked) + Enter selects highlighted (index 1).
@@ -900,8 +1290,8 @@ mod tests {
             ..Default::default()
         };
         crate::map_keyboard(&mut enter);
+        s.begin_frame(&mut enter);
         focus.begin_frame(&enter);
-        s.begin_frame(&enter);
         let popup = s.push_open_layer(&mut layers);
         let mut list = DrawList::new();
         let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &enter, 800.0, 600.0);
@@ -909,7 +1299,7 @@ mod tests {
         drop(ctx);
         let result = s.draw_open_layer(&mut layers, popup, &StyleResolver::new(&theme), &enter);
         assert_eq!(result, Some((1, 1)), "Enter selects highlighted item");
-        s.end_frame();
+        s.end_frame(&mut focus);
         assert!(!s.is_open(1), "selecting closes the dropdown");
     }
 }

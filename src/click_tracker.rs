@@ -159,12 +159,11 @@ impl ClickTracker {
         }
 
         // ---- Hold detection ----
-        if input.mouse_down {
-            if let Some(since) = self.down_since {
-                if time_secs - since >= self.hold_threshold {
-                    self.hold_latched = true;
-                }
-            }
+        if input.mouse_down
+            && let Some(since) = self.down_since
+            && time_secs - since >= self.hold_threshold
+        {
+            self.hold_latched = true;
         }
 
         input.mouse_held = self.hold_latched;

@@ -1,14 +1,24 @@
 //! UI widgets - buttons, text inputs, panels, etc.
 
+mod app_shell;
+mod asset_grid;
+mod badge;
 mod banner;
+mod breadcrumb;
+mod busy;
 mod button;
 mod checkbox;
 mod color_picker;
+mod combo_box;
+mod curve_editor;
+mod doc_tabs;
+mod dock_panel;
 mod drag;
 mod drag_handle;
 mod draw_list;
 mod dropdown;
 mod focus;
+mod gradient_ramp;
 mod group;
 mod hit_zone;
 #[cfg(feature = "phosphor-icons")]
@@ -16,34 +26,65 @@ mod icon;
 mod image;
 mod image_button;
 mod list;
+mod material;
+mod menu_screens;
+mod binding;
+mod settings;
+mod menubar;
 mod number_input;
 mod panel;
+mod popover;
 mod progress_bar;
 mod radio;
 mod scroll_view;
 mod separator;
 mod slider;
+mod splitter;
+mod status_bar;
 mod table;
 mod tabs;
-mod toast;
+mod tag_input;
 mod text_input;
+mod toast;
+mod toggle;
+mod toolbar;
 mod tooltip;
 mod tree;
+mod vector_field;
 
+pub use app_shell::{
+    AppShell, SHELL_DRAG_BOTTOM_SPLITTER, SHELL_DRAG_LEFT_SPLITTER, SHELL_DRAG_RIGHT_SPLITTER,
+    SHELL_DRAG_TOOLBAR_GRIP, ShellChromeOutput, ShellLayout,
+};
+pub use asset_grid::{AssetGrid, AssetGridOutput};
+pub use badge::{ChipOutput, badge, chip, keycap};
 pub use banner::{Banner, Severity};
+pub use breadcrumb::{Breadcrumb, Pager, PagerOutput};
+pub use busy::{EmptyState, dots, empty_state, skeleton, spinner};
 pub use button::Button;
 pub use checkbox::{CHECKBOX_CHECKED_ICON, CHECKBOX_ICON, Checkbox};
 pub use color_picker::{ColorPicker, ColorPickerOutput};
+pub use combo_box::{
+    ComboOutput, draw_list as draw_combo_list, draw_trigger as draw_combo_trigger,
+};
+pub use curve_editor::{CurveOutput, draw as draw_curve_editor};
+pub use doc_tabs::{DocTab, DocTabsOutput, draw as draw_doc_tabs};
+pub use dock_panel::{DockPanel, DockPanelOutput, DockPanelState, DockSide, DockTab};
 pub use drag::{DragCapture, DragId};
 pub use drag_handle::{DragHandle, DragHandleOutput};
-pub(crate) use draw_list::ColorCmd;
 #[cfg(feature = "phosphor-icons")]
 pub use draw_list::IconMsdf;
+pub(crate) use draw_list::PaintCmd;
 pub use draw_list::{
-    ChromeInstance, CircleInstance, DrawList, IconDraw, NineSliceDraw, NineSliceId, Vertex,
+    ChromeInstance, CircleInstance, DebugScope, DrawList, IconDraw, NineSliceDraw, NineSliceId,
+    PrimCounts, Vertex,
 };
 pub use dropdown::{Dropdown, DropdownId, DropdownOutput, DropdownState};
 pub use focus::{FocusId, FocusState};
+pub use gradient_ramp::{
+    GradientStop, RampOutput, draw as draw_gradient_ramp, readout as gradient_ramp_readout,
+    sample as sample_ramp,
+};
 pub use group::Group;
 pub use hit_zone::{HitZone, HitZoneOutput};
 #[cfg(feature = "phosphor-icons")]
@@ -51,21 +92,43 @@ pub use icon::Icon;
 pub use image::{Image, ImageAlign, ImageFit};
 pub use image_button::ImageButton;
 pub use list::{List, ListItem, ListOutput, ListState, SelectionMode};
+pub(crate) use material::sheen_over;
+pub use material::{Material, Tone};
+pub use menu_screens::{MenuList, MenuListOutput, draw_scrim};
+pub use binding::{Binding, KeyCode, PadButton};
+pub use settings::{
+    default_values, SettingField, SettingValue, SettingsForm, SettingsFormOutput, SettingsSpec,
+    SettingsFormState,
+};
+pub use menubar::{
+    AccelPlatform, Accelerator, ActivatedItem, Key, Menu, MenuBar, MenuBarId, MenuBarOutput,
+    MenuBarState, MenuDrawEnv, MenuItem, MenuItemId, MenuLayers, MenuTrigger, Modifiers,
+    SubmenuSide, blocker_regions, place_popup,
+};
 pub use number_input::{NumberInput, NumberOutput};
 pub use panel::{Panel, label, label_at, label_centered_at, title, title_at};
+pub use popover::{Popover, PopoverOutput, PopoverSide, measure_sheet_height, place_popover};
 pub use progress_bar::{ProgressBar, ProgressFill};
 pub use radio::RadioGroup;
 pub use scroll_view::{ScrollBegin, ScrollState, ScrollView};
 pub use separator::{Orientation, Separator};
 pub use slider::{Slider, SliderOutput};
+pub use splitter::{SplitAxis, Splitter, SplitterOutput};
+pub use status_bar::{STATUS_BAR_HEIGHT, StatusCell, draw as draw_status_bar};
 pub use table::{Align, ColumnWidth, Table, TableCell, TableColumn, TableOutput};
 pub use tabs::{Tabs, TabsOutput};
-pub use text_input::TextInput;
+pub use tag_input::{TagOutput, draw as draw_tag_input};
+pub use text_input::{ClipboardGet, ClipboardSet, TextInput};
 pub use toast::{Corner, DEFAULT_TTL, Toast, ToastStack};
+pub use toggle::Toggle;
+pub use toolbar::{ToolDef, Toolbar, ToolbarEdge, ToolbarItem, ToolbarOutput, ToolbarState};
 pub use tooltip::{TooltipContent, TooltipLayer};
 pub use tree::{TreeAction, TreeIcon, TreeId, TreeNode, TreeNodeOutput, TreeState};
+pub use vector_field::{AXIS_TINTS, VectorField, VectorFieldOutput, VectorScrub};
 
-use crate::{AnimSlot, AnimationState, Easing, InputState, StyleKey, StyleOverlay, StyleResolver, Theme};
+use crate::{
+    AnimSlot, AnimationState, Easing, InputState, StyleKey, StyleOverlay, StyleResolver, Theme,
+};
 
 /// Context for drawing UI elements.
 ///
@@ -114,6 +177,10 @@ pub struct DrawContext<'a> {
     /// [`CursorIcon`](crate::CursorIcon) after the frame and applies it to its
     /// window.
     pub cursor: Option<&'a mut crate::CursorState>,
+    /// Optional retained interaction scene. When attached, widgets with stable
+    /// IDs register their local geometry here and receive topmost-first responses
+    /// resolved against the previous completed frame.
+    pub interactions: Option<&'a mut crate::InteractionScene>,
 }
 
 impl<'a> DrawContext<'a> {
@@ -137,6 +204,7 @@ impl<'a> DrawContext<'a> {
             style: None,
             animations: None,
             cursor: None,
+            interactions: None,
         }
     }
 
@@ -167,6 +235,45 @@ impl<'a> DrawContext<'a> {
     pub fn with_cursor(mut self, cursor: &'a mut crate::CursorState) -> Self {
         self.cursor = Some(cursor);
         self
+    }
+
+    /// Attach the retained interaction scene for this surface. Widgets that use
+    /// [`interact`](Self::interact) then share their exact local allocation,
+    /// active transform, clip, and layer ordering with hit testing.
+    pub fn with_interactions(mut self, interactions: &'a mut crate::InteractionScene) -> Self {
+        self.interactions = Some(interactions);
+        self
+    }
+
+    /// Register a rectangular interactive allocation and return the response
+    /// resolved from the same widget ID in the previous completed frame.
+    pub fn interact(
+        &mut self,
+        id: impl Into<crate::WidgetId>,
+        rect: crate::layout::Rect,
+        enabled: bool,
+    ) -> crate::Response {
+        let id = id.into();
+        let transform = self.draw_list.current_transform();
+        let clip = self.draw_list.current_clip();
+        let layer = self.active_layer.map_or(0, |index| index as u32 + 1);
+        match self.interactions.as_deref_mut() {
+            Some(scene) => scene.register(
+                id,
+                crate::HitShape::Rect(rect),
+                transform,
+                clip,
+                layer,
+                enabled,
+                crate::PointerPolicy::Target,
+            ),
+            None => crate::Response::idle(id, rect),
+        }
+    }
+
+    /// Whether this context has retained interaction dispatch attached.
+    pub fn has_interactions(&self) -> bool {
+        self.interactions.is_some()
     }
 
     /// Request an OS cursor shape for this frame on behalf of a hovered widget.
@@ -250,6 +357,38 @@ impl<'a> DrawContext<'a> {
     pub fn draw_focus_ring(&mut self, rect: crate::layout::Rect) {
         let radius = self.scalar(StyleKey::BorderRadius);
         let color = self.color(StyleKey::FocusRing);
-        self.draw_list.rounded_rect_outline(rect, radius, 2.0, color);
+        self.draw_list
+            .rounded_rect_outline(rect, radius, 2.0, color);
+    }
+
+    /// Open a debug scope declaring the box this widget was allocated — see
+    /// [`DrawList::push_debug_scope_rect`].
+    ///
+    /// Widgets call this with the `Rect` they were handed so the report can tell
+    /// whether they stayed inside it. Applications never need to.
+    pub fn push_debug_scope_rect(&mut self, name: impl Into<String>, rect: crate::layout::Rect) {
+        self.draw_list.push_debug_scope_rect(name, rect);
+    }
+
+    /// Close the innermost debug scope.
+    pub fn pop_debug_scope(&mut self) {
+        self.draw_list.pop_debug_scope();
+    }
+}
+
+/// Build a widget scope name: the type name, plus the author-written label in
+/// quotes when the widget has one (`Button "Save"`).
+///
+/// The type leads so names stay greppable and machine-splittable; the label is
+/// what makes [`DebugReport::node`](crate::debug::DebugReport::node) — which is
+/// first-match-wins — actually able to address one button out of thirty.
+///
+/// Only ever pass an author-written label (a title, a caption), never
+/// content the user typed or a long message: scope names are not truncated.
+pub(crate) fn scope_name(kind: &str, label: &str) -> String {
+    if label.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind} {label:?}")
     }
 }

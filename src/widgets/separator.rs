@@ -98,6 +98,14 @@ impl Separator {
 
     /// Draw the rule centered within `rect`.
     pub fn draw(&self, rect: Rect, list: &mut DrawList, style: &StyleResolver) {
+        // The light counter-edge paints one pixel beyond the supplied layout
+        // line on its lower/right side; declare that intentional material
+        // footprint rather than teaching callers to reserve phantom space.
+        let scope = match self.orientation {
+            Orientation::Horizontal => Rect::new(rect.x, rect.y, rect.width, rect.height + 1.0),
+            Orientation::Vertical => Rect::new(rect.x, rect.y, rect.width + 1.0, rect.height),
+        };
+        list.push_debug_scope_rect("Separator", scope);
         let thickness = self
             .thickness
             .unwrap_or_else(|| style.scalar(StyleKey::BorderWidth).max(1.0));
@@ -105,26 +113,32 @@ impl Separator {
             .color
             .unwrap_or_else(|| style.color(StyleKey::PanelBorder));
 
+        // The 4a rule is a recessed two-tone edge: a dark primary line plus a
+        // faint light counter-edge on its lower/right side. Keep the requested
+        // thickness as the dark rule and add the counter-edge outside it, so a
+        // default 1px separator still remains a 1px layout contribution.
+        let highlight = style.color(StyleKey::EdgeHighlight);
         match self.orientation {
             Orientation::Horizontal => {
-                // Centered vertically; spans the width minus the end insets.
                 let y = rect.y + (rect.height - thickness) * 0.5;
                 let x = rect.x + self.inset;
                 let w = (rect.width - 2.0 * self.inset).max(0.0);
                 if w > 0.0 {
                     list.quad(x, y, w, thickness, color);
+                    list.quad(x, y + thickness, w, 1.0, highlight);
                 }
             }
             Orientation::Vertical => {
-                // Centered horizontally; spans the height minus the end insets.
                 let x = rect.x + (rect.width - thickness) * 0.5;
                 let y = rect.y + self.inset;
                 let h = (rect.height - 2.0 * self.inset).max(0.0);
                 if h > 0.0 {
                     list.quad(x, y, thickness, h, color);
+                    list.quad(x + thickness, y, 1.0, h, highlight);
                 }
             }
         }
+        list.pop_debug_scope();
     }
 }
 
@@ -139,14 +153,13 @@ mod tests {
         StyleResolver::new(theme)
     }
 
-    /// The single emitted quad as (x, y, w, h). `quad` takes the translate-only
-    /// fast path under the identity transform, recording one fill-only
-    /// `ChromeInstance` (radius 0) rather than soup vertices.
+    /// Primary dark rule as (x, y, w, h). `quad` takes the translate-only fast
+    /// path under the identity transform, recording fill-only chrome instances.
     fn only_quad(list: &DrawList) -> (f32, f32, f32, f32) {
         assert_eq!(
             list.chrome_instances.len(),
-            1,
-            "expected exactly one fill instance"
+            2,
+            "dark rule + light counter-edge"
         );
         let r = list.chrome_instances[0].rect;
         (r[0], r[1], r[2], r[3])
@@ -156,9 +169,11 @@ mod tests {
     fn horizontal_is_centered_and_full_width() {
         let s = style();
         let mut list = DrawList::new();
-        Separator::horizontal()
-            .with_thickness(2.0)
-            .draw(Rect::new(10.0, 20.0, 100.0, 10.0), &mut list, &s);
+        Separator::horizontal().with_thickness(2.0).draw(
+            Rect::new(10.0, 20.0, 100.0, 10.0),
+            &mut list,
+            &s,
+        );
         let (x, y, w, h) = only_quad(&list);
         assert_eq!((x, w), (10.0, 100.0), "spans the full width");
         assert_eq!(h, 2.0, "thickness honored");
@@ -170,9 +185,11 @@ mod tests {
     fn vertical_is_centered_and_full_height() {
         let s = style();
         let mut list = DrawList::new();
-        Separator::vertical()
-            .with_thickness(4.0)
-            .draw(Rect::new(10.0, 20.0, 12.0, 80.0), &mut list, &s);
+        Separator::vertical().with_thickness(4.0).draw(
+            Rect::new(10.0, 20.0, 12.0, 80.0),
+            &mut list,
+            &s,
+        );
         let (x, y, w, h) = only_quad(&list);
         assert_eq!((y, h), (20.0, 80.0), "spans the full height");
         assert_eq!(w, 4.0, "thickness honored");
@@ -194,6 +211,23 @@ mod tests {
     }
 
     #[test]
+    fn vertical_places_its_highlight_on_the_right_edge() {
+        let s = style();
+        let mut list = DrawList::new();
+        Separator::vertical().with_thickness(2.0).draw(
+            Rect::new(10.0, 20.0, 10.0, 40.0),
+            &mut list,
+            &s,
+        );
+        assert_eq!(list.chrome_instances[0].rect, [14.0, 20.0, 2.0, 40.0]);
+        assert_eq!(list.chrome_instances[1].rect, [16.0, 20.0, 1.0, 40.0]);
+        assert_eq!(
+            list.chrome_instances[1].bg,
+            s.color(StyleKey::EdgeHighlight)
+        );
+    }
+
+    #[test]
     fn default_thickness_follows_theme_border_width() {
         let s = style();
         let bw = s.scalar(StyleKey::BorderWidth).max(1.0);
@@ -209,10 +243,14 @@ mod tests {
         let expected = s.color(StyleKey::PanelBorder);
         let mut list = DrawList::new();
         Separator::horizontal().draw(Rect::new(0.0, 0.0, 50.0, 4.0), &mut list, &s);
-        assert_eq!(list.chrome_instances.len(), 1);
+        assert_eq!(list.chrome_instances.len(), 2);
         assert_eq!(
             list.chrome_instances[0].bg, expected,
-            "fill uses the theme panel-border color"
+            "primary rule uses the theme panel-border color"
+        );
+        assert_eq!(
+            list.chrome_instances[1].bg,
+            s.color(StyleKey::EdgeHighlight)
         );
     }
 
@@ -221,12 +259,11 @@ mod tests {
         let s = style();
         let mut list = DrawList::new();
         // Inset larger than half the width collapses the line entirely.
-        Separator::horizontal()
-            .with_inset(60.0)
-            .draw(Rect::new(0.0, 0.0, 100.0, 1.0), &mut list, &s);
-        assert!(
-            list.chrome_instances.is_empty(),
-            "no quad when length ≤ 0"
+        Separator::horizontal().with_inset(60.0).draw(
+            Rect::new(0.0, 0.0, 100.0, 1.0),
+            &mut list,
+            &s,
         );
+        assert!(list.chrome_instances.is_empty(), "no rule when length ≤ 0");
     }
 }

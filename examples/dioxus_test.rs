@@ -747,7 +747,7 @@ async fn run_wgpu_app() {
         // Establish the open dropdown's popup layer at frame-top (from
         // last frame's geometry) so `input_for_base` blocks clicks to
         // widgets under the open list — same as the modal above.
-        ui_persist_clone.dropdowns.begin_frame(&input_state_clone);
+        ui_persist_clone.dropdowns.begin_frame(&mut input_state_clone);
         let dropdown_popup = ui_persist_clone.dropdowns.push_open_layer(&mut layers);
 
         // Resolve input for the base layer. When a modal is open this
@@ -1089,7 +1089,7 @@ async fn run_wgpu_app() {
                 ui_persist_clone.dropdown_sel = idx;
             }
         }
-        ui_persist_clone.dropdowns.end_frame();
+        ui_persist_clone.dropdowns.end_frame(&mut focus_clone);
 
         // Bonus: rotated badge from the original demo, on the base layer
         // (built via UiContext::with_layers so it stays clipped to the

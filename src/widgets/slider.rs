@@ -1,9 +1,10 @@
 //! Slider widget - a horizontal bar with a draggable scrubber.
 
+use crate::StyleKey;
 use crate::layout::Rect;
 use crate::text::TextBlock;
-use crate::StyleKey;
 
+use super::material::draw_inset_shadow;
 use super::{DragCapture, DragId, DrawContext, FocusId};
 
 /// Output from drawing a slider.
@@ -95,6 +96,7 @@ impl Slider {
         rect: Rect,
         ctx: &mut DrawContext,
     ) -> SliderOutput {
+        ctx.push_debug_scope_rect("Slider", rect);
         // Snapshot the input fields up front so we can mutate `ctx` (focus
         // registration) later without holding a borrow on `ctx.input`.
         let input = ctx.input;
@@ -196,42 +198,89 @@ impl Slider {
         };
         let display_scrubber_x = slide_left + display_t * slide_range;
 
-        // ---- Track (procedural rounded pill) ----
+        // ---- Track (sunken well, 4a language) ----
         let track_rect = Rect::new(rect.x, track_y, track_width, track_height);
         let track_radius = track_height * 0.5;
-        list.rounded_rect(track_rect, track_radius, s.color(StyleKey::InputBackground));
-
-        // Filled portion: from the track's left up to the knob centre.
-        let fill_w = (display_scrubber_x - rect.x).clamp(0.0, track_width);
-        if fill_w > 0.0 {
-            list.rounded_rect(
-                Rect::new(rect.x, track_y, fill_w, track_height),
-                track_radius,
-                s.color(StyleKey::Accent),
-            );
-        }
-
-        // Subtle outline for definition, matching the rounded inputs.
-        list.rounded_rect_outline(
+        // Dark trough with a black edge (the design's `rgba(0,0,0,0.55)` well).
+        list.chrome_rect(
             track_rect,
             track_radius,
             s.scalar(StyleKey::BorderWidth),
-            s.color(StyleKey::InputBorder),
+            s.color(StyleKey::InputBackground),
+            [0.0, 0.0, 0.0, 0.6],
+        );
+        // Inset shadow fading down from the top edge (the sunken read).
+        draw_inset_shadow(
+            list,
+            &s,
+            track_rect,
+            s.scalar(StyleKey::InnerShadowDepth),
+            1.0,
         );
 
-        // ---- Scrubber (procedural circle handle) ----
+        // Filled portion: from the track's left up to the knob centre — the
+        // accent gradient (brighter at the top), capped at radius 2 like the
+        // design.
+        let fill_w = (display_scrubber_x - rect.x).clamp(0.0, track_width);
+        if fill_w > 0.0 {
+            let fill_rect = Rect::new(
+                rect.x + 1.0,
+                track_y + 1.0,
+                fill_w - 2.0,
+                track_height - 2.0,
+            );
+            list.chrome_rect_gradient(
+                fill_rect,
+                2.0,
+                0.0,
+                s.color(StyleKey::AccentFaceTop),
+                s.color(StyleKey::AccentFaceBottom),
+                [0.0; 4],
+            );
+        }
+        // Light line beneath the track's bottom edge (sunken underline).
+        let under = s.color(StyleKey::EdgeShadow);
+        list.quad(
+            track_rect.x + 1.0,
+            track_rect.y + track_height - 2.0,
+            (track_width - 2.0).max(0.0),
+            1.0,
+            under,
+        );
+
+        // ---- Scrubber: a light rectangular key with a black edge (the design's
+        // 11×14 knob: `linear-gradient(#f2f6f9, #c3ccd4)` + 1px black border),
+        // sliding on the track centreline. ----
+        let knob_h = scrubber_size.max(track_height + 4.0);
+        let knob_w = knob_h * 0.75;
+        let knob_rect = Rect::new(
+            display_scrubber_x - knob_w * 0.5,
+            rect.y + rect.height * 0.5 - knob_h * 0.5,
+            knob_w,
+            knob_h,
+        );
         let knob_center = (display_scrubber_x, rect.y + rect.height * 0.5);
-        let knob_radius = scrubber_size * 0.5;
+        let knob_radius = knob_h * 0.5;
         // Hover/drag halo behind the knob.
         if dragging || hovered {
             list.circle(knob_center, knob_radius + 2.0, [1.0, 1.0, 1.0, 0.10]);
         }
-        list.circle(knob_center, knob_radius, s.color(StyleKey::Text));
-        list.circle_outline(
-            knob_center,
-            knob_radius,
-            s.scalar(StyleKey::BorderWidth).max(1.0),
-            s.color(StyleKey::ButtonBorder),
+        list.chrome_rect_gradient(
+            knob_rect,
+            s.scalar(StyleKey::BorderRadius),
+            1.0,
+            [0.949, 0.965, 0.976, 1.0], // #f2f6f9
+            [0.765, 0.800, 0.831, 1.0], // #c3ccd4
+            [0.0, 0.0, 0.0, 0.55],
+        );
+        // 1px inset highlight under the knob's top edge.
+        let hl = s.color(StyleKey::EdgeHighlightHover);
+        list.quad(
+            knob_rect.x + 1.0,
+            knob_rect.y + 1.0,
+            (knob_rect.width - 2.0).max(0.0),
+            1.0,
+            [hl[0], hl[1], hl[2], 0.8],
         );
 
         // Value text
@@ -266,6 +315,7 @@ impl Slider {
             ctx.draw_focus_ring(rect);
         }
 
+        ctx.pop_debug_scope();
         SliderOutput {
             value: new_value,
             dragging,

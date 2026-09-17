@@ -182,6 +182,7 @@ impl<'a> Table<'a> {
         style: &StyleResolver,
         input: &mut InputState,
     ) -> TableOutput {
+        list.push_debug_scope_rect("Table", rect);
         let header_h = if self.show_header {
             self.header_height
         } else {
@@ -301,6 +302,7 @@ impl<'a> Table<'a> {
             },
         );
 
+        list.pop_debug_scope();
         TableOutput {
             rect,
             clicked_row,
@@ -341,7 +343,13 @@ impl<'a> Table<'a> {
         widths
     }
 
-    fn draw_header(&self, rect: Rect, col_widths: &[f32], list: &mut DrawList, style: &StyleResolver) {
+    fn draw_header(
+        &self,
+        rect: Rect,
+        col_widths: &[f32],
+        list: &mut DrawList,
+        style: &StyleResolver,
+    ) {
         let header_rect = Rect::new(rect.x, rect.y, rect.width, self.header_height);
 
         // Header background

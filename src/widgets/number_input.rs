@@ -18,9 +18,9 @@
 //!
 //! Integer fields are just `decimals == 0` (the default).
 
-use crate::layout::Rect;
 #[cfg(feature = "phosphor-icons")]
 use crate::StyleKey;
+use crate::layout::Rect;
 
 use super::{Button, DrawContext, FocusId, TextInput};
 
@@ -72,6 +72,32 @@ fn sanitize_numeric(s: &str, cursor: usize, allow_decimal: bool) -> (String, usi
         new_cursor = out.len();
     }
     (out, new_cursor)
+}
+
+/// Draw a compact up/down triangle centred in a number-input stepper.
+///
+/// It is only used when the phosphor icon feature is present; non-icon builds
+/// retain their text fallback below.
+#[cfg(feature = "phosphor-icons")]
+fn draw_stepper_caret(list: &mut super::DrawList, rect: Rect, up: bool, color: [f32; 4]) {
+    let cx = rect.x + rect.width * 0.5;
+    let cy = rect.y + rect.height * 0.5;
+    let half = (rect.width.min(rect.height) * 0.23).min(3.0);
+    if up {
+        list.triangle(
+            (cx, cy - half),
+            (cx - half, cy + half),
+            (cx + half, cy + half),
+            color,
+        );
+    } else {
+        list.triangle(
+            (cx - half, cy - half),
+            (cx + half, cy - half),
+            (cx, cy + half),
+            color,
+        );
+    }
 }
 
 /// Output from drawing a [`NumberInput`].
@@ -241,13 +267,17 @@ impl NumberInput {
         rect: Rect,
         ctx: &mut DrawContext,
     ) -> NumberOutput {
+        ctx.push_debug_scope_rect("NumberInput", rect);
         let original = value;
         let mut value = self.clamp(value);
         let allow_decimal = self.decimals > 0;
 
-        // Reserve a square-ish right column for the +/- buttons.
+        // The design's numeric field reserves a fixed 17px stepper column,
+        // independent of the field row height. Coupling it to `rect.height`
+        // made tall number inputs grow oversized +/- controls.
+        const STEPPER_COLUMN_W: f32 = 17.0;
         let btn_w = if self.step_buttons {
-            rect.height.min(20.0)
+            rect.width.min(STEPPER_COLUMN_W)
         } else {
             0.0
         };
@@ -303,28 +333,21 @@ impl NumberInput {
             // other without rounded inner edges.
             #[cfg(feature = "phosphor-icons")]
             {
-                // Vector +/- icons centred in each stepper. The Button draws only
-                // chrome (empty label); the icon is overlaid on top. The icon
-                // placement is em-scaled (1 em → the button's smaller dimension),
-                // which already leaves ~25% margin, so no extra inset is needed —
-                // and crucially the minus renders as a short bar the width of the
-                // plus's arm, not stretched to the (wider) button.
+                // Compact triangular carets match the design's 17px stacked
+                // steppers. Using the generic Plus/Minus icon filled almost the
+                // entire half-button and looked oversized.
                 let s = ctx.styles();
-                let tint = s.color(StyleKey::Text);
+                let tint = s.color(StyleKey::TextDim);
                 if Button::new("").with_radius(0.0).draw(up_rect, ctx) && can_click {
                     value = self.clamp(value + self.step);
                     stepped = true;
                 }
-                super::Icon::new(crate::render::PhosphorIcon::Plus)
-                    .tint(tint)
-                    .draw(up_rect, ctx.draw_list);
+                draw_stepper_caret(ctx.draw_list, up_rect, true, tint);
                 if Button::new("").with_radius(0.0).draw(down_rect, ctx) && can_click {
                     value = self.clamp(value - self.step);
                     stepped = true;
                 }
-                super::Icon::new(crate::render::PhosphorIcon::Minus)
-                    .tint(tint)
-                    .draw(down_rect, ctx.draw_list);
+                draw_stepper_caret(ctx.draw_list, down_rect, false, tint);
             }
             // Text fallback when the icon font is compiled out. The label is
             // centred by Button. Use the typographic MINUS SIGN (U+2212), drawn
@@ -390,6 +413,7 @@ impl NumberInput {
             }
         }
 
+        ctx.pop_debug_scope();
         NumberOutput {
             value,
             changed: value != original,
@@ -418,8 +442,7 @@ mod tests {
     }
 
     fn rect() -> Rect {
-        // 120px wide, 24px tall at the origin. With step buttons the field is
-        // the left (120 - 24) = 96px; the button column is the rightmost 24px.
+        // The 120px field keeps the design's fixed 17px stepper column.
         Rect::new(0.0, 0.0, 120.0, 24.0)
     }
 
@@ -470,6 +493,22 @@ mod tests {
 
     // ---- interaction ----
 
+    #[test]
+    fn stepper_column_stays_17px_in_a_tall_input() {
+        let ni = NumberInput::new();
+        let mut ti = TextInput::new(0.0, 0.0, 200.0, 40.0);
+        let mut focus = FocusState::new();
+        let input = InputState::default();
+        let mut list = DrawList::new();
+        let theme = Theme::default();
+        let mut ctx = DrawContext::new(&mut list, &mut focus, &theme, &input, 800.0, 600.0);
+        ni.draw(1.0, 0, &mut ti, Rect::new(0.0, 0.0, 200.0, 40.0), &mut ctx);
+        assert_eq!(
+            ti.width, 183.0,
+            "field reserves only the 17px stepper column"
+        );
+    }
+
     fn click_at(x: f32, y: f32) -> InputState {
         InputState {
             mouse_x: x,
@@ -483,10 +522,10 @@ mod tests {
     #[test]
     fn plus_button_increments_and_clamps_to_max() {
         let ni = NumberInput::new().with_range(0.0, 10.0).with_step(3.0);
-        let mut ti = TextInput::new(0.0, 0.0, 96.0, 24.0);
+        let mut ti = TextInput::new(0.0, 0.0, 103.0, 24.0);
         let mut focus = FocusState::new();
-        // Up button is the top half of the 24px column at x in [96,120), y in [0,12).
-        let input = click_at(108.0, 6.0);
+        // Up button is the top half of the fixed 17px column at x in [103,120).
+        let input = click_at(111.0, 6.0);
         let out = draw_number(&ni, 9.0, 0, &mut ti, rect(), &mut focus, &input);
         assert_eq!(out.value, 10.0, "9 + 3 clamps to max 10");
         assert!(out.changed);
@@ -496,10 +535,10 @@ mod tests {
     #[test]
     fn minus_button_decrements_and_clamps_to_min() {
         let ni = NumberInput::new().with_range(0.0, 10.0).with_step(3.0);
-        let mut ti = TextInput::new(0.0, 0.0, 96.0, 24.0);
+        let mut ti = TextInput::new(0.0, 0.0, 103.0, 24.0);
         let mut focus = FocusState::new();
-        // Down button is the bottom half: y in [12,24).
-        let input = click_at(108.0, 18.0);
+        // Down button is the bottom half of the fixed 17px column.
+        let input = click_at(111.0, 18.0);
         let out = draw_number(&ni, 2.0, 0, &mut ti, rect(), &mut focus, &input);
         assert_eq!(out.value, 0.0, "2 - 3 clamps to min 0");
         assert!(out.changed);
@@ -675,7 +714,10 @@ mod tests {
         input.enter_pressed = true;
         let out = draw_number(&ni, 0.0, 0, &mut ti, rect(), &mut focus, &input);
         assert_eq!(out.value, 9.0);
-        assert_eq!(ti.value, "09", "Enter re-canonicalises through the formatter");
+        assert_eq!(
+            ti.value, "09",
+            "Enter re-canonicalises through the formatter"
+        );
     }
 
     /// A toy custom format ("3h" / "12h") paired with a matching parser, to

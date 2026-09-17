@@ -504,7 +504,7 @@ impl ApplicationHandler for WebApp {
                 gpu.config.height = size.height.max(1);
                 gpu.surface.configure(&gpu.device, &gpu.config);
                 gpu.ui
-                    .resize(&gpu.queue, gpu.config.width, gpu.config.height);
+                    .resize(&gpu.device, &gpu.queue, gpu.config.width, gpu.config.height, 1.0);
                 window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -665,7 +665,7 @@ impl ApplicationHandler for WebApp {
                 // Establish the open dropdown's popup layer at frame-top (from
                 // last frame's geometry) so `input_for_base` blocks clicks to
                 // widgets under the open list — same as the modal above.
-                self.state.dropdowns.begin_frame(&self.input);
+                self.state.dropdowns.begin_frame(&mut self.input);
                 let dropdown_popup = self.state.dropdowns.push_open_layer(&mut layers);
 
                 // Resolve input for the base layer. When a modal is open this
@@ -1000,7 +1000,7 @@ impl ApplicationHandler for WebApp {
                         self.state.dropdown_sel = idx;
                     }
                 }
-                self.state.dropdowns.end_frame();
+                self.state.dropdowns.end_frame(&mut FocusState::new());
 
                 // Bonus: rotated badge from the original demo, on the base layer
                 // (built via UiContext::with_layers so it stays clipped to the

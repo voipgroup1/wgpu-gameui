@@ -29,8 +29,8 @@
 //! if out.hovered      { skip_world_picking_this_frame(); }
 //! ```
 
-use crate::layout::Rect;
 use crate::InputState;
+use crate::layout::Rect;
 
 /// Result of probing a [`HitZone`] for one frame.
 ///
@@ -202,7 +202,9 @@ mod tests {
 
     #[test]
     fn disabled_zone_is_idle() {
-        let out = HitZone::new().enabled(false).test(rect(), &at_center(true, true));
+        let out = HitZone::new()
+            .enabled(false)
+            .test(rect(), &at_center(true, true));
         assert_eq!(out, HitZoneOutput::idle());
     }
 
