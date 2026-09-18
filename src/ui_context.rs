@@ -1409,10 +1409,10 @@ impl<'a> UiContext<'a> {
     /// font stack, then advance the layout cursor by the font size. The
     /// auto-advancing companion to [`text_block`](Self::text_block) /
     /// [`text_line`](Self::text_line).
-    pub fn text(&mut self, label: &str) {
+    pub fn text(&mut self, label: &str, max_width: Option<f32>) {
         let color = self.theme.map_or([1.0, 1.0, 1.0, 1.0], |t| t.text);
         let size = self.current_font().size;
-        self.text_line(label, color,None);
+        self.text_line(label, color, max_width);
         self.advance(size);
     }
 
@@ -2651,8 +2651,8 @@ mod tests {
         let mut list = DrawList::new();
         let mut ui = UiContext::new(&mut list);
         ui.set_auto_advance(false);
-        ui.text("a");
-        ui.text("b");
+        ui.text("a",None);
+        ui.text("b", None);
         drop(ui);
         assert_eq!(list.texts.len(), 2);
         assert!(
@@ -3907,7 +3907,7 @@ mod tests {
             let mut ui = UiContext::interactive(&mut list, &input, &mut state, &theme);
             ui.font_size(24.0);
             let c0 = ui.cursor();
-            ui.text("hello");
+            ui.text("hello",None);
             let c1 = ui.cursor();
             assert!(approx(c1[1], c0[1] + 24.0 + theme.spacing));
         }

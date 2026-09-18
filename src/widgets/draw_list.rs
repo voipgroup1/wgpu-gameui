@@ -1893,6 +1893,7 @@ impl DrawList {
             );
             self.text_rotation_warned = true;
         }
+        block.current_transform = m;
 
         // When span mode is active, derive the display content from the
         // concatenated span texts so the shape cache and cursor-position calls
@@ -2002,10 +2003,12 @@ impl DrawList {
         }
 
         // Transform origin.
-        let origin = m.transform_point([block.x, block.y]);
-        block.x = origin[0];
-        block.y = origin[1];
-
+        //let origin = m.transform_point([block.x, block.y]);
+        //block.x = origin[0];
+        //block.y = origin[1];
+        block.x = block.x + m.tx;
+        block.y = block.y + m.ty;
+        
         // Apply uniform-ish scale: geometric mean of the two basis lengths,
         // which equals sqrt(|det|). This handles non-uniform axis-aligned
         // scale gracefully (picks the average zoom instead of dropping a

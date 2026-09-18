@@ -684,6 +684,7 @@ async fn run_wgpu_app() {
 
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
 
+        //web_sys::console::error_1(&format!("time:{:?}", Instant::now()).into());
         let mut state :RefMut<RenderState> = render_state_clone.borrow_mut();
 
         let surface_clone1 = surface_clone.borrow_mut();
@@ -696,16 +697,19 @@ async fn run_wgpu_app() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
                 surface_clone1.configure(&device_clone1, &config_clone1);
+                //web_sys::console::error_1(&format!("wgpu::CurrentSurfaceTexture::Suboptimal:{:?}", Instant::now()).into());
                 request_animation_frame(f.borrow().as_ref().unwrap());
                 return;                
             },
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated=> {
                 surface_clone1.configure(&device_clone1, &config_clone1);
+                //web_sys::console::error_1(&format!("wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated:{:?}", Instant::now()).into());
                 request_animation_frame(f.borrow().as_ref().unwrap());
                 return;
             },
             _ => {
                 //tracing::warn!("Surface error: {:?}", e);
+                //web_sys::console::error_1(&format!("wgpu::CurrentSurfaceTexture Other Not Success:{:?}", Instant::now()).into());
                 request_animation_frame(f.borrow().as_ref().unwrap());
                 return;
             }
@@ -1232,7 +1236,7 @@ async fn run_wgpu_app() {
                 multiview_mask: None,
             });
         }
-
+        ui_renderer.begin_frame();
         ui_renderer.render_layers(
             &device_clone1,
             &state.queue,

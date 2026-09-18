@@ -795,7 +795,7 @@ fn render_widget_gallery() {
             {
                 let mut ui = UiContext::interactive(list, &input, &mut vstate, &theme);
                 ui.translate(r.x, r.y);
-                ui.text("text() label",None);
+                ui.text("text() label", None);
                 ui.text_button("text_button()", Some(200.0), None);
                 let _ = ui.slider(0, 0.6, 0.0, 1.0, Some(200.0));
                 let _ = ui.checkbox("checkbox()", true);
