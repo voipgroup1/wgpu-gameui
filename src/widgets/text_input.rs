@@ -1015,6 +1015,7 @@ impl TextInput {
                 Vec::new()
             };
 
+         
         // ---- Click-to-position ----
         let pre_click_anchor = self.selection_start.unwrap_or(self.cursor_pos);
         if clicked && focused {
@@ -1044,7 +1045,12 @@ impl TextInput {
                     // display byte back to a real value byte.
                     let display = self.display_value();
                     let positions =
-                        list.text_cursor_positions(&display, s.scalar(StyleKey::FontSize), None);
+                        list.text_cursor_positions(&display, s.scalar(StyleKey::FontSize), None,
+                        if let Some(font) = s.theme().font.as_ref() {
+                            Some(font.family())
+                        } else {
+                            None
+                        });
                     let byte_pos =
                         self.display_to_value_byte(closest_cursor_pos(&positions, local_x));
                     if input.shift_pressed {
@@ -1088,7 +1094,12 @@ impl TextInput {
                     (input.mouse_x - text_x + self.horizontal_scroll_offset).clamp(0.0, f32::MAX);
                 let display = self.display_value();
                 let positions =
-                    list.text_cursor_positions(&display, s.scalar(StyleKey::FontSize), None);
+                    list.text_cursor_positions(&display, s.scalar(StyleKey::FontSize), None,
+                    if let Some(font) = s.theme().font.as_ref() {
+                    Some(font.family())
+                } else {
+                    None
+                });
                 self.display_to_value_byte(closest_cursor_pos(&positions, local_x))
             };
             self.selection_start = self.drag_selection_anchor;
@@ -1160,7 +1171,12 @@ impl TextInput {
         } else if !multiline {
             let display = self.display_value();
             let positions =
-                list.text_cursor_positions(&display, s.scalar(StyleKey::FontSize), None);
+                list.text_cursor_positions(&display, s.scalar(StyleKey::FontSize), None,
+                if let Some(font) = s.theme().font.as_ref() {
+                    Some(font.family())
+                } else {
+                    None
+                });
             let caret_byte = self.value_to_display_byte(self.cursor_pos);
             let caret_x = positions
                 .iter()
@@ -1340,6 +1356,53 @@ impl TextInput {
             list.text(text);
         }
 
+        // line byte x line_top line_height
+        let multiline_caret_pos:(usize, usize,f32,f32,f32) = if multiline {
+            let mut render_byte = self.cursor_pos;
+            let render_layout_c =if let Some((t0,_t1,t2)) = &composed {
+                 render_byte = *t2;
+                 &list.text_caret_layout(
+                    t0,
+                    s.scalar(StyleKey::FontSize),
+                    Some(text_max_w),
+                    wrap,
+                    self.direction,
+                    if let Some(font) = s.theme().font.as_ref() {
+                        Some(font.family())
+                    } else {
+                        None
+                    })
+                }else{
+                    &render_layout
+                };
+            
+            let caret_pos=caret_for_byte(&render_layout_c, render_byte);
+            (caret_pos.line,caret_pos.byte,text_x + caret_pos.x,text_top - scroll + caret_pos.line_top,caret_pos.line_height)
+        }else{
+            (0usize,0usize,0.0,0.0,0.0)
+        };
+
+        //---- Draw cursor new ----
+        if focused {
+            let mut caret_x = multiline_caret_pos.2;
+            if !multiline {
+                    let caret_disp = self.value_to_display_byte(self.cursor_pos);
+                    caret_x = crate::text::visual_caret_pos(&caret_vis, caret_disp)
+                        .map(|c| draw_text_x + c.x)
+                        .unwrap_or(draw_text_x);
+            }
+            let (caret_top, caret_h) = if multiline { 
+                (multiline_caret_pos.3,multiline_caret_pos.4)
+            }
+            else{
+                (sl_band_top, sl_band_h)
+            };
+            list.quad(caret_x, caret_top, 1.5, caret_h, s.color(StyleKey::Text));
+            // See the multiline branch: declare IME focus + caret anchor.
+            focus.request_ime(Rect::new(caret_x, caret_top, 1.5, caret_h));
+        }
+
+        /*
         // ---- Draw cursor ----
         if focused {
             if multiline && composed.is_none() {
@@ -1356,9 +1419,10 @@ impl TextInput {
                 // enable IME) and where to anchor the IME candidate window.
                 focus.request_ime(Rect::new(caret_x, caret_y, 1.5, caret_h));
             } else {
-                let cursor_x = if let Some((display, _spans, caret_byte)) = &composed {
+                let cursor_x = if let Some((_display, _spans, _caret_byte)) = &composed {
                     // Caret position is measured on the composed display string so
                     // it sits inside the preedit where the IME asked.
+                    /*
                     let positions =
                         list.text_cursor_positions(display, s.scalar(StyleKey::FontSize), None);
                     let offset = positions
@@ -1367,6 +1431,8 @@ impl TextInput {
                         .map(|&(_, x)| x)
                         .unwrap_or(positions.last().map(|&(_, x)| x).unwrap_or(0.0));
                     draw_text_x + offset
+                    */
+                    text_x + multiline_caret_pos.2
                 } else if self.value.is_empty() {
                     draw_text_x
                 } else {
@@ -1384,8 +1450,26 @@ impl TextInput {
                 // Single-line carets share the box-centred band as the selection
                 // (see `sl_band_top`/`sl_band_h`); multiline-composing keeps the
                 // first-line top (`block_y`) the preedit text is drawn at.
-                let (caret_top, caret_h) = if multiline {
-                    (block_y, line_height)
+                let (caret_top, caret_h) = if multiline { 
+                    /*
+                    let (render_layout_c, cur_pos) = if composed.is_some() {
+                        (&list.text_caret_layout(
+                            &composed.unwrap().0,
+                            s.scalar(StyleKey::FontSize),
+                            Some(text_max_w),
+                            wrap,
+                            self.direction,
+                            if let Some(font) = s.theme().font.as_ref() {
+                                Some(font.family())
+                            } else {
+                                None
+                            }),
+                            composing_caret_pos.0)
+                    }else{
+                        (&render_layout,self.cursor_pos)
+                    };
+                    */
+                    (block_y + multiline_caret_pos.3, line_height)
                 } else {
                     (sl_band_top, sl_band_h)
                 };
@@ -1394,7 +1478,7 @@ impl TextInput {
                 focus.request_ime(Rect::new(cursor_x, caret_top, 1.5, caret_h));
             }
         }
-
+        */
         list.pop_clip();
 
         list.pop_debug_scope();

@@ -33,9 +33,13 @@ axum = { version = "0.8.7" , optional = true }
 tokio = { version = "1.48.0", features = ["full","rt"], optional = true }
 libc = { version = "0.2.178", optional = true  }
 web-time = { version = "1.1.0" }
+tree-sitter-highlight = { version = "0.27.0", optional = true }
+tree-sitter-lua = { version = "0.5.0", optional = true }
 
 [features]
 default = ["bundled-font", "phosphor-icons"]
+syntax-highlighting = ["dep:tree-sitter-highlight"]
+syntax-lua = ["syntax-highlighting", "dep:tree-sitter-lua"]
 # Emit tracing spans around the render path for Tracy profiling.
 tracy = ["dep:tracing"]
 # Embed Noto Sans and register it as the default sans-serif family. Disable

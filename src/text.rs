@@ -33,7 +33,7 @@ use crate::widgets::IconMsdf;
 
 use glyphon::cosmic_text::{
     Align as CosmicAlign, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style,
-    Weight, Wrap, fontdb,
+    Weight, Wrap, UnderlineStyle, fontdb,
 };
 
 const MSDF_SHADER: &str = include_str!("render/ui_msdf.wgsl");
@@ -855,6 +855,7 @@ impl TextRenderer {
                 Cow::Owned(format!("{prefix}{content}"))
             };
 
+
             let mut buffer = Buffer::new(&mut fs, Metrics::new(block.font_size, block.line_height));
             if block.vertical || block.ellipsize {
                 // Vertical: each line is one cluster, no wrapping; shrink-to-content
@@ -865,18 +866,35 @@ impl TextRenderer {
                 buffer.set_wrap(block.wrap.into());
                 buffer.set_size(Some(block.max_width), None);
             }
-            buffer.set_text(
-                //&mut fs,
-                &shaped_text,
-                &Attrs::new()
-                    .family(family)
-                    .weight(block.weight)
-                    .style(block.style)
-                    .letter_spacing(block.letter_spacing)
-                    .color(block.color),
-                Shaping::Advanced,
-                None,
-            );
+            //if block.spans.is_empty(){
+                buffer.set_text(
+                    //&mut fs,
+                    &shaped_text,
+                    &Attrs::new()
+                        .family(family)
+                        .weight(block.weight)
+                        .style(block.style)
+                        .letter_spacing(block.letter_spacing)
+                        .color(block.color),
+                    Shaping::Advanced,
+                    None,
+                );
+            /*}else{
+                let shaped_rich_text: Vec<(Cow<str>, Attrs)> = vertical_stack_spans(&block.spans,prefix,block.vertical,block.color,block.style,block.weight,family,block.letter_spacing);
+                
+                buffer.set_rich_text(
+                    //&mut fs,
+                    shaped_rich_text.iter().map(|s| {let s0:&str = &s.0; (s0,s.1.clone())}).collect::<Vec<(&str,Attrs)>>(),
+                    &Attrs::new()
+                        .family(family)
+                        .weight(block.weight)
+                        .style(block.style)
+                        .letter_spacing(block.letter_spacing)
+                        .color(block.color),
+                    Shaping::Advanced,
+                    None,
+                );
+            }*/
             // Horizontal alignment is set per buffer line before layout; `Start`
             // is cosmic-text's default so we only override for the rest. Vertical
             // mode never sets a cosmic align — it centers each row manually within
@@ -1280,6 +1298,52 @@ fn shape_key(block: &TextBlock) -> ShapeKey {
 /// [`TextBlock::with_vertical`].
 fn vertical_stack_string(s: &str) -> String {
     s.graphemes(true).collect::<Vec<_>>().join("\n")
+}
+
+fn vertical_stack_spans<'s,'r>(spans: &'s Vec<TextSpan>,prefix: &str, is_vertical:bool,color: Color, style: Style, weight: Weight, family: Family<'r>, letter_spacing:f32) -> Vec<(Cow<'s, str>, Attrs<'r>)>{
+    let c = spans.iter().map(|span|{
+        let cstr : Cow<str> =if is_vertical {
+                Cow::Owned(span.text.graphemes(true).collect::<Vec<_>>().join("\n").into())
+            }else if prefix.is_empty() {
+                Cow::Borrowed(&span.text)
+            }else {
+                Cow::Owned(format!("{}{}",prefix,&span.text).into())
+            };
+        let c_color = match span.color {
+                Some(color32) => {
+                    Color::rgba(
+                        (color32[0] * 255.0) as u8,
+                        (color32[1] * 255.0) as u8,
+                        (color32[2] * 255.0) as u8,
+                        (color32[3] * 255.0) as u8,
+                    )
+                },
+                _ => color
+            };
+        let attrs = Attrs::new()
+            .color(c_color)
+            .family(family)
+            .style(style)
+            .weight(weight)
+            .underline(match span.underline {
+                Underline::None => UnderlineStyle::None,
+                _ => UnderlineStyle::Single
+            })
+            .underline_color(match span.underline {
+                Underline::Color(color32) =>{
+                    Color::rgba(
+                        (color32[0] * 255.0) as u8,
+                        (color32[1] * 255.0) as u8,
+                        (color32[2] * 255.0) as u8,
+                        (color32[3] * 255.0) as u8,
+                    )
+                },
+                _ => c_color
+            })
+            .letter_spacing(letter_spacing);
+        (cstr , attrs)
+    }).collect();
+    c
 }
 
 /// Stable discriminant for a cosmic-text [`Style`] so it can sit in a `Hash + Eq`
@@ -3785,6 +3849,19 @@ impl TextBlock {
     pub fn with_wrap(mut self, wrap: WrapMode) -> Self {
         self.wrap = wrap;
         self
+    }
+
+    ///get span from current char index of content
+    pub fn get_span_by_index(&self, index: usize) -> Option<TextSpan>{
+        let mut i =0usize;
+        for a in self.spans.iter() {
+            let l  = a.text.len();
+            if index>=i && index<i+l {
+                return Some(a.clone());
+            }
+            i +=l;
+        }
+        None
     }
 }
 

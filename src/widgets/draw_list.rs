@@ -600,12 +600,13 @@ impl DrawList {
         text: &str,
         font_size: f32,
         max_width: Option<f32>,
+        family_name: Option<&str>,
     ) -> Vec<(usize, f32)> {
         let handle = self.text_measurer.font_system_handle();
         let mut fs = handle.lock().expect("FontSystem poisoned");
         let mw = max_width.unwrap_or(f32::MAX / 4.0);
         let lh = font_size * 1.25;
-        crate::text::text_cursor_positions(&mut fs, text, font_size, lh, mw, None)
+        crate::text::text_cursor_positions(&mut fs, text, font_size, lh, mw, family_name)
     }
 
     /// Line-aware caret layout for the given text — the multi-line counterpart of
@@ -1885,7 +1886,7 @@ impl DrawList {
     /// emitted as axis-aligned MSDF quads) — when the transform has any
     /// rotation we log a one-shot warning and render axis-aligned.
     pub fn text(&mut self, mut block: TextBlock) {
-        let m = self.current_transform();
+        let m: Affine2 = self.current_transform();
         if !m.is_axis_aligned() && !self.text_rotation_warned {
             log::warn!(
                 "wgpu-gameui: TextBlock pushed under a rotated/sheared transform — \
@@ -1952,13 +1953,27 @@ impl DrawList {
         // the active transform uniformly — matching exactly what the text
         // pipeline does. Soup geometry draws before text glyphs, so the
         // underlines naturally appear beneath the MSDF rendering.
+        
         if block
             .spans
             .iter()
             .any(|s| !matches!(s.underline, Underline::None))
         {
+            let font_family = match block.font.as_ref()
+            { 
+                Some(c)=>{Some(c.0.as_ref())},
+                _=>None
+            };
+            let multiline_layout = &self.text_caret_layout(
+                &block.content,
+                block.font_size,
+                Some(block.max_width),
+                block.wrap,
+                block.direction,
+                font_family);
+            
             let positions =
-                self.text_cursor_positions(&block.content, block.font_size, Some(block.max_width));
+                self.text_cursor_positions(&block.content, block.font_size, Some(block.max_width),font_family);
             // Sit the underline just below the baseline so it clears the letter
             // bottoms. `baseline_ratio` (~1.0 of the em) locates the baseline
             // below the block top; the old flat `0.9` sat *above* it, cutting
@@ -1985,13 +2000,21 @@ impl DrawList {
                     Underline::Color(c) => Some(c),
                 };
                 if let Some(ul_color) = ul_color {
-                    let x_start = span_cursor_x(&positions, span_byte);
+                    let caret_pos_start=crate::text::caret_for_byte(multiline_layout, span_byte);
+                    //let x_start = span_cursor_x(&positions, span_byte);
+                    let mut x_start = caret_pos_start.x;
                     let end_byte = span_byte + span.text.len();
-                    let x_end = span_cursor_x(&positions, end_byte);
+                    let caret_pos_end=crate::text::caret_for_byte(multiline_layout, end_byte);
+                    //let x_end = span_cursor_x(&positions, end_byte);
+                    let x_end = caret_pos_end.x;
+                    let underline_y_mulitline= block.y + caret_pos_end.line as f32 * caret_pos_end.line_height+block.font_size * (vm.baseline_ratio + 0.12);
+                    if caret_pos_start.line != caret_pos_end.line {
+                        x_start = 0.0;
+                    }
                     if x_end > x_start {
                         self.quad(
                             block.x + x_start,
-                            underline_y,
+                            underline_y_mulitline,
                             x_end - x_start,
                             thickness,
                             ul_color,

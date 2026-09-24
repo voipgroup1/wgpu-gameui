@@ -106,7 +106,8 @@ fn fs_msdf(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    let msd = textureSample(atlas_tex, atlas_sampler, in.uv).rgb;
+    let color = textureSample(atlas_tex, atlas_sampler, in.uv);
+    let msd = color.rgb;
     let sd = median(msd.r, msd.g, msd.b);
 
     // Convert the atlas-space distance range to a screen-pixel range using the uv
@@ -116,6 +117,28 @@ fn fs_msdf(in: VsOut) -> @location(0) vec4<f32> {
     let screen_tex_size = vec2<f32>(1.0) / fwidth(in.uv);
     let screen_px_range = max(0.5 * dot(unit_range, screen_tex_size), 1.0);
     let dist = screen_px_range * (sd - 0.5);
+
+    // start line
+    let text_color = vec4<f32>(1.0,1.0,0.0,1.0);
+    let edge = fwidth(sd) * 0.75; 
+    let text_a = smoothstep(0.5 - edge, 0.5 + edge, sd) * text_color.a ; 
+    var ua :f32 = 0.0;
+    let uline_enable = 1.0;
+    let uline_pos_uv = 0.5;
+    let uline_thickness_uv = 0.001;
+    let uline_color = vec4<f32>(1.0,1.0,0.0,1.0); 
+    if (uline_enable > 0.5) { 
+        let d = abs(in.uv.y - uline_pos_uv) - 0.5 * uline_thickness_uv;  
+        let le = fwidth(in.uv.y); 
+        ua = clamp(1.0 - smoothstep(0.0, le, d), 0.0, 1.0) * uline_color.a; 
+        if (d<0.0) {
+            ua = 1.0;
+        }
+    }
+    let out_a = text_a + (1.0 - text_a) * ua; 
+    let out_rgb = text_color.rgb * text_a + (1.0 - text_a) * (uline_color.rgb * ua);
+    let out_underline = vec4<f32>(out_rgb, out_a); 
+    // end draw line
 
     // AA half-width in screen px; `softness` widens it for shadows / glow.
     let aa = 0.5 + in.softness;
@@ -130,7 +153,16 @@ fn fs_msdf(in: VsOut) -> @location(0) vec4<f32> {
     let premul = in.fill.rgb * fill_a + in.outline.rgb * (outline_a * (1.0 - fill_a));
     let a = fill_a + outline_a * (1.0 - fill_a);
     if (a <= 0.0) {
+        
         discard;
     }
-    return vec4<f32>(premul / a, a);
+    let out_0 = vec4<f32>(premul / a, a);
+    return vec4<f32>(out_0);
+}
+
+fn distToSegment(p : vec2<f32>, a : vec2<f32>, b : vec2<f32>) -> f32 {
+    let ab = b - a;
+    let t = clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
+    let proj = a + t * ab;
+    return length(p - proj);
 }
