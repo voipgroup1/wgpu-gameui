@@ -1,5 +1,6 @@
 //! Text input widget with selection, cursor navigation, and clipboard support.
 
+use core::option::Option::None;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -1332,7 +1333,7 @@ impl TextInput {
                     (text_c[1] * 255.0) as u8,
                     (text_c[2] * 255.0) as u8,
                 )
-                .with_max_width(text_max_w)
+                .with_max_width(text_max_w+horizontal_scroll)
                 .with_direction(self.direction)
                 .with_spans(spans.clone());
             list.text(text);
@@ -1345,7 +1346,7 @@ impl TextInput {
                     (text_color[1] * 255.0) as u8,
                     (text_color[2] * 255.0) as u8,
                 )
-                .with_max_width(text_max_w)
+                .with_max_width(text_max_w+horizontal_scroll)
                 .with_direction(self.direction);
             #[cfg(feature = "syntax-highlighting")]
             let text = if multiline && !self.value.is_empty() && self.syntax.is_some() {
@@ -1382,15 +1383,50 @@ impl TextInput {
             (0usize,0usize,0.0,0.0,0.0)
         };
 
+        let singleline_caret_pos = if !multiline {
+            let mut render_byte = self.cursor_pos;
+            let render_layout_c =if let Some((t0,_t1,t2)) = &composed {
+                 render_byte = *t2;
+                 &list.text_caret_layout(
+                    t0,
+                    s.scalar(StyleKey::FontSize),
+                    None,
+                    wrap,
+                    self.direction,
+                    if let Some(font) = s.theme().font.as_ref() {
+                        Some(font.family())
+                    } else {
+                        None
+                    })
+                }else{
+                &list.text_caret_layout(
+                    &self.value,
+                    s.scalar(StyleKey::FontSize),
+                    None,
+                    wrap,
+                    self.direction,
+                    if let Some(font) = s.theme().font.as_ref() {
+                        Some(font.family())
+                    } else {
+                        None
+                    })
+                };
+            
+            let caret_pos=caret_for_byte(&render_layout_c, render_byte);
+            (caret_pos.byte,draw_text_x + caret_pos.x,caret_pos.line_height)
+
+        }else{
+            (0usize,0.0,0.0)
+        };
+
         //---- Draw cursor new ----
         if focused {
-            let mut caret_x = multiline_caret_pos.2;
-            if !multiline {
-                    let caret_disp = self.value_to_display_byte(self.cursor_pos);
-                    caret_x = crate::text::visual_caret_pos(&caret_vis, caret_disp)
-                        .map(|c| draw_text_x + c.x)
-                        .unwrap_or(draw_text_x);
-            }
+            let caret_x = if multiline {
+                    multiline_caret_pos.2
+                }
+                else {
+                    singleline_caret_pos.1
+                };
             let (caret_top, caret_h) = if multiline { 
                 (multiline_caret_pos.3,multiline_caret_pos.4)
             }
