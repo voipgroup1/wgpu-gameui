@@ -24,7 +24,7 @@ nalgebra = "0.35.0"
 fdsm = {path = "fdsm/"}
 ttf-parser = "0.25"
 
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Bundled default UI font (Noto Sans regular/bold/italic/bold-italic). Optional,
 # enabled by the default `bundled-font` feature so the UI renders identically on
 # every machine without depending on installed system fonts.
@@ -35,9 +35,12 @@ libc = { version = "0.2.178", optional = true  }
 web-time = { version = "1.1.0" }
 tree-sitter-highlight = { version = "0.27.0", optional = true }
 tree-sitter-lua = { version = "0.5.0", optional = true }
+# Blocking executor used only to create a headless wgpu adapter/device in
+# `render::capture::HeadlessGpu`. Zero transitive dependencies.
+pollster = { path= "pollster/", optional = true }
 
 [features]
-default = ["bundled-font", "phosphor-icons"]
+default = ["bundled-font", "phosphor-icons", "headless"]
 syntax-highlighting = ["dep:tree-sitter-highlight"]
 syntax-lua = ["syntax-highlighting", "dep:tree-sitter-lua"]
 # Emit tracing spans around the render path for Tracy profiling.
@@ -50,6 +53,7 @@ bundled-font = ["dep:notosans"]
 # atlas. Disable (`--no-default-features`) to drop the ~0.5 MB font; widgets
 # fall back to text glyphs (`+`/`\u{2212}`) for their icon affordances.
 phosphor-icons = []
+headless = ["dep:pollster"]
 
 web = ["dioxus/web","bundled-font", "phosphor-icons"]
 server = ["dioxus/server", "dep:libc", "dep:tokio", "dep:axum"]
@@ -57,7 +61,7 @@ server = ["dioxus/server", "dep:libc", "dep:tokio", "dep:axum"]
 
 [dev-dependencies]
 winit = "0.30"
-pollster = "0.3"
+pollster = { path = "pollster/" }
 env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
 notosans = "0.1.0"

@@ -227,18 +227,18 @@ impl HeadlessGpu {
     /// Returning `None` rather than panicking lets a test skip cleanly:
     /// `let Some(gpu) = HeadlessGpu::new() else { return };`
     pub fn new() -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))?;
+            apply_limit_buckets: false,
+        })).ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("gameui headless device"),
                 ..Default::default()
             },
-            None,
         ))
         .ok()?;
         let font_system = crate::text::shared_font_system();
