@@ -1300,6 +1300,7 @@ fn vertical_stack_string(s: &str) -> String {
     s.graphemes(true).collect::<Vec<_>>().join("\n")
 }
 
+/*
 fn vertical_stack_spans<'s,'r>(spans: &'s Vec<TextSpan>,prefix: &str, is_vertical:bool,color: Color, style: Style, weight: Weight, family: Family<'r>, letter_spacing:f32) -> Vec<(Cow<'s, str>, Attrs<'r>)>{
     let c = spans.iter().map(|span|{
         let cstr : Cow<str> =if is_vertical {
@@ -1345,6 +1346,7 @@ fn vertical_stack_spans<'s,'r>(spans: &'s Vec<TextSpan>,prefix: &str, is_vertica
     }).collect();
     c
 }
+*/
 
 /// Stable discriminant for a cosmic-text [`Style`] so it can sit in a `Hash + Eq`
 /// cache key: `Normal = 0`, `Italic = 1`, `Oblique = 2`.
