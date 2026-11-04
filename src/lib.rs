@@ -80,10 +80,6 @@ pub use text::{
 /// Font weight and style selectors (re-exported from `glyphon`/`cosmic-text`)
 /// for `TextBlock::with_weight`/`with_style` and the `UiContext` font stack.
 pub use glyphon::cosmic_text::{Style, Weight};
-//just re-exported from `glyphon`
-pub mod low_level_glyphon{
-    pub use glyphon::*;
-}
 
 pub mod affine;
 mod animation;
